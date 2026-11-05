@@ -164,6 +164,25 @@ test("二度押しても増殖せず、翻訳中の復元は上書きしない",
   assert.equal(posted.at(-1).phase, "done");
 });
 
+test("訳の途中で復元したら、遅れて返った訳で上書きしない", async () => {
+  const dom = setup(`<p>The <a href="/d">dashboard</a> lists every task.</p>`);
+  const original = dom.window.chrome.runtime.sendMessage;
+  dom.window.chrome.runtime.sendMessage = async (message) => {
+    if (message.type === "plamo:status") return original(message);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    // 目印を落とすので、ノードごとの訳（await を挟む経路）に入る
+    return { ok: true, translation: message.text.replace(/\u27E6[^\u27E7]*\u27E7/g, "").toUpperCase() };
+  };
+
+  const running = send(dom.listeners, { type: "plamo:page-translate" });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await send(dom.listeners, { type: "plamo:page-restore" });
+  await running;
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  assert.equal(dom.document.body.textContent, "The dashboard lists every task.");
+});
+
 test("訳の失敗はページを止めず、失敗数として出る", async () => {
   const dom = setup(`<p>First</p><p>Second</p>`);
   const original = dom.window.chrome.runtime.sendMessage;

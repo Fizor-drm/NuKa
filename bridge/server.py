@@ -129,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
         except BadRequest as exc:
             self._send(400, {"error": str(exc)})
             return
-        except ValueError as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             self._send(400, {"error": str(exc)})
             return
 

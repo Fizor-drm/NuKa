@@ -116,6 +116,20 @@ class BridgeTest(unittest.TestCase):
         status, _, _ = self.post({"text": "hello", "target_lang": "xx"})
         self.assertEqual(status, 400)
 
+    def test_rejects_unhashable_language(self):
+        status, _, _ = self.post({"text": "hello", "target_lang": ["en"]})
+        self.assertEqual(status, 400)
+
+    def test_rejects_infinite_max_tokens(self):
+        status, _, _ = self.post({"text": "hello", "target_lang": "en", "max_tokens": 1e999})
+        self.assertEqual(status, 400)
+
+    def test_clamps_max_tokens(self):
+        RECEIVED.clear()
+        status, _, _ = self.post({"text": "hello", "target_lang": "en", "max_tokens": 999999})
+        self.assertEqual(status, 200)
+        self.assertEqual(RECEIVED[0]["max_tokens"], 4096)
+
     def test_ignores_malformed_history_and_glossary(self):
         status, _, _ = self.post(
             {

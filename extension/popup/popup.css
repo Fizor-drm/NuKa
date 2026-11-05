@@ -72,6 +72,11 @@ form {
   font-size: 13px;
 }
 
+/* .field の display が [hidden] の既定を打ち消すので、明示的に隠す。 */
+.field[hidden] {
+  display: none;
+}
+
 .field > span,
 .field > legend {
   color: var(--quiet);

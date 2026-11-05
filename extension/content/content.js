@@ -177,7 +177,16 @@
     return true;
   }
 
-  async function applySegment(segment, translation, history) {
+  /** 履歴に残す文字列。目印は訳文の質を下げるので落とし、長さも原文と揃える。 */
+  function forHistory(text) {
+    return String(text ?? "")
+      .replace(MARKER, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 400);
+  }
+
+  async function applySegment(segment, translation, history, isCurrent) {
     if (segment.parts.length === 1) {
       writeOne(segment.parts[0], translation);
       return;
@@ -192,8 +201,12 @@
     let context = history;
     for (const part of segment.parts) {
       const partTranslation = await ask(part.text, context);
+      // 待っている間に「原文に戻す」や「止める」が押されていたら、そこで止める。
+      if (!isCurrent()) return;
       writeOne(part, partTranslation);
-      context = context.concat([{ source: part.text.slice(0, 400), translation: partTranslation }]).slice(-2);
+      context = context
+        .concat([{ source: forHistory(part.text), translation: forHistory(partTranslation) }])
+        .slice(-2);
     }
   }
 
@@ -260,14 +273,19 @@
           }
           const segment = segments[index];
           const history = (historyByBlock.get(segment.blockKey) || []).slice(-2);
+          const isCurrent = () => runGeneration === generation && !stopRequested;
           try {
             const translation = await ask(segment.text, history);
-            if (runGeneration === generation && !stopRequested) {
-              await applySegment(segment, translation, history);
-              historyByBlock.set(
-                segment.blockKey,
-                history.concat({ source: segment.plain.slice(0, 400), translation }).slice(-2),
-              );
+            if (isCurrent()) {
+              await applySegment(segment, translation, history, isCurrent);
+              if (isCurrent()) {
+                historyByBlock.set(
+                  segment.blockKey,
+                  history
+                    .concat({ source: forHistory(segment.plain), translation: forHistory(translation) })
+                    .slice(-2),
+                );
+              }
             }
           } catch (error) {
             failed += 1;
