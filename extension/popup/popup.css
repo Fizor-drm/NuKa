@@ -1,0 +1,176 @@
+/* ポップアップは翻訳の操作盤。紙面のような縦組みにして、ボタンだけを赤で目立たせる。
+   赤は「いま訳す」という一点のため。状態表示やフォームには使わない。 */
+
+:root {
+  color-scheme: light;
+  --ink: #1c1915;
+  --paper: #f6f1e7;
+  --rule: #d9d0c2;
+  --quiet: #6f675c;
+  --seal: #9c2b2b;
+  --seal-ink: #fff8f2;
+  --focus: #1c1915;
+  font-family: "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  width: 340px;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.mast {
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.mark {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+}
+
+.mark span {
+  color: var(--seal);
+}
+
+/* 朱は「ページを訳す」と、ブリッジが止まっているという一点だけ。状態の緑は使わない。 */
+
+h1 {
+  margin: 4px 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.status {
+  margin: 0;
+  color: var(--quiet);
+  font-size: 12px;
+}
+
+.status[data-state="down"] { color: var(--seal); }
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 18px 18px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: 13px;
+}
+
+.field > span,
+.field > legend {
+  color: var(--quiet);
+  font-size: 12px;
+  padding: 0;
+}
+
+.field small {
+  color: var(--quiet);
+}
+
+select,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+select,
+textarea {
+  width: 100%;
+  background: #fffdf8;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 7px 8px;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.5;
+}
+
+fieldset label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 2px 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+button {
+  min-height: 44px;
+  padding: 0 12px;
+  background: transparent;
+  border: 1px solid var(--ink);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--seal);
+  border-color: var(--seal);
+  color: var(--seal-ink);
+  flex: 1 1 140px;
+}
+
+.count,
+.progress,
+.error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.count,
+.progress { color: var(--quiet); }
+
+.error { color: var(--seal); }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ink: #f3ecdf;
+    --paper: #1b1916;
+    --rule: #3a342c;
+    --quiet: #b7ad9f;
+    --seal: #e06a5c;
+    --seal-ink: #1b1916;
+    --focus: #f3ecdf;
+  }
+
+  select,
+  textarea { background: #241f1b; }
+}
