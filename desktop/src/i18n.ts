@@ -197,7 +197,7 @@ const ja: Dict = {
   "engine.spawnFailed": "llama-server を起動できません: {detail}",
   "engine.logOpenFailed": "ログファイルを開けません: {detail}",
   "engine.logCloneFailed": "ログファイルを複製できません: {detail}",
-  "engine.bothNotInstalled": "ランタイムとモデルが未導入です。設定でインストールしてください。",
+  "engine.bothNotInstalled": "ランタイムとモデルが未導入です。設定からインストールしてください。(モデル: {model_paths} / ランタイム: {runtime_paths})",
 
   // バックエンド: インストーラー
   "installer.clientCreate": "ダウンロード用クライアントを作れません: {detail}",
@@ -258,6 +258,8 @@ const ja: Dict = {
   "updater.checkClient": "更新確認用クライアントを作れません: {detail}",
   "updater.checkFailed": "更新情報を取得できませんでした: {detail}",
   "updater.httpStatus": "更新情報を取得できませんでした (HTTP {status})。",
+  "updater.rateLimited": "レート制限です。時間をおいて再試行してください。",
+  "updater.releaseMissing": "リリースが見つかりませんでした。",
   "updater.responseTooLarge": "更新情報が大きすぎます。",
   "updater.responseRead": "更新情報を読めませんでした: {detail}",
   "updater.responseTimeout": "更新情報の取得がタイムアウトしました。",
@@ -477,7 +479,7 @@ const en: Dict = {
   "engine.spawnFailed": "Could not start llama-server: {detail}",
   "engine.logOpenFailed": "Could not open the log file: {detail}",
   "engine.logCloneFailed": "Could not duplicate the log file: {detail}",
-  "engine.bothNotInstalled": "Neither the runtime nor a model is installed. Install them from Settings.",
+  "engine.bothNotInstalled": "Neither the runtime nor a model is installed. Install them from Settings. (Model: {model_paths} / Runtime: {runtime_paths})",
 
   "installer.clientCreate": "Could not create the download client: {detail}",
   "installer.downloadStart": "Could not start the download: {detail}",
@@ -535,6 +537,8 @@ const en: Dict = {
   "updater.checkClient": "Could not create the update client: {detail}",
   "updater.checkFailed": "Could not fetch update information: {detail}",
   "updater.httpStatus": "Could not fetch update information (HTTP {status}).",
+  "updater.rateLimited": "Rate limited. Please retry later.",
+  "updater.releaseMissing": "No release was found.",
   "updater.responseTooLarge": "The update information is too large.",
   "updater.responseRead": "Could not read the update information: {detail}",
   "updater.responseTimeout": "Fetching update information timed out.",
@@ -750,7 +754,7 @@ const zh: Dict = {
   "engine.spawnFailed": "无法启动 llama-server：{detail}",
   "engine.logOpenFailed": "无法打开日志文件：{detail}",
   "engine.logCloneFailed": "无法复制日志文件：{detail}",
-  "engine.bothNotInstalled": "运行时和模型均未安装。请在设置中安装。",
+  "engine.bothNotInstalled": "运行时和模型均未安装。请在设置中安装。（模型：{model_paths} / 运行时：{runtime_paths}）",
 
   "installer.clientCreate": "无法创建下载客户端：{detail}",
   "installer.downloadStart": "无法开始下载：{detail}",
@@ -807,6 +811,8 @@ const zh: Dict = {
   "updater.checkClient": "无法创建更新检查客户端：{detail}",
   "updater.checkFailed": "无法获取更新信息：{detail}",
   "updater.httpStatus": "无法获取更新信息（HTTP {status}）。",
+  "updater.rateLimited": "已达速率限制，请稍后重试。",
+  "updater.releaseMissing": "找不到发布版本。",
   "updater.responseTooLarge": "更新信息过大。",
   "updater.responseRead": "无法读取更新信息：{detail}",
   "updater.responseTimeout": "获取更新信息超时。",

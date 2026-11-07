@@ -506,6 +506,10 @@ function describeError(error: unknown): string {
 }
 
 /** フロントで組み立てた文字列を、言語切替でも再描画できるメッセージにする。 */
+function localizedMessage(key: string, params: Record<string, string> = {}): LocalizedMessage {
+  return { key, params, fallback: t(key, params) };
+}
+
 function rawMessage(message: string): LocalizedMessage {
   return { key: "error.raw", params: { detail: message }, fallback: message };
 }
@@ -832,7 +836,7 @@ async function handleOutputAction(kind: OutputActionKind): Promise<void> {
     return;
   }
   state.translationError = null;
-  state.engine = { state: "starting", detail: rawMessage(t("engine.startingDetail")) };
+  state.engine = { state: "starting", detail: localizedMessage("engine.startingDetail") };
   renderEngine();
   renderOutput();
   try {
@@ -1266,7 +1270,7 @@ async function checkForUpdates(manual: boolean): Promise<void> {
     }
   } catch (error) {
     state.update.phase = "error";
-    state.update.message = rawMessage(t("update.checkFailed", { detail: describeError(error) }));
+    state.update.message = localizedMessage("update.checkFailed", { detail: describeError(error) });
   }
   renderUpdate();
   if (manual && state.update.phase === "error") {
@@ -1289,7 +1293,7 @@ async function startUpdateDownload(): Promise<void> {
     if (state.update.phase === "downloading") {
       state.update.phase = "error";
       state.update.progress = null;
-      state.update.message = rawMessage(t("update.downloadStartFailed", { detail: describeError(error) }));
+      state.update.message = localizedMessage("update.downloadStartFailed", { detail: describeError(error) });
       renderUpdate();
     }
   }
@@ -1313,7 +1317,7 @@ async function installDownloadedUpdate(): Promise<void> {
     await ipc.installUpdate();
   } catch (error) {
     state.update.phase = "error";
-    state.update.message = rawMessage(t("update.installFailed", { detail: describeError(error) }));
+    state.update.message = localizedMessage("update.installFailed", { detail: describeError(error) });
     renderUpdate();
   }
 }

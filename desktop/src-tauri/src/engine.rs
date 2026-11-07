@@ -552,15 +552,14 @@ pub(crate) fn resolve_runtime_path(
 /// モデルは管理対象 → settings.json の model_path → 環境変数 → exe の位置からの探索。
 /// ランタイムは管理済み → settings.json の server_path → 既定の保存先 → 環境変数 → 探索。
 /// 探索はデバッグ実行では上位 6 階層まで、リリースでは隣と 1 つ上だけ。
-fn both_not_installed(model_error: &LocalizedText) -> LocalizedText {
+fn both_not_installed(model_error: &LocalizedText, runtime_error: &LocalizedText) -> LocalizedText {
+    let paths = |error: &LocalizedText| error.params.get("paths").cloned().unwrap_or_default();
     text(
         "engine.bothNotInstalled",
-        format!(
-            "ランタイムとモデルが未導入です。設定でインストールしてください。({})",
-            model_error.fallback
-        ),
+        "ランタイムとモデルが未導入です。設定からインストールしてください。",
     )
-    .param("detail", &model_error.fallback)
+    .param("model_paths", paths(model_error))
+    .param("runtime_paths", paths(runtime_error))
 }
 fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, LocalizedText> {
     let search_root = exe_directory();
@@ -571,7 +570,9 @@ fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, Lo
 
     match (model, server) {
         (Ok(model), Ok(server)) => Ok(ServerPaths { model, server }),
-        (Err(model_error), Err(_)) => Err(both_not_installed(&model_error)),
+        (Err(model_error), Err(runtime_error)) => {
+            Err(both_not_installed(&model_error, &runtime_error))
+        }
         (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
@@ -880,11 +881,22 @@ mod tests {
     }
 
     #[test]
-    fn both_not_installed_carries_detail_param() {
-        let model = text("engine.modelNotInstalled", "モデルが未導入です。");
-        let combined = both_not_installed(&model);
+    fn both_not_installed_carries_path_params() {
+        let model = text("engine.modelNotInstalled", "モデルが未導入です。")
+            .param("paths", "/models/a.gguf");
+        let runtime = text("engine.runtimeNotInstalled", "ランタイムが未導入です。")
+            .param("paths", "/runtime/llama-server.exe");
+        let combined = both_not_installed(&model, &runtime);
         assert_eq!(combined.key, "engine.bothNotInstalled");
-        assert_eq!(combined.params.get("detail"), Some(&model.fallback));
+        assert_eq!(
+            combined.params.get("model_paths").map(String::as_str),
+            Some("/models/a.gguf")
+        );
+        assert_eq!(
+            combined.params.get("runtime_paths").map(String::as_str),
+            Some("/runtime/llama-server.exe")
+        );
+        assert!(!combined.fallback.contains("/models/a.gguf"));
     }
     #[test]
     fn status_matches_the_event_contract() {

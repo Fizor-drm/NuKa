@@ -345,6 +345,21 @@ fn check_client() -> Result<reqwest::Client, LocalizedText> {
         })
 }
 
+fn status_error(status: reqwest::StatusCode) -> LocalizedText {
+    match status.as_u16() {
+        403 | 429 => text(
+            "updater.rateLimited",
+            "レート制限です。時間をおいて再試行してください。",
+        ),
+        404 => text("updater.releaseMissing", "リリースが見つかりませんでした。"),
+        _ => text(
+            "updater.httpStatus",
+            format!("更新情報を取得できませんでした (HTTP {status})。"),
+        )
+        .param("status", status),
+    }
+}
+
 async fn fetch_release() -> Result<GitHubRelease, LocalizedText> {
     let client = check_client()?;
     let response = client
@@ -361,11 +376,7 @@ async fn fetch_release() -> Result<GitHubRelease, LocalizedText> {
         })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(text(
-            "updater.httpStatus",
-            format!("更新情報を取得できませんでした (HTTP {status})。"),
-        )
-        .param("status", status));
+        return Err(status_error(status));
     }
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
@@ -719,6 +730,21 @@ async fn download_asset(
     .await
 }
 
+/// キャンセル要求中は、読み取り系の失敗を既存のキャンセル扱いに寄せる。
+/// UI 側は `updater.cancelled` を受けるとエラー表示にせず available に戻す。
+fn normalize_download_error(message: LocalizedText, cancel: &AtomicBool) -> LocalizedText {
+    if cancel.load(Ordering::SeqCst)
+        && matches!(
+            message.key.as_str(),
+            "updater.readFailed" | "updater.timeout"
+        )
+    {
+        text("updater.cancelled", "ダウンロードを中止しました。")
+    } else {
+        message
+    }
+}
+
 /// 更新インストーラーをダウンロードして保持する。成功/失敗はイベントで流す。
 pub async fn download(
     app: &AppHandle,
@@ -746,6 +772,7 @@ pub async fn download(
             Ok(())
         }
         Err(message) => {
+            let message = normalize_download_error(message, &cancel);
             emit_error(app, &message);
             Err(message)
         }
@@ -929,6 +956,55 @@ mod tests {
             let _ = socket.shutdown().await;
         });
         port
+    }
+
+    #[test]
+    fn status_errors_map_to_specific_hints() {
+        assert_eq!(
+            status_error(reqwest::StatusCode::TOO_MANY_REQUESTS).key,
+            "updater.rateLimited"
+        );
+        assert_eq!(
+            status_error(reqwest::StatusCode::FORBIDDEN).key,
+            "updater.rateLimited"
+        );
+        assert_eq!(
+            status_error(reqwest::StatusCode::NOT_FOUND).key,
+            "updater.releaseMissing"
+        );
+        let other = status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(other.key, "updater.httpStatus");
+        assert_eq!(
+            other.params.get("status").map(String::as_str),
+            Some("500 Internal Server Error")
+        );
+    }
+
+    #[test]
+    fn cancel_wins_over_read_and_timeout_errors() {
+        let cancel = AtomicBool::new(true);
+        let read_error = text("updater.readFailed", "読めません").param("detail", "broken");
+        assert_eq!(
+            normalize_download_error(read_error, &cancel).key,
+            "updater.cancelled"
+        );
+        let timeout = text("updater.timeout", "タイムアウト");
+        assert_eq!(
+            normalize_download_error(timeout, &cancel).key,
+            "updater.cancelled"
+        );
+        // 読み取り/タイムアウト以外はキャンセル中でもそのまま。
+        let hash = text("updater.hashMismatch", "不一致");
+        assert_eq!(
+            normalize_download_error(hash, &cancel).key,
+            "updater.hashMismatch"
+        );
+        let idle = AtomicBool::new(false);
+        let read_again = text("updater.readFailed", "読めません");
+        assert_eq!(
+            normalize_download_error(read_again, &idle).key,
+            "updater.readFailed"
+        );
     }
 
     #[test]
