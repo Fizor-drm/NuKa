@@ -308,7 +308,10 @@ pub fn cancel_update_download(state: State<'_, AppState>) {
 
 /// ダウンロード済みのインストーラーを起動し、このアプリを終了する。
 #[tauri::command]
-pub fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn install_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), crate::message::LocalizedText> {
     let engine = state.engine.clone();
     let settings = state.settings.clone();
     crate::updater::install(&app, &state.updates, &engine, &settings)

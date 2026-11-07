@@ -1001,7 +1001,7 @@ function buildModelRows(): void {
     name.textContent = `${entry.size.toUpperCase()} · ${entry.quant}`;
     const size = document.createElement("span");
     size.className = "model-size";
-    size.textContent = formatBytes(entry.bytes);
+    size.textContent = t("models.aboutSize", { size: formatBytes(entry.bytes) });
     main.append(name, size);
 
     const actions = document.createElement("div");

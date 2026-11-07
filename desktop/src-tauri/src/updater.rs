@@ -240,29 +240,45 @@ fn is_trusted_asset_url(url: &str) -> bool {
 }
 
 /// 更新に使える asset か。名前・URL・digest をすべて検証する。
-fn select_asset(assets: &[GitHubAsset]) -> Result<UpdateAsset, String> {
+fn select_asset(assets: &[GitHubAsset]) -> Result<UpdateAsset, LocalizedText> {
     let candidates: Vec<&GitHubAsset> = assets
         .iter()
         .filter(|asset| asset.name.starts_with("NuKa_") && asset.name.ends_with("_x64-setup.exe"))
         .collect();
     if candidates.is_empty() {
-        return Err("更新ファイル (NuKa_*_x64-setup.exe) が見つかりませんでした。".to_string());
+        return Err(text(
+            "updater.assetMissing",
+            "更新ファイル (NuKa_*_x64-setup.exe) が見つかりませんでした。",
+        ));
     }
     let Some(asset) = candidates
         .into_iter()
         .find(|asset| is_safe_asset_name(&asset.name))
     else {
-        return Err("更新ファイル名が想定と違います。".to_string());
+        return Err(text(
+            "updater.assetName",
+            "更新ファイル名が想定と違います。",
+        ));
     };
 
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
-        return Err("更新ファイルのサイズが想定の範囲外です。".to_string());
+        return Err(text(
+            "updater.assetSize",
+            "更新ファイルのサイズが想定の範囲外です。",
+        ));
     }
     if !is_trusted_asset_url(&asset.browser_download_url) {
-        return Err("更新ファイルの取得先が想定と違います。".to_string());
+        return Err(text(
+            "updater.assetUrl",
+            "更新ファイルの取得先が想定と違います。",
+        ));
     }
-    let digest = normalize_digest(asset.digest.as_deref())
-        .ok_or_else(|| "更新ファイルの検証情報が取得できませんでした。".to_string())?;
+    let digest = normalize_digest(asset.digest.as_deref()).ok_or_else(|| {
+        text(
+            "updater.digestMissing",
+            "更新ファイルの検証情報が取得できませんでした。",
+        )
+    })?;
     Ok(UpdateAsset {
         name: asset.name.clone(),
         size: asset.size,
@@ -307,42 +323,49 @@ fn evaluate_release(current: &str, release: GitHubRelease) -> UpdateCheck {
             ..base
         },
         Err(message) => UpdateCheck {
-            error: Some(text("updater.checkFailed", message.clone()).param("detail", message)),
+            error: Some(message),
             ..base
         },
     }
 }
 
-fn check_client() -> Result<reqwest::Client, String> {
+fn check_client() -> Result<reqwest::Client, LocalizedText> {
     reqwest::Client::builder()
         .https_only(true)
         .user_agent(USER_AGENT)
         .connect_timeout(CHECK_TIMEOUT)
         .timeout(CHECK_TIMEOUT)
         .build()
-        .map_err(|error| format!("更新確認用クライアントを作れません: {error}"))
+        .map_err(|error| {
+            text(
+                "updater.checkClient",
+                format!("更新確認用クライアントを作れません: {error}"),
+            )
+            .param("detail", error)
+        })
 }
 
-async fn fetch_release() -> Result<GitHubRelease, String> {
+async fn fetch_release() -> Result<GitHubRelease, LocalizedText> {
     let client = check_client()?;
     let response = client
         .get(API_URL)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|error| format!("更新情報を取得できませんでした: {error}"))?;
+        .map_err(|error| {
+            text(
+                "updater.checkFailed",
+                format!("更新情報を取得できませんでした: {error}"),
+            )
+            .param("detail", error)
+        })?;
     let status = response.status();
     if !status.is_success() {
-        let hint = match status.as_u16() {
-            403 | 429 => {
-                "GitHub の API 制限に達した可能性があります。時間をおいて再試行してください。"
-            }
-            404 => "リリースが見つかりませんでした。",
-            _ => "時間をおいて再試行してください。",
-        };
-        return Err(format!(
-            "更新情報を取得できませんでした (HTTP {status})。{hint}"
-        ));
+        return Err(text(
+            "updater.httpStatus",
+            format!("更新情報を取得できませんでした (HTTP {status})。"),
+        )
+        .param("status", status));
     }
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
@@ -351,18 +374,32 @@ async fn fetch_release() -> Result<GitHubRelease, String> {
             Ok(Some(Ok(chunk))) => {
                 body.extend_from_slice(&chunk);
                 if body.len() > MAX_RESPONSE_BYTES {
-                    return Err("更新情報が大きすぎます。".to_string());
+                    return Err(text("updater.responseTooLarge", "更新情報が大きすぎます。"));
                 }
             }
             Ok(Some(Err(error))) => {
-                return Err(format!("更新情報を読めませんでした: {error}"));
+                return Err(text(
+                    "updater.responseRead",
+                    format!("更新情報を読めませんでした: {error}"),
+                )
+                .param("detail", error));
             }
             Ok(None) => break,
-            Err(_) => return Err("更新情報の取得がタイムアウトしました。".to_string()),
+            Err(_) => {
+                return Err(text(
+                    "updater.responseTimeout",
+                    "更新情報の取得がタイムアウトしました。",
+                ))
+            }
         }
     }
-    serde_json::from_slice::<GitHubRelease>(&body)
-        .map_err(|error| format!("更新情報を解析できませんでした: {error}"))
+    serde_json::from_slice::<GitHubRelease>(&body).map_err(|error| {
+        text(
+            "updater.parseFailed",
+            format!("更新情報を解析できませんでした: {error}"),
+        )
+        .param("detail", error)
+    })
 }
 
 /// GitHub の最新リリースを確認する。失敗しても Result ではなく `error` に入れて返す。
@@ -376,7 +413,7 @@ pub async fn check(_app: &AppHandle, state: &UpdateState) -> UpdateCheck {
             latest: None,
             available: false,
             asset: None,
-            error: Some(text("updater.assetError", message.clone()).param("detail", message)),
+            error: Some(message),
         },
     };
     let mut offer = state.lock_offer();
@@ -398,11 +435,17 @@ pub async fn check(_app: &AppHandle, state: &UpdateState) -> UpdateCheck {
 // ダウンロード
 // ---------------------------------------------------------------------------
 
-fn cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn cache_dir(app: &AppHandle) -> Result<PathBuf, LocalizedText> {
     app.path()
         .app_cache_dir()
         .map(|directory| directory.join("update"))
-        .map_err(|error| format!("保存先を取得できません: {error}"))
+        .map_err(|error| {
+            text(
+                "updater.cachePath",
+                format!("保存先を取得できません: {error}"),
+            )
+            .param("detail", error)
+        })
 }
 
 /// 起動時に、中断されたダウンロードやインストーラーの残骸を片付ける。
@@ -426,29 +469,38 @@ fn remove_if_exists(path: &Path) {
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+fn sha256_file(path: &Path) -> Result<String, LocalizedText> {
     let mut file = fs::File::open(path).map_err(|error| {
         eprintln!("SHA-256 の対象を開けません ({}): {error}", path.display());
-        "SHA-256 を計算できませんでした。".to_string()
+        text("updater.fileCheck", "SHA-256 を計算できませんでした。")
     })?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).map_err(|error| {
         eprintln!("SHA-256 を計算できません ({}): {error}", path.display());
-        "SHA-256 を計算できませんでした。".to_string()
+        text("updater.fileCheck", "SHA-256 を計算できませんでした。")
     })?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// ダウンロードしたファイルを検証する。SHA-256 は必須で、正規化済みの 64 文字 hex を受ける。
 /// ここで再正規化はしない (二重適用で検証が素通りする事故を防ぐ)。
-fn verify_download(path: &Path, expected_size: u64, digest: &str) -> Result<(), String> {
+fn verify_download(path: &Path, expected_size: u64, digest: &str) -> Result<(), LocalizedText> {
     let size = fs::metadata(path)
-        .map_err(|error| format!("更新ファイルを確認できません: {error}"))?
+        .map_err(|error| {
+            text(
+                "updater.fileCheck",
+                format!("更新ファイルを確認できません: {error}"),
+            )
+            .param("detail", error)
+        })?
         .len();
     if size != expected_size {
-        return Err(format!(
-            "更新ファイルのサイズが一致しません ({size} / {expected_size} バイト)。"
-        ));
+        return Err(text(
+            "updater.sizeMismatch",
+            format!("更新ファイルのサイズが一致しません ({size} / {expected_size} バイト)。"),
+        )
+        .param("actual", size)
+        .param("expected", expected_size));
     }
     let expected = digest.trim().to_ascii_lowercase();
     if expected.len() != 64
@@ -456,26 +508,36 @@ fn verify_download(path: &Path, expected_size: u64, digest: &str) -> Result<(), 
             .chars()
             .all(|character| character.is_ascii_hexdigit())
     {
-        return Err("更新ファイルの検証情報が不正です。".to_string());
+        return Err(text(
+            "updater.digestInvalid",
+            "更新ファイルの検証情報が不正です。",
+        ));
     }
     let actual = sha256_file(path)?;
     if actual != expected {
         eprintln!("更新ファイルの SHA-256 が一致しません (期待 {expected} / 実際 {actual})");
-        return Err("更新ファイルの SHA-256 が一致しません。".to_string());
+        return Err(text(
+            "updater.hashMismatch",
+            "更新ファイルの SHA-256 が一致しません。",
+        ));
     }
     Ok(())
 }
 
-fn download_client() -> Result<reqwest::Client, String> {
+fn download_client() -> Result<reqwest::Client, LocalizedText> {
     let builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT);
     // テストではローカル HTTP のスタブに接続するため、テスト時だけ https 強制を外す。
     #[cfg(not(test))]
     let builder = builder.https_only(true);
-    builder
-        .build()
-        .map_err(|error| format!("ダウンロード用クライアントを作れません: {error}"))
+    builder.build().map_err(|error| {
+        text(
+            "updater.downloadClient",
+            format!("ダウンロード用クライアントを作れません: {error}"),
+        )
+        .param("detail", error)
+    })
 }
 
 /// 実ファイルのダウンロードと検証。保存先を引数で受けるので、テストからも同じ経路を通せる。
@@ -484,12 +546,18 @@ async fn download_to_directory(
     directory: &Path,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(u64, u64),
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, LocalizedText> {
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
-        return Err("更新ファイルのサイズが想定の範囲外です。".to_string());
+        return Err(text(
+            "updater.assetSize",
+            "更新ファイルのサイズが想定の範囲外です。",
+        ));
     }
     if !is_safe_asset_name(&asset.name) {
-        return Err("更新ファイル名が想定と違います。".to_string());
+        return Err(text(
+            "updater.assetName",
+            "更新ファイル名が想定と違います。",
+        ));
     }
     if asset.digest.len() != 64
         || !asset
@@ -497,7 +565,10 @@ async fn download_to_directory(
             .chars()
             .all(|character| character.is_ascii_hexdigit())
     {
-        return Err("更新ファイルの検証情報が不正です。".to_string());
+        return Err(text(
+            "updater.digestInvalid",
+            "更新ファイルの検証情報が不正です。",
+        ));
     }
     let dest = directory.join(&asset.name);
     let part = part_path(&dest);
@@ -505,27 +576,38 @@ async fn download_to_directory(
     remove_if_exists(&dest);
 
     let client = download_client()?;
-    let response = client
-        .get(&asset.url)
-        .send()
-        .await
-        .map_err(|error| format!("ダウンロードを開始できません: {error}"))?;
+    let response = client.get(&asset.url).send().await.map_err(|error| {
+        text(
+            "updater.downloadStart",
+            format!("ダウンロードを開始できません: {error}"),
+        )
+        .param("detail", error)
+    })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("配布元が {status} を返しました。"));
+        return Err(text(
+            "updater.httpStatus",
+            format!("配布元が {status} を返しました。"),
+        )
+        .param("status", status));
     }
     if let Some(length) = response.content_length() {
         if length != asset.size {
-            return Err(format!(
-                "配布元のサイズが想定と違います ({length} / {} バイト)。",
-                asset.size
-            ));
+            return Err(text(
+                "updater.sizeMismatch",
+                format!(
+                    "配布元のサイズが想定と違います ({length} / {} バイト)。",
+                    asset.size
+                ),
+            )
+            .param("actual", length)
+            .param("expected", asset.size));
         }
     }
 
-    let mut file = tokio::fs::File::create(&part)
-        .await
-        .map_err(|error| format!("保存先を作れません: {error}"))?;
+    let mut file = tokio::fs::File::create(&part).await.map_err(|error| {
+        text("updater.savePath", format!("保存先を作れません: {error}")).param("detail", error)
+    })?;
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
     let mut last_emit = Instant::now();
@@ -535,7 +617,7 @@ async fn download_to_directory(
         if cancel.load(Ordering::SeqCst) {
             drop(file);
             remove_if_exists(&part);
-            return Err("ダウンロードを中止しました。".to_string());
+            return Err(text("updater.cancelled", "ダウンロードを中止しました。"));
         }
         let item = tokio::time::timeout(READ_TIMEOUT, stream.next()).await;
         let chunk = match item {
@@ -543,25 +625,39 @@ async fn download_to_directory(
             Ok(Some(Err(error))) => {
                 drop(file);
                 remove_if_exists(&part);
-                return Err(format!("ダウンロードを読めません: {error}"));
+                return Err(text(
+                    "updater.readFailed",
+                    format!("ダウンロードを読めません: {error}"),
+                )
+                .param("detail", error));
             }
             Ok(None) => break,
             Err(_) => {
                 drop(file);
                 remove_if_exists(&part);
-                return Err("ダウンロードがタイムアウトしました。".to_string());
+                return Err(text(
+                    "updater.timeout",
+                    "ダウンロードがタイムアウトしました。",
+                ));
             }
         };
         if let Err(error) = file.write_all(&chunk).await {
             drop(file);
             remove_if_exists(&part);
-            return Err(format!("ダウンロードを書き込めません: {error}"));
+            return Err(text(
+                "updater.writeFailed",
+                format!("ダウンロードを書き込めません: {error}"),
+            )
+            .param("detail", error));
         }
         written += chunk.len() as u64;
         if written > asset.size || written > MAX_UPDATE_BYTES {
             drop(file);
             remove_if_exists(&part);
-            return Err("更新ファイルが想定より大きいため中止しました。".to_string());
+            return Err(text(
+                "updater.tooLarge",
+                "更新ファイルが想定より大きいため中止しました。",
+            ));
         }
         if last_emit.elapsed() >= PROGRESS_INTERVAL {
             on_progress(written, asset.size);
@@ -571,7 +667,11 @@ async fn download_to_directory(
     if let Err(error) = file.flush().await {
         drop(file);
         remove_if_exists(&part);
-        return Err(format!("ダウンロードを書き込めません: {error}"));
+        return Err(text(
+            "updater.writeFailed",
+            format!("ダウンロードを書き込めません: {error}"),
+        )
+        .param("detail", error));
     }
     drop(file);
     on_progress(written, asset.size);
@@ -583,11 +683,15 @@ async fn download_to_directory(
     eprintln!("更新ファイルの SHA-256 を確認しました");
     if cancel.load(Ordering::SeqCst) {
         remove_if_exists(&part);
-        return Err("ダウンロードを中止しました。".to_string());
+        return Err(text("updater.cancelled", "ダウンロードを中止しました。"));
     }
     fs::rename(&part, &dest).map_err(|error| {
         remove_if_exists(&part);
-        format!("更新ファイルを配置できません: {error}")
+        text(
+            "updater.renameFailed",
+            format!("更新ファイルを配置できません: {error}"),
+        )
+        .param("detail", error)
     })?;
     Ok(dest)
 }
@@ -596,14 +700,19 @@ async fn download_asset(
     app: &AppHandle,
     offer: &UpdateOffer,
     cancel: &AtomicBool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, LocalizedText> {
     let asset = &offer.asset;
     // 保持している URL も再検証する。
     if !is_trusted_asset_url(&asset.url) {
-        return Err("更新ファイルの取得先が想定と違います。".to_string());
+        return Err(text(
+            "updater.assetUrl",
+            "更新ファイルの取得先が想定と違います。",
+        ));
     }
     let directory = cache_dir(app)?;
-    fs::create_dir_all(&directory).map_err(|error| format!("保存先を作れません: {error}"))?;
+    fs::create_dir_all(&directory).map_err(|error| {
+        text("updater.savePath", format!("保存先を作れません: {error}")).param("detail", error)
+    })?;
     download_to_directory(asset, &directory, cancel, |downloaded, total| {
         emit_progress(app, downloaded, total);
     })
@@ -637,13 +746,8 @@ pub async fn download(
             Ok(())
         }
         Err(message) => {
-            let localized = if cancel.load(Ordering::SeqCst) && message.contains("中止") {
-                text("updater.cancelled", "ダウンロードを中止しました。")
-            } else {
-                text("updater.downloadFailed", message.clone()).param("detail", message)
-            };
-            emit_error(app, &localized);
-            Err(localized)
+            emit_error(app, &message);
+            Err(message)
         }
     }
 }
@@ -669,15 +773,18 @@ pub fn install(
     state: &UpdateState,
     engine: &Engine,
     settings: &SettingsStore,
-) -> Result<(), String> {
+) -> Result<(), LocalizedText> {
     // take() で消費し、二重起動を防ぐ。起動に失敗したときだけ戻す。
     let downloaded = {
         let mut guard = state.lock_downloaded();
-        guard
-            .take()
-            .ok_or_else(|| "更新ファイルがありません。先にダウンロードしてください。".to_string())?
+        guard.take().ok_or_else(|| {
+            text(
+                "updater.notDownloaded",
+                "更新ファイルがありません。先にダウンロードしてください。",
+            )
+        })?
     };
-    let restore = |message: String| -> Result<(), String> {
+    let restore = |message: LocalizedText| -> Result<(), LocalizedText> {
         *state.lock_downloaded() = Some(downloaded.clone());
         Err(message)
     };
@@ -687,19 +794,34 @@ pub fn install(
         Err(error) => return restore(error),
     };
     if downloaded.path.parent() != Some(directory.as_path()) {
-        return restore("更新ファイルの保存先が想定と違います。".to_string());
+        return restore(text(
+            "updater.installPath",
+            "更新ファイルの保存先が想定と違います。",
+        ));
     }
     let metadata = match fs::symlink_metadata(&downloaded.path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return restore(format!("更新ファイルを確認できません: {error}"));
+            return restore(
+                text(
+                    "updater.fileCheck",
+                    format!("更新ファイルを確認できません: {error}"),
+                )
+                .param("detail", error),
+            );
         }
     };
     if metadata.file_type().is_symlink() {
-        return restore("更新ファイルがシンボリックリンクのため中止しました。".to_string());
+        return restore(text(
+            "updater.installSymlink",
+            "更新ファイルがシンボリックリンクのため中止しました。",
+        ));
     }
     if !metadata.is_file() {
-        return restore("更新ファイルが見つかりません。再ダウンロードしてください。".to_string());
+        return restore(text(
+            "updater.installMissing",
+            "更新ファイルが見つかりません。再ダウンロードしてください。",
+        ));
     }
 
     // インストーラーとファイルロックが競合しないよう、先にエンジンを止める。
@@ -728,7 +850,13 @@ pub fn install(
                     engine.start(&settings).await;
                 });
             }
-            return restore(format!("インストーラーを起動できません: {error}"));
+            return restore(
+                text(
+                    "updater.installSpawn",
+                    format!("インストーラーを起動できません: {error}"),
+                )
+                .param("detail", error),
+            );
         }
     };
     let pid = child.id();
@@ -903,7 +1031,7 @@ mod tests {
             digest,
         )];
         let error = select_asset(&evil).expect_err("URL が違えば拒否");
-        assert!(error.contains("取得先"));
+        assert!(error.fallback.contains("取得先"));
 
         let too_large = vec![asset(
             "NuKa_1.0.0_x64-setup.exe",
@@ -927,7 +1055,7 @@ mod tests {
         ] {
             let assets = vec![asset("NuKa_1.0.0_x64-setup.exe", 10, GOOD_URL, digest)];
             let error = select_asset(&assets).expect_err("digest 不備は拒否");
-            assert!(error.contains("検証情報"), "{digest:?}: {error}");
+            assert!(error.fallback.contains("検証情報"), "{digest:?}: {error:?}");
         }
     }
 
@@ -941,7 +1069,7 @@ mod tests {
         ] {
             let assets = vec![asset(name, 10, GOOD_URL, Some(TEST_DIGEST_FIELD))];
             let error = select_asset(&assets).expect_err("危険な名前は拒否");
-            assert!(error.contains("ファイル名"), "{name}: {error}");
+            assert!(error.fallback.contains("ファイル名"), "{name}: {error:?}");
         }
 
         let evil_url = "https://github.com/Fizor-drm/NuKa/releases/download/v1.0.0/../evil/NuKa_1.0.0_x64-setup.exe";
@@ -957,7 +1085,7 @@ mod tests {
             Some(TEST_DIGEST_FIELD),
         )];
         let error = select_asset(&assets).expect_err(".. を含む URL は拒否");
-        assert!(error.contains("取得先"), "{error}");
+        assert!(error.fallback.contains("取得先"), "{error:?}");
     }
 
     #[test]
@@ -1059,7 +1187,7 @@ mod tests {
         fs::write(&path, &tampered).unwrap();
         let error =
             verify_download(&path, download.size, &download.digest).expect_err("改ざんは拒否");
-        assert!(error.contains("SHA-256"));
+        assert!(error.fallback.contains("SHA-256"));
 
         // 4) 改ざんされた配信をダウンロードすると失敗し、成果物を残さない
         let port = spawn_stub(tampered).await;
@@ -1070,7 +1198,7 @@ mod tests {
         let error = download_to_directory(&bad, &directory, &cancel, |_, _| {})
             .await
             .expect_err("digest 不一致は失敗");
-        assert!(error.contains("SHA-256"));
+        assert!(error.fallback.contains("SHA-256"));
         assert!(!directory.join(&download.name).exists());
         assert!(!part_path(&directory.join(&download.name)).exists());
         let _ = fs::remove_dir_all(&directory);

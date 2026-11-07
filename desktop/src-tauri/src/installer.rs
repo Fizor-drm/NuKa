@@ -213,9 +213,15 @@ fn download_client() -> Result<reqwest::Client, DownloadError> {
     // テストではローカル HTTP のスタブに接続するため、テスト時だけ https 強制を外す。
     #[cfg(not(test))]
     let builder = builder.https_only(true);
-    builder
-        .build()
-        .map_err(|error| failed(format!("ダウンロード用クライアントを作れません: {error}")))
+    builder.build().map_err(|error| {
+        failed(
+            text(
+                "installer.clientCreate",
+                format!("ダウンロード用クライアントを作れません: {error}"),
+            )
+            .param("detail", error),
+        )
+    })
 }
 
 fn check_cancelled(cancel: &AtomicBool) -> Result<(), DownloadError> {
@@ -247,24 +253,41 @@ fn sha256_file(path: &Path) -> Result<String, DownloadError> {
 fn verify_archive(path: &Path, archive: &RuntimeArchive) -> Result<(), DownloadError> {
     let size = fs::metadata(path)
         .map_err(|error| {
-            failed(format!(
-                "配布ファイルを確認できません ({}): {error}",
-                path.display()
-            ))
+            failed(
+                text(
+                    "installer.verifyInfo",
+                    format!("配布ファイルを確認できません: {error}"),
+                )
+                .param("detail", error),
+            )
         })?
         .len();
     if size != archive.bytes {
-        return Err(failed(format!(
-            "配布ファイルのサイズが一致しません ({size} / {} バイト): {}",
-            archive.bytes, archive.file_name
-        )));
+        return Err(failed(
+            text(
+                "installer.archiveSizeMismatch",
+                format!(
+                    "配布ファイルのサイズが一致しません ({size} / {} バイト): {}",
+                    archive.bytes, archive.file_name
+                ),
+            )
+            .param("actual", size)
+            .param("expected", archive.bytes)
+            .param("file", archive.file_name),
+        ));
     }
     let actual = sha256_file(path)?;
     if !actual.eq_ignore_ascii_case(archive.sha256) {
-        return Err(failed(format!(
-            "配布ファイルの SHA-256 が一致しません: {} (取得値 {actual})",
-            archive.file_name
-        )));
+        return Err(failed(
+            text(
+                "installer.hashMismatch",
+                format!(
+                    "配布ファイルの SHA-256 が一致しません: {}",
+                    archive.file_name
+                ),
+            )
+            .param("file", archive.file_name),
+        ));
     }
     Ok(())
 }
@@ -302,35 +325,70 @@ where
     remove_if_exists(&part);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|error| {
-            failed(format!(
-                "保存先を作れません ({}): {error}",
-                parent.display()
-            ))
+            failed(
+                text("installer.savePath", format!("保存先を作れません: {error}"))
+                    .param("detail", error),
+            )
         })?;
     }
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| failed(format!("ダウンロードを開始できません ({url}): {error}")))?;
+    let response = client.get(url).send().await.map_err(|error| {
+        failed(
+            text(
+                "installer.downloadStart",
+                format!("ダウンロードを開始できません: {error}"),
+            )
+            .param("detail", error),
+        )
+    })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(failed(format!("配布元が {status} を返しました ({url})")));
+        return Err(failed(
+            text(
+                "installer.httpStatus",
+                format!("配布元が {status} を返しました。"),
+            )
+            .param("status", status),
+        ));
     }
     let content_length = response.content_length().filter(|length| *length > 0);
-    if let (Some(expected), Some(actual)) = (expected.filter(|size| *size > 0), content_length) {
-        if expected != actual {
-            return Err(failed(format!(
-                "配布元のサイズが想定と違います ({actual} / {expected} バイト) {url}"
-            )));
+    let expected = match expected.filter(|size| *size > 0) {
+        Some(expected) => {
+            if let Some(actual) = content_length {
+                if actual != expected {
+                    return Err(failed(
+                        text(
+                            "installer.remoteSizeMismatch",
+                            format!(
+                                "配布元のサイズが想定と違います ({actual} / {expected} バイト)。"
+                            ),
+                        )
+                        .param("actual", actual)
+                        .param("expected", expected),
+                    ));
+                }
+            }
+            Some(expected)
         }
-    }
-    let expected = expected.filter(|size| *size > 0).or(content_length);
+        None => Some(content_length.ok_or_else(|| {
+            failed(text(
+                "installer.remoteSizeUnknown",
+                "配布元のサイズを確認できませんでした。",
+            ))
+        })?),
+    };
+    let total = if total > 0 {
+        total
+    } else {
+        expected.unwrap_or(0)
+    };
 
-    let mut file = tokio::fs::File::create(&part)
-        .await
-        .map_err(|error| failed(format!("保存先を作れません ({}): {error}", part.display())))?;
+    let mut file = tokio::fs::File::create(&part).await.map_err(|error| {
+        failed(
+            text("installer.savePath", format!("保存先を作れません: {error}"))
+                .param("detail", error),
+        )
+    })?;
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
     let mut last_emit = Instant::now();
@@ -349,28 +407,50 @@ where
             Ok(Some(Err(error))) => {
                 drop(file);
                 remove_if_exists(&part);
-                return Err(failed(format!("ダウンロードを読めません: {error}")));
+                return Err(failed(
+                    text(
+                        "installer.readFailed",
+                        format!("ダウンロードを読めません: {error}"),
+                    )
+                    .param("detail", error),
+                ));
             }
             Ok(None) => break,
             Err(_) => {
                 drop(file);
                 remove_if_exists(&part);
-                return Err(failed("ダウンロードがタイムアウトしました。"));
+                return Err(failed(text(
+                    "installer.timeout",
+                    "ダウンロードがタイムアウトしました。",
+                )));
             }
         };
         if let Err(error) = file.write_all(&bytes).await {
             drop(file);
             remove_if_exists(&part);
-            return Err(failed(format!("ダウンロードを書き込めません: {error}")));
+            return Err(failed(
+                text(
+                    "installer.writeFailed",
+                    format!("ダウンロードを書き込めません: {error}"),
+                )
+                .param("detail", error),
+            ));
         }
         written += bytes.len() as u64;
         if let Some(expected) = expected {
             if written > expected {
                 drop(file);
                 remove_if_exists(&part);
-                return Err(failed(format!(
-                    "配布元のデータが想定より大きいため中止しました ({written} / {expected} バイト)"
-                )));
+                return Err(failed(
+                    text(
+                        "installer.dataTooLarge",
+                        format!(
+                            "配布元のデータが想定より大きいため中止しました ({written} / {expected} バイト)"
+                        ),
+                    )
+                    .param("actual", written)
+                    .param("expected", expected),
+                ));
             }
         }
         if last_emit.elapsed() >= PROGRESS_INTERVAL {
@@ -381,7 +461,13 @@ where
     if let Err(error) = file.flush().await {
         drop(file);
         remove_if_exists(&part);
-        return Err(failed(format!("ダウンロードを書き込めません: {error}")));
+        return Err(failed(
+            text(
+                "installer.writeFailed",
+                format!("ダウンロードを書き込めません: {error}"),
+            )
+            .param("detail", error),
+        ));
     }
     drop(file);
 
@@ -390,22 +476,38 @@ where
         Ok(metadata) => metadata.len(),
         Err(error) => {
             remove_if_exists(&part);
-            return Err(failed(format!("ダウンロードを確認できません: {error}")));
+            return Err(failed(
+                text(
+                    "installer.verifyFailed",
+                    format!("ダウンロードを確認できません: {error}"),
+                )
+                .param("detail", error),
+            ));
         }
     };
     if let Some(expected) = expected {
         if actual != expected {
             remove_if_exists(&part);
-            return Err(failed(format!(
-                "ダウンロードのサイズが一致しません ({actual} / {expected} バイト) {url}"
-            )));
+            return Err(failed(
+                text(
+                    "installer.sizeMismatch",
+                    format!("ダウンロードのサイズが一致しません ({actual} / {expected} バイト)。"),
+                )
+                .param("actual", actual)
+                .param("expected", expected),
+            ));
         }
     }
     if actual != written {
         remove_if_exists(&part);
-        return Err(failed(format!(
-            "ダウンロードの書き込み量が一致しません ({written} / {actual} バイト)"
-        )));
+        return Err(failed(
+            text(
+                "installer.partSizeMismatch",
+                format!("ダウンロードの書き込み量が一致しません ({written} / {actual} バイト)。"),
+            )
+            .param("actual", actual)
+            .param("expected", written),
+        ));
     }
 
     if cancel.load(Ordering::SeqCst) {
@@ -413,10 +515,13 @@ where
         return Err(DownloadError::Cancelled);
     }
     fs::rename(&part, dest).map_err(|error| {
-        failed(format!(
-            "ダウンロードを配置できません ({}): {error}",
-            dest.display()
-        ))
+        failed(
+            text(
+                "installer.renameFailed",
+                format!("ダウンロードを配置できません: {error}"),
+            )
+            .param("detail", error),
+        )
     })?;
     on_progress(written, total);
     Ok(written)
@@ -470,10 +575,15 @@ async fn install_runtime_inner(
     const KIND: &str = "runtime";
     const ID: &str = "runtime";
     let client = download_client()?;
-    let local_data = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| failed(format!("保存先を取得できません: {error}")))?;
+    let local_data = app.path().app_local_data_dir().map_err(|error| {
+        failed(
+            text(
+                "installer.localDataFailed",
+                format!("保存先を取得できません: {error}"),
+            )
+            .param("detail", error),
+        )
+    })?;
     let runtime_root = local_data.join("runtime");
     let llama_dir = runtime_root.join("llama");
     let staging_dir = runtime_root.join("llama.staging");
@@ -536,16 +646,27 @@ async fn install_runtime_inner(
         // 展開は staging に対して行い、検証が通るまで既存の llama には触らない。
         for (zip, archive) in [(&llama_zip, &LLAMA_ZIP), (&cudart_zip, &CUDART_ZIP)] {
             if !zip.is_file() {
-                return Err(failed(format!(
-                    "配布ファイルが見つかりません: {}",
-                    archive.file_name
-                )));
+                return Err(failed(
+                    text(
+                        "installer.archiveMissing",
+                        format!("配布ファイルが見つかりません: {}", archive.file_name),
+                    )
+                    .param("file", archive.file_name),
+                ));
             }
             let source = zip.clone();
             let destination = staging_dir.clone();
             tokio::task::spawn_blocking(move || extract_zip(&source, &destination))
                 .await
-                .map_err(|error| failed(format!("展開処理が落ちました: {error}")))??;
+                .map_err(|error| {
+                    failed(
+                        text(
+                            "installer.unzipFailed",
+                            format!("展開処理が落ちました: {error}"),
+                        )
+                        .param("detail", error),
+                    )
+                })??;
             check_cancelled(&cancel)?;
         }
         verify_runtime_dir(&staging_dir).map_err(DownloadError::Failed)?;
@@ -616,21 +737,25 @@ pub fn verify_runtime_dir(dir: &Path) -> Result<(), LocalizedText> {
 /// zip を `dest` 直下へ展開する。ディレクトリは無視し、パス脱出する項目は捨てる。
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), DownloadError> {
     let file = fs::File::open(zip_path).map_err(|error| {
-        failed(format!(
-            "zip を開けません ({}): {error}",
-            zip_path.display()
-        ))
+        failed(
+            text("installer.zipOpen", format!("zip を開けません: {error}")).param("detail", error),
+        )
     })?;
     let mut archive = zip::ZipArchive::new(file).map_err(|error| {
-        failed(format!(
-            "zip を読めません ({}): {error}",
-            zip_path.display()
-        ))
+        failed(
+            text("installer.zipRead", format!("zip を読めません: {error}")).param("detail", error),
+        )
     })?;
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| failed(format!("zip の項目を読めません: {error}")))?;
+        let mut entry = archive.by_index(index).map_err(|error| {
+            failed(
+                text(
+                    "installer.zipItem",
+                    format!("zip の項目を読めません: {error}"),
+                )
+                .param("detail", error),
+            )
+        })?;
         if entry.is_dir() {
             continue;
         }
@@ -642,16 +767,16 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), DownloadError> {
         };
         let target = dest.join(file_name);
         let mut output = fs::File::create(&target).map_err(|error| {
-            failed(format!(
-                "展開先に書けません ({}): {error}",
-                target.display()
-            ))
+            failed(
+                text("installer.zipWrite", format!("展開先に書けません: {error}"))
+                    .param("detail", error),
+            )
         })?;
         std::io::copy(&mut entry, &mut output).map_err(|error| {
-            failed(format!(
-                "展開に失敗しました ({}): {error}",
-                target.display()
-            ))
+            failed(
+                text("installer.zipCopy", format!("展開に失敗しました: {error}"))
+                    .param("detail", error),
+            )
         })?;
     }
     Ok(())
@@ -693,32 +818,33 @@ pub async fn install_model(
     }
 }
 
-/// 既存ファイルの状態。`Ok(true)` は同サイズのファイルが既にある (再 DL 不要)。
-fn existing_model_file(dest: &Path, expected: u64) -> Result<bool, DownloadError> {
+/// 既存ファイルの状態。`Ok(Some(bytes))` は再利用できるファイルがある。
+/// カタログのバイト数は表示用の目安なので、実サイズと突き合わせない。
+fn existing_model_file(dest: &Path) -> Result<Option<u64>, DownloadError> {
     match fs::symlink_metadata(dest) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(failed(format!(
-                    "保存先にファイル以外のものがあります: {}",
-                    dest.display()
-                )));
+                return Err(failed(
+                    text(
+                        "installer.modelPathNotFile",
+                        format!("保存先にファイル以外のものがあります: {}", dest.display()),
+                    )
+                    .param("detail", dest.display()),
+                ));
             }
-            if metadata.len() == expected {
-                Ok(true)
-            } else {
-                Err(failed(format!(
-                    "サイズの合わないファイルが既にあります: {} ({} / {} バイト)。削除してから再実行してください。",
-                    dest.display(),
-                    metadata.len(),
-                    expected
-                )))
+            if metadata.len() == 0 {
+                return Ok(None);
             }
+            Ok(Some(metadata.len()))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(failed(format!(
-            "既存ファイルを確認できません ({}): {error}",
-            dest.display()
-        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(failed(
+            text(
+                "installer.existingCheck",
+                format!("既存ファイルを確認できません: {error}"),
+            )
+            .param("detail", error),
+        )),
     }
 }
 
@@ -726,11 +852,12 @@ fn register_model(
     settings: &SettingsStore,
     entry: &CatalogEntry,
     dest: &Path,
+    bytes: u64,
 ) -> Result<InstalledModel, DownloadError> {
     let model = InstalledModel {
         file: entry.file.clone(),
         repo: entry.repo.clone(),
-        bytes: entry.bytes,
+        bytes,
         path: dest.to_string_lossy().into_owned(),
         installed_at: unix_seconds(),
     };
@@ -740,7 +867,9 @@ fn register_model(
             next.installed_models.push(model.clone());
             Ok(())
         })
-        .map_err(failed)?;
+        .map_err(|message| {
+            failed(text("installer.registerFailed", message.clone()).param("detail", message))
+        })?;
     Ok(model)
 }
 
@@ -752,38 +881,45 @@ async fn install_model_inner(
 ) -> Result<InstalledModel, DownloadError> {
     const KIND: &str = "model";
     let current = settings.get();
-    let models_dir = models_dir_for(app, &current).map_err(failed)?;
+    let models_dir = models_dir_for(app, &current).map_err(|message| {
+        failed(text("installer.localDataFailed", message.clone()).param("detail", message))
+    })?;
     let dest = models_dir.join(&entry.file);
 
     // settings を作り直した・保存先を変えた等で、同じファイルが既にある場合は
-    // ダウンロードせず登録だけ行う。
-    if existing_model_file(&dest, entry.bytes)? {
-        return register_model(settings, entry, &dest);
+    // ダウンロードせず登録だけ行う (サイズは実ファイルから記録する)。
+    if let Some(bytes) = existing_model_file(&dest)? {
+        return register_model(settings, entry, &dest, bytes);
     }
 
     fs::create_dir_all(&models_dir).map_err(|error| {
-        failed(format!(
-            "保存先を作れません ({}): {error}",
-            models_dir.display()
-        ))
+        failed(
+            text("installer.savePath", format!("保存先を作れません: {error}"))
+                .param("detail", error),
+        )
     })?;
 
     let client = download_client()?;
     let progress_app = app.clone();
     let id = entry.id.clone();
+    // 期待サイズはカタログ定数ではなく GET 応答の Content-Length を使う。
+    // (HF の再アップロードでカタログ値が陳腐化しても DL を壊さない)
     download_file(
         &client,
         &entry.url,
         &dest,
-        Some(entry.bytes),
-        entry.bytes,
+        None,
+        0,
         &cancel,
         move |written, total| emit_progress(&progress_app, KIND, &id, written, total),
     )
     .await?;
 
     check_cancelled(&cancel)?;
-    register_model(settings, entry, &dest)
+    let bytes = fs::metadata(&dest)
+        .map(|metadata| metadata.len())
+        .unwrap_or(entry.bytes);
+    register_model(settings, entry, &dest, bytes)
 }
 
 /// インストール済みモデルを削除する。使用中のものは拒否する。
@@ -1222,6 +1358,135 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
+    /// Content-Length を付けずに本文を返すサーバ (サイズ不明の再現)。
+    async fn spawn_stub_without_length(body: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("stub を bind できる");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = [0u8; 4096];
+            let _ = socket.read(&mut head).await;
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn download_uses_content_length_when_expected_is_unknown() {
+        let directory = temp_dir("download-dynamic");
+        let dest = directory.join("model.gguf");
+        let body = vec![3u8; 4096];
+        let port = spawn_stub(body.clone(), None).await;
+        let client = download_client().expect("client");
+        let cancel = AtomicBool::new(false);
+        let mut totals = Vec::new();
+        let written = download_file(
+            &client,
+            &format!("http://127.0.0.1:{port}/model.gguf"),
+            &dest,
+            None,
+            0,
+            &cancel,
+            |_, total| totals.push(total),
+        )
+        .await
+        .expect("Content-Length で検証できる");
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(fs::read(&dest).expect("ファイルがある"), body);
+        assert!(totals.contains(&(body.len() as u64)));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn download_fails_without_content_length() {
+        let directory = temp_dir("download-no-length");
+        let dest = directory.join("model.gguf");
+        let port = spawn_stub_without_length(vec![4u8; 1024]).await;
+        let client = download_client().expect("client");
+        let cancel = AtomicBool::new(false);
+        let error = download_file(
+            &client,
+            &format!("http://127.0.0.1:{port}/model.gguf"),
+            &dest,
+            None,
+            0,
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .expect_err("サイズ不明は失敗する");
+        assert!(error
+            .message()
+            .fallback
+            .contains("サイズを確認できませんでした"));
+        assert!(!dest.exists());
+        assert!(!part_path(&dest).exists());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn download_fails_with_zero_content_length() {
+        let directory = temp_dir("download-zero-length");
+        let dest = directory.join("model.gguf");
+        let port = spawn_stub(vec![5u8; 1024], Some(0)).await;
+        let client = download_client().expect("client");
+        let cancel = AtomicBool::new(false);
+        let error = download_file(
+            &client,
+            &format!("http://127.0.0.1:{port}/model.gguf"),
+            &dest,
+            None,
+            0,
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .expect_err("Content-Length: 0 は失敗する");
+        assert!(error
+            .message()
+            .fallback
+            .contains("サイズを確認できませんでした"));
+        assert!(!dest.exists());
+        assert!(!part_path(&dest).exists());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn download_rejects_truncated_body() {
+        let directory = temp_dir("download-truncated");
+        let dest = directory.join("model.gguf");
+        let body = vec![6u8; 1024];
+        let port = spawn_stub(body, Some(4096)).await;
+        let client = download_client().expect("client");
+        let cancel = AtomicBool::new(false);
+        let error = download_file(
+            &client,
+            &format!("http://127.0.0.1:{port}/model.gguf"),
+            &dest,
+            None,
+            0,
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .expect_err("本文が短ければ失敗する");
+        assert!(
+            error.message().fallback.contains("サイズ")
+                || error.message().fallback.contains("読めません")
+        );
+        assert!(!dest.exists());
+        assert!(!part_path(&dest).exists());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
     #[tokio::test]
     async fn cancel_removes_the_part_file() {
         let directory = temp_dir("download-cancel");
@@ -1307,17 +1572,16 @@ mod tests {
     }
 
     #[test]
-    fn existing_model_file_classifies_match_and_mismatch() {
+    fn existing_model_file_reuses_any_non_empty_file() {
         let directory = temp_dir("existing-model");
         let path = directory.join("model.gguf");
-        assert!(!existing_model_file(&path, 3).expect("無い場合は false"));
+        assert!(existing_model_file(&path)
+            .expect("無い場合は None")
+            .is_none());
         fs::write(&path, b"abc").unwrap();
-        assert!(existing_model_file(&path, 3).expect("同サイズは true"));
-        let error = existing_model_file(&path, 4).expect_err("サイズ違いは拒否");
-        assert!(error
-            .message()
-            .fallback
-            .contains("サイズの合わないファイル"));
+        assert_eq!(existing_model_file(&path).expect("ファイルあり"), Some(3));
+        fs::write(&path, b"").unwrap();
+        assert!(existing_model_file(&path).expect("空ファイル").is_none());
         let _ = fs::remove_dir_all(&directory);
     }
 

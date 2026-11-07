@@ -143,6 +143,7 @@ const ja: Dict = {
   "runtime.cancel": "取消",
   "runtime.meta": "llama.cpp b12136 (CUDA 12.4) / 合計 約 650 MB",
 
+  "models.aboutSize": "約 {size}",
   "models.dirLabel": "インストール先",
   "models.defaultDir": "既定の場所",
   "models.customDir": "別の場所",
@@ -245,13 +246,14 @@ const ja: Dict = {
   "installer.downloadSizeExpected": "ダウンロードのサイズが一致しません ({actual} / {expected} バイト) {url}",
   "installer.modelFileMissing": "モデルファイルが見つかりません。再インストールしてください: {detail}",
   "installer.deleteNameMismatch": "削除対象のファイル名が一致しません: {detail}",
+
   "installer.modelExistingMismatchSimple":
     "サイズの合わないファイルが既にあります: {detail}",
 
   // バックエンド: アップデーター
   "updater.checkClient": "更新確認用クライアントを作れません: {detail}",
   "updater.checkFailed": "更新情報を取得できませんでした: {detail}",
-  "updater.httpStatus": "更新情報を取得できませんでした (HTTP {status})。{hint}",
+  "updater.httpStatus": "更新情報を取得できませんでした (HTTP {status})。",
   "updater.responseTooLarge": "更新情報が大きすぎます。",
   "updater.responseRead": "更新情報を読めませんでした: {detail}",
   "updater.responseTimeout": "更新情報の取得がタイムアウトしました。",
@@ -281,6 +283,7 @@ const ja: Dict = {
   "updater.installSpawn": "インストーラーを起動できません: {detail}",
   "updater.fileCheck": "更新ファイルを確認できません: {detail}",
   "updater.notChecked": "先に更新を確認してください。",
+  "updater.notDownloaded": "更新ファイルがありません。先にダウンロードしてください。",
   "updater.assetError": "更新ファイルを検証できませんでした: {detail}",
   "updater.downloadFailed": "更新ファイルをダウンロードできませんでした: {detail}",
 
@@ -415,6 +418,7 @@ const en: Dict = {
   "runtime.cancel": "Cancel",
   "runtime.meta": "llama.cpp b12136 (CUDA 12.4) / about 650 MB total",
 
+  "models.aboutSize": "About {size}",
   "models.dirLabel": "Install location",
   "models.defaultDir": "Default location",
   "models.customDir": "Custom location",
@@ -514,13 +518,17 @@ const en: Dict = {
   "installer.archiveMissing": "Downloaded file not found: {file}",
   "installer.runtimeSizeExpected": "The server size does not match ({actual} / {expected} bytes) {url}",
   "installer.downloadSizeExpected": "The download size does not match ({actual} / {expected} bytes) {url}",
+  "installer.remoteSizeUnknown": "Could not determine the download size.",
+  "installer.dataTooLarge": "The server sent more data than expected ({actual} / {expected} bytes).",
+  "installer.registerFailed": "Could not register the model: {detail}",
   "installer.modelFileMissing": "The model file is missing. Reinstall it: {detail}",
   "installer.deleteNameMismatch": "The file name to delete does not match: {detail}",
+
   "installer.modelExistingMismatchSimple": "A file with a different size already exists: {detail}",
 
   "updater.checkClient": "Could not create the update client: {detail}",
   "updater.checkFailed": "Could not fetch update information: {detail}",
-  "updater.httpStatus": "Could not fetch update information (HTTP {status}). {hint}",
+  "updater.httpStatus": "Could not fetch update information (HTTP {status}).",
   "updater.responseTooLarge": "The update information is too large.",
   "updater.responseRead": "Could not read the update information: {detail}",
   "updater.responseTimeout": "Fetching update information timed out.",
@@ -551,6 +559,7 @@ const en: Dict = {
   "updater.installSpawn": "Could not start the installer: {detail}",
   "updater.fileCheck": "Could not check the update file: {detail}",
   "updater.notChecked": "Check for updates first.",
+  "updater.notDownloaded": "The update file is missing. Download it first.",
   "updater.assetError": "Could not validate the update file: {detail}",
   "updater.downloadFailed": "Could not download the update file: {detail}",
 
@@ -683,6 +692,7 @@ const zh: Dict = {
   "runtime.cancel": "取消",
   "runtime.meta": "llama.cpp b12136 (CUDA 12.4) / 共约 650 MB",
 
+  "models.aboutSize": "约 {size}",
   "models.dirLabel": "安装位置",
   "models.defaultDir": "默认位置",
   "models.customDir": "自定义位置",
@@ -778,13 +788,17 @@ const zh: Dict = {
   "installer.archiveMissing": "找不到下载文件：{file}",
   "installer.runtimeSizeExpected": "服务器返回的大小与预期不符（{actual} / {expected} 字节）{url}",
   "installer.downloadSizeExpected": "下载大小不一致（{actual} / {expected} 字节）{url}",
+  "installer.remoteSizeUnknown": "无法确认下载大小。",
+  "installer.dataTooLarge": "服务器返回的数据超出预期（{actual} / {expected} 字节）。",
+  "installer.registerFailed": "模型注册失败：{detail}",
   "installer.modelFileMissing": "找不到模型文件。请重新安装：{detail}",
   "installer.deleteNameMismatch": "要删除的文件名不一致：{detail}",
+
   "installer.modelExistingMismatchSimple": "已存在大小不符的文件：{detail}",
 
   "updater.checkClient": "无法创建更新检查客户端：{detail}",
   "updater.checkFailed": "无法获取更新信息：{detail}",
-  "updater.httpStatus": "无法获取更新信息（HTTP {status}）。{hint}",
+  "updater.httpStatus": "无法获取更新信息（HTTP {status}）。",
   "updater.responseTooLarge": "更新信息过大。",
   "updater.responseRead": "无法读取更新信息：{detail}",
   "updater.responseTimeout": "获取更新信息超时。",
@@ -814,6 +828,7 @@ const zh: Dict = {
   "updater.installSpawn": "无法启动安装程序：{detail}",
   "updater.fileCheck": "无法检查更新文件：{detail}",
   "updater.notChecked": "请先检查更新。",
+  "updater.notDownloaded": "没有更新文件。请先下载。",
   "updater.assetError": "无法验证更新文件：{detail}",
   "updater.downloadFailed": "无法下载更新文件：{detail}",
 

@@ -1,6 +1,7 @@
 //! 設定画面に出す公式モデルカタログ (PFN の GGUF)。
 //!
-//! サイズは配布元 (Hugging Face) の LFS 情報から取得した実バイト数。
+//! サイズは配布元 (Hugging Face) の LFS 情報から取得した目安で、表示専用。
+//! ダウンロード時の検証は応答の Content-Length を使う (再アップロードで変わりうるため)。
 //! 8b / 31b には Q4_0 が無いので 3 種ずつ、合計 14 種。
 
 use serde::Serialize;
@@ -17,7 +18,7 @@ pub struct CatalogEntry {
     pub size: String,
     /// `"Q2_K"` などの量子化名。
     pub quant: String,
-    /// 配布元の実バイト数。
+    /// 表示用の目安バイト数。検証は GET 応答の Content-Length で行う。
     pub bytes: u64,
     pub url: String,
     /// `pfnet/plamo-3-translate-0.8b-GGUF`。
@@ -28,20 +29,20 @@ pub struct CatalogEntry {
 
 /// (サイズ, 量子化, バイト数)。並び順がそのまま UI の並びになる。
 const MODELS: [(&str, &str, u64); 14] = [
-    ("0.8b", "Q2_K", 410_135_168),
-    ("0.8b", "Q3_K_M", 486_382_208),
-    ("0.8b", "Q4_0", 547_539_584),
-    ("0.8b", "Q4_K_M", 573_123_200),
-    ("2b", "Q2_K", 1_225_608_352),
-    ("2b", "Q3_K_M", 1_495_882_912),
-    ("2b", "Q4_0", 1_698_573_472),
-    ("2b", "Q4_K_M", 1_807_199_392),
-    ("8b", "Q2_K", 3_450_742_496),
-    ("8b", "Q3_K_M", 4_310_214_368),
-    ("8b", "Q4_K_M", 5_280_442_080),
-    ("31b", "Q2_K", 12_609_920_864),
-    ("31b", "Q3_K_M", 15_863_127_904),
-    ("31b", "Q4_K_M", 19_526_590_304),
+    ("0.8b", "Q2_K", 410_137_920),
+    ("0.8b", "Q3_K_M", 486_384_960),
+    ("0.8b", "Q4_0", 547_542_336),
+    ("0.8b", "Q4_K_M", 573_125_952),
+    ("2b", "Q2_K", 1_225_611_104),
+    ("2b", "Q3_K_M", 1_495_885_664),
+    ("2b", "Q4_0", 1_698_576_224),
+    ("2b", "Q4_K_M", 1_807_202_144),
+    ("8b", "Q2_K", 3_450_745_248),
+    ("8b", "Q3_K_M", 4_310_217_120),
+    ("8b", "Q4_K_M", 5_280_444_832),
+    ("31b", "Q2_K", 12_609_923_616),
+    ("31b", "Q3_K_M", 15_863_130_656),
+    ("31b", "Q4_K_M", 19_526_593_056),
 ];
 
 fn entry(size: &str, quant: &str, bytes: u64) -> CatalogEntry {
@@ -93,7 +94,7 @@ mod tests {
     #[test]
     fn known_sizes_match_the_distribution() {
         let entry = find("0.8b-Q4_K_M").expect("カタログにある");
-        assert_eq!(entry.bytes, 573_123_200);
+        assert_eq!(entry.bytes, 573_125_952);
         assert_eq!(entry.file, "plamo-3-translate-0.8b-Q4_K_M.gguf");
         assert_eq!(entry.repo, "pfnet/plamo-3-translate-0.8b-GGUF");
         assert_eq!(
@@ -102,11 +103,11 @@ mod tests {
         );
         assert_eq!(
             find("0.8b-Q2_K").expect("カタログにある").bytes,
-            410_135_168
+            410_137_920
         );
         assert_eq!(
             find("31b-Q4_K_M").expect("カタログにある").bytes,
-            19_526_590_304
+            19_526_593_056
         );
     }
 
