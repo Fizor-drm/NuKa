@@ -219,7 +219,10 @@ pub fn get_setup_state(app: AppHandle, state: State<'_, AppState>) -> crate::ins
 
 /// ランタイム (llama.cpp の 2 zip) をダウンロードして展開する。
 #[tauri::command]
-pub async fn install_runtime(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn install_runtime(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), crate::message::LocalizedText> {
     let settings = state.settings.clone();
     let downloads = state.downloads.clone();
     let engine = state.engine.clone();
@@ -233,7 +236,7 @@ pub async fn install_model(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
-) -> Result<crate::settings::InstalledModel, String> {
+) -> Result<crate::settings::InstalledModel, crate::message::LocalizedText> {
     let settings = state.settings.clone();
     let downloads = state.downloads.clone();
     crate::installer::install_model(&app, &settings, &downloads, &id).await
@@ -245,7 +248,10 @@ pub fn cancel_download(state: State<'_, AppState>, id: String) {
 }
 
 #[tauri::command]
-pub fn delete_model(state: State<'_, AppState>, file: String) -> Result<Settings, String> {
+pub fn delete_model(
+    state: State<'_, AppState>,
+    file: String,
+) -> Result<Settings, crate::message::LocalizedText> {
     crate::installer::delete_model(&state.settings, &file)
 }
 
@@ -254,7 +260,7 @@ pub fn delete_model(state: State<'_, AppState>, file: String) -> Result<Settings
 pub async fn set_active_model(
     state: State<'_, AppState>,
     file: String,
-) -> Result<Settings, String> {
+) -> Result<Settings, crate::message::LocalizedText> {
     let settings = crate::installer::set_active_model(&state.settings, &file)?;
     let engine = state.engine.clone();
     engine.start(&settings).await;
@@ -263,7 +269,10 @@ pub async fn set_active_model(
 
 /// モデルの保存先を変更する (空文字なら既定の場所)。
 #[tauri::command]
-pub fn set_models_dir(state: State<'_, AppState>, path: String) -> Result<Settings, String> {
+pub fn set_models_dir(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Settings, crate::message::LocalizedText> {
     crate::installer::set_models_dir(&state.settings, &path)
 }
 
@@ -283,7 +292,10 @@ pub async fn check_update(
 
 /// 確認済みの更新インストーラーをダウンロードする。
 #[tauri::command]
-pub async fn download_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn download_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), crate::message::LocalizedText> {
     let updates = state.updates.clone();
     let downloads = state.downloads.clone();
     crate::updater::download(&app, &updates, &downloads).await
@@ -378,7 +390,10 @@ async fn translate_job(
         return Err(match status.state {
             EnginePhase::Error => format!(
                 "エンジンを起動できていません。{}",
-                status.detail.unwrap_or_default()
+                status
+                    .detail
+                    .map(|detail| detail.fallback)
+                    .unwrap_or_default()
             ),
             EnginePhase::Ready => {
                 "エンジンの待ち受けポートがありません。再起動してください。".to_string()

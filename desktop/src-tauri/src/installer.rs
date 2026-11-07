@@ -19,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::catalog::{self, CatalogEntry};
 use crate::engine;
+use crate::message::{text, LocalizedText};
 use crate::settings::{InstalledModel, InstalledRuntime, Settings, SettingsStore};
 
 pub const RUNTIME_VERSION: &str = "b12136";
@@ -79,7 +80,7 @@ struct DoneEvent {
 struct ErrorEvent {
     kind: &'static str,
     id: String,
-    message: String,
+    message: LocalizedText,
 }
 
 fn emit_progress(app: &AppHandle, kind: &'static str, id: &str, downloaded: u64, total: u64) {
@@ -104,11 +105,11 @@ fn emit_done(app: &AppHandle, kind: &'static str, id: &str) {
     }
 }
 
-fn emit_error(app: &AppHandle, kind: &'static str, id: &str, message: &str) {
+fn emit_error(app: &AppHandle, kind: &'static str, id: &str, message: &LocalizedText) {
     let payload = ErrorEvent {
         kind,
         id: id.to_string(),
-        message: message.to_string(),
+        message: message.clone(),
     };
     if let Err(error) = app.emit("download:error", payload) {
         eprintln!("download:error を送れません: {error}");
@@ -135,13 +136,17 @@ impl DownloadManager {
     }
 
     /// 新しいダウンロードを始める。既に走っていればエラー。
-    pub(crate) fn begin(&self, id: &str) -> Result<Arc<AtomicBool>, String> {
+    pub(crate) fn begin(&self, id: &str) -> Result<Arc<AtomicBool>, LocalizedText> {
         let mut slot = self.lock();
         if let Some(active) = slot.as_ref() {
-            return Err(format!(
-                "別のダウンロードが進行中です ({}). 完了するか取消してから再試行してください。",
-                active.id
-            ));
+            return Err(text(
+                "installer.busy",
+                format!(
+                    "別のダウンロードが進行中です ({}). 完了するか取消してから再試行してください。",
+                    active.id
+                ),
+            )
+            .param("id", &active.id));
         }
         let cancel = Arc::new(AtomicBool::new(false));
         *slot = Some(ActiveDownload {
@@ -187,19 +192,19 @@ impl DownloadManager {
 #[derive(Debug)]
 enum DownloadError {
     Cancelled,
-    Failed(String),
+    Failed(LocalizedText),
 }
 
 impl DownloadError {
-    fn message(&self) -> String {
+    fn message(&self) -> LocalizedText {
         match self {
-            Self::Cancelled => "ダウンロードを中止しました。".to_string(),
+            Self::Cancelled => text("installer.cancelled", "ダウンロードを中止しました。"),
             Self::Failed(message) => message.clone(),
         }
     }
 }
 
-fn failed(message: impl Into<String>) -> DownloadError {
+fn failed(message: impl Into<LocalizedText>) -> DownloadError {
     DownloadError::Failed(message.into())
 }
 
@@ -429,7 +434,7 @@ pub async fn install_runtime(
     settings: &SettingsStore,
     downloads: &DownloadManager,
     engine: &engine::Engine,
-) -> Result<InstalledRuntime, String> {
+) -> Result<InstalledRuntime, LocalizedText> {
     const KIND: &str = "runtime";
     const ID: &str = "runtime";
     let cancel = downloads.begin(ID)?;
@@ -445,7 +450,10 @@ pub async fn install_runtime(
         }
         Err(error) => {
             let message = error.message();
-            eprintln!("ランタイムのインストールに失敗しました: {message}");
+            eprintln!(
+                "ランタイムのインストールに失敗しました: {}",
+                message.fallback
+            );
             emit_error(app, KIND, ID, &message);
             // 既存のランタイムが残っていればそれで戻す。無ければ未導入のエラー状態。
             engine.start(&settings.get()).await;
@@ -588,7 +596,7 @@ fn swap_runtime_dir(staging: &Path, target: &Path) -> Result<(), DownloadError> 
 }
 
 /// 必要なファイルが展開先にそろっているか。
-pub fn verify_runtime_dir(dir: &Path) -> Result<(), String> {
+pub fn verify_runtime_dir(dir: &Path) -> Result<(), LocalizedText> {
     let missing: Vec<&str> = REQUIRED_RUNTIME_FILES
         .iter()
         .copied()
@@ -597,10 +605,11 @@ pub fn verify_runtime_dir(dir: &Path) -> Result<(), String> {
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "展開後に必要なファイルがありません: {}",
-            missing.join(", ")
-        ))
+        Err(text(
+            "installer.runtimeMissingFiles",
+            format!("展開後に必要なファイルがありません: {}", missing.join(", ")),
+        )
+        .param("files", missing.join(", ")))
     }
 }
 
@@ -658,10 +667,15 @@ pub async fn install_model(
     settings: &SettingsStore,
     downloads: &DownloadManager,
     catalog_id: &str,
-) -> Result<InstalledModel, String> {
+) -> Result<InstalledModel, LocalizedText> {
     const KIND: &str = "model";
-    let entry = catalog::find(catalog_id)
-        .ok_or_else(|| format!("カタログにないモデルです: {catalog_id}"))?;
+    let entry = catalog::find(catalog_id).ok_or_else(|| {
+        text(
+            "installer.catalogUnknown",
+            format!("カタログにないモデルです: {catalog_id}"),
+        )
+        .param("id", catalog_id)
+    })?;
     let cancel = downloads.begin(catalog_id)?;
     let result = install_model_inner(app, settings, cancel, &entry).await;
     downloads.finish(catalog_id);
@@ -672,7 +686,7 @@ pub async fn install_model(
         }
         Err(error) => {
             let message = error.message();
-            eprintln!("モデルのインストールに失敗しました: {message}");
+            eprintln!("モデルのインストールに失敗しました: {}", message.fallback);
             emit_error(app, KIND, catalog_id, &message);
             Err(message)
         }
@@ -773,15 +787,20 @@ async fn install_model_inner(
 }
 
 /// インストール済みモデルを削除する。使用中のものは拒否する。
-pub fn delete_model(settings: &SettingsStore, file: &str) -> Result<Settings, String> {
+pub fn delete_model(settings: &SettingsStore, file: &str) -> Result<Settings, LocalizedText> {
     let current = settings.get();
     if current.active_model.as_deref() == Some(file) {
-        return Err(
-            "使用中のモデルは削除できません。別のモデルを選んでから削除してください。".to_string(),
-        );
+        return Err(text(
+            "installer.modelActive",
+            "使用中のモデルは削除できません。別のモデルを選んでから削除してください。",
+        ));
     }
     let Some(entry) = catalog::find_by_file(file) else {
-        return Err(format!("カタログにないモデルです: {file}"));
+        return Err(text(
+            "installer.catalogUnknown",
+            format!("カタログにないモデルです: {file}"),
+        )
+        .param("id", file));
     };
     let Some(model) = current
         .installed_models
@@ -789,7 +808,11 @@ pub fn delete_model(settings: &SettingsStore, file: &str) -> Result<Settings, St
         .find(|model| model.file == file)
         .cloned()
     else {
-        return Err(format!("インストール済みのモデルにありません: {file}"));
+        return Err(text(
+            "installer.modelNotFound",
+            format!("インストール済みのモデルにありません: {file}"),
+        )
+        .param("file", file));
     };
 
     // 記録と実ファイルがずれていないか確かめてから消す。
@@ -799,88 +822,120 @@ pub fn delete_model(settings: &SettingsStore, file: &str) -> Result<Settings, St
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == entry.file);
     if !name_matches {
-        return Err(format!(
-            "削除対象のファイル名が一致しません: {} (期待: {})",
-            path.display(),
-            entry.file
+        return Err(text(
+            "installer.deleteNameMismatch",
+            format!(
+                "削除対象のファイル名が一致しません: {} (期待: {})",
+                path.display(),
+                entry.file
+            ),
         ));
     }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err("シンボリックリンクは削除できません。".to_string());
+            return Err(text(
+                "installer.modelSymlink",
+                "シンボリックリンクは削除できません。",
+            ));
         }
         Ok(metadata) if metadata.is_file() => {
-            fs::remove_file(&path)
-                .map_err(|error| format!("モデルを削除できません ({}): {error}", path.display()))?;
+            fs::remove_file(&path).map_err(|error| {
+                text(
+                    "installer.deleteFailed",
+                    format!("モデルを削除できません: {error}"),
+                )
+                .param("detail", error)
+            })?;
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(format!(
-                "モデルを確認できません ({}): {error}",
-                path.display()
-            ));
+            return Err(text(
+                "installer.deleteFailed",
+                format!("モデルを確認できません: {error}"),
+            )
+            .param("detail", error));
         }
     }
-    settings.update(|next| {
-        next.installed_models.retain(|item| item.file != file);
-        Ok(())
-    })
+    settings
+        .update(|next| {
+            next.installed_models.retain(|item| item.file != file);
+            Ok(())
+        })
+        .map_err(LocalizedText::from)
 }
 
 /// 使用するモデルを切り替える。エンジンの再起動は呼び出し側で行う。
-pub fn set_active_model(settings: &SettingsStore, file: &str) -> Result<Settings, String> {
+pub fn set_active_model(settings: &SettingsStore, file: &str) -> Result<Settings, LocalizedText> {
     let current = settings.get();
     let Some(model) = current
         .installed_models
         .iter()
         .find(|model| model.file == file)
     else {
-        return Err(format!("インストール済みのモデルにありません: {file}"));
+        return Err(text(
+            "installer.modelNotFound",
+            format!("インストール済みのモデルにありません: {file}"),
+        )
+        .param("file", file));
     };
     if !Path::new(&model.path).is_file() {
-        return Err(format!(
-            "モデルファイルが見つかりません。再インストールしてください: {}",
-            model.path
+        return Err(text(
+            "installer.modelFileMissing",
+            format!(
+                "モデルファイルが見つかりません。再インストールしてください: {}",
+                model.path
+            ),
         ));
     }
-    settings.update(|next| {
-        next.active_model = Some(file.to_string());
-        Ok(())
-    })
+    settings
+        .update(|next| {
+            next.active_model = Some(file.to_string());
+            Ok(())
+        })
+        .map_err(LocalizedText::from)
 }
 
 /// モデルの保存先として許可できるパスか。
 ///
 /// ローカルの絶対パス (ドライブ文字 + ルート) のみ許可し、UNC と `..` は拒否する。
-fn validate_models_dir(path: &str) -> Result<PathBuf, String> {
+fn validate_models_dir(path: &str) -> Result<PathBuf, LocalizedText> {
     let candidate = PathBuf::from(path);
     if !candidate.is_absolute() {
-        return Err("フォルダは絶対パスで指定してください。".to_string());
+        return Err(text(
+            "installer.dirAbsolute",
+            "フォルダは絶対パスで指定してください。",
+        ));
     }
     let Some(Component::Prefix(prefix)) = candidate.components().next() else {
-        return Err("フォルダはドライブ文字から始まるローカルパスで指定してください。".to_string());
+        return Err(text(
+            "installer.dirLocalOnly",
+            "フォルダはドライブ文字から始まるローカルパスで指定してください。",
+        ));
     };
     match prefix.kind() {
         Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
         _ => {
-            return Err(
-                "UNC パス (\\\\server\\share) は指定できません。ローカルのフォルダを選んでください。"
-                    .to_string(),
-            );
+            return Err(text(
+                "installer.dirUnc",
+                "UNC パス (\\\\server\\share) は指定できません。ローカルのフォルダを選んでください。",
+            ));
         }
     }
     if candidate
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err("パスに「..」は指定できません。".to_string());
+        return Err(text(
+            "installer.dirNoParent",
+            "パスに「..」は指定できません。",
+        ));
     }
     Ok(candidate)
 }
 
 /// モデルの保存先を変更する。空文字なら既定の場所に戻す。
-pub fn set_models_dir(settings: &SettingsStore, path: &str) -> Result<Settings, String> {
+pub fn set_models_dir(settings: &SettingsStore, path: &str) -> Result<Settings, LocalizedText> {
     let trimmed = path.trim();
     let value = if trimmed.is_empty() {
         None
@@ -890,10 +945,12 @@ pub fn set_models_dir(settings: &SettingsStore, path: &str) -> Result<Settings, 
             .map_err(|error| format!("フォルダを作れません ({}): {error}", candidate.display()))?;
         Some(candidate.to_string_lossy().into_owned())
     };
-    settings.update(|next| {
-        next.models_dir = value.clone();
-        Ok(())
-    })
+    settings
+        .update(|next| {
+            next.models_dir = value.clone();
+            Ok(())
+        })
+        .map_err(LocalizedText::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,7 +1123,7 @@ mod tests {
         assert!(verify_runtime_dir(&directory).is_ok());
         fs::remove_file(directory.join("ggml-cuda.dll")).unwrap();
         let error = verify_runtime_dir(&directory).expect_err("欠けていれば失敗する");
-        assert!(error.contains("ggml-cuda.dll"));
+        assert!(error.fallback.contains("ggml-cuda.dll"));
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -1159,7 +1216,7 @@ mod tests {
         )
         .await
         .expect_err("サイズ不一致は失敗する");
-        assert!(error.message().contains("サイズ"));
+        assert!(error.message().fallback.contains("サイズ"));
         assert!(!dest.exists());
         assert!(!part_path(&dest).exists());
         let _ = fs::remove_dir_all(&directory);
@@ -1184,7 +1241,7 @@ mod tests {
         )
         .await
         .expect_err("キャンセルされる");
-        assert_eq!(error.message(), "ダウンロードを中止しました。");
+        assert_eq!(error.message().fallback, "ダウンロードを中止しました。");
         assert!(!dest.exists());
         assert!(!part_path(&dest).exists());
         let _ = fs::remove_dir_all(&directory);
@@ -1241,11 +1298,11 @@ mod tests {
             ..good
         };
         let error = verify_archive(&path, &wrong_hash).expect_err("ハッシュ不一致は失敗");
-        assert!(error.message().contains("SHA-256"));
+        assert!(error.message().fallback.contains("SHA-256"));
 
         let wrong_size = RuntimeArchive { bytes: 4, ..good };
         let error = verify_archive(&path, &wrong_size).expect_err("サイズ不一致は失敗");
-        assert!(error.message().contains("サイズ"));
+        assert!(error.message().fallback.contains("サイズ"));
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -1257,7 +1314,10 @@ mod tests {
         fs::write(&path, b"abc").unwrap();
         assert!(existing_model_file(&path, 3).expect("同サイズは true"));
         let error = existing_model_file(&path, 4).expect_err("サイズ違いは拒否");
-        assert!(error.message().contains("サイズの合わないファイル"));
+        assert!(error
+            .message()
+            .fallback
+            .contains("サイズの合わないファイル"));
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -1282,9 +1342,9 @@ mod tests {
         assert!(validate_models_dir("C:\\Temp\\nuka-models").is_ok());
         assert!(validate_models_dir("relative\\models").is_err());
         let unc = validate_models_dir("\\\\server\\share\\models").expect_err("UNC は拒否");
-        assert!(unc.contains("UNC"));
+        assert!(unc.fallback.contains("UNC"));
         let parent = validate_models_dir("C:\\Temp\\..\\models").expect_err(".. は拒否");
-        assert!(parent.contains(".."));
+        assert!(parent.fallback.contains(".."));
     }
 
     #[test]
@@ -1333,7 +1393,7 @@ mod tests {
             })
             .unwrap();
         let error = delete_model(&store, file).expect_err("名前が違えば拒否");
-        assert!(error.contains("ファイル名が一致しません"));
+        assert!(error.fallback.contains("ファイル名が一致しません"));
         assert!(wrong_name.exists());
 
         store
@@ -1347,7 +1407,7 @@ mod tests {
         assert!(!path.exists());
 
         let error = delete_model(&store, "unknown.gguf").expect_err("カタログにない");
-        assert!(error.contains("カタログにない"));
+        assert!(error.fallback.contains("カタログにない"));
         let _ = fs::remove_dir_all(&directory);
     }
 }

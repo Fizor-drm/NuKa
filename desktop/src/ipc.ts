@@ -9,11 +9,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import type { LocalizedMessage } from "./i18n";
+
 export type EnginePhase = "starting" | "loading" | "ready" | "error";
 
 export interface EngineStatus {
   state: EnginePhase;
-  detail?: string;
+  detail?: LocalizedMessage;
 }
 
 export interface DetectedLanguage {
@@ -31,6 +33,7 @@ export interface Settings {
   theme: ThemeSetting;
   auto_translate: boolean;
   auto_update_check: boolean;
+  ui_language: "ja" | "en" | "zh";
   models_dir: string | null;
   installed_runtime: InstalledRuntime | null;
   installed_models: InstalledModel[];
@@ -43,6 +46,7 @@ export interface SettingsPatch {
   theme?: ThemeSetting;
   auto_translate?: boolean;
   auto_update_check?: boolean;
+  ui_language?: "ja" | "en" | "zh";
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +113,7 @@ export interface DownloadDonePayload {
 export interface DownloadErrorPayload {
   kind: DownloadKind;
   id: string;
-  message: string;
+  message: LocalizedMessage;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +132,7 @@ export interface UpdateCheck {
   latest?: string;
   available: boolean;
   asset?: UpdateAsset;
-  error?: string;
+  error?: LocalizedMessage;
 }
 
 export interface UpdateProgressPayload {
@@ -141,7 +145,7 @@ export interface UpdateDonePayload {
 }
 
 export interface UpdateErrorPayload {
-  message: string;
+  message: LocalizedMessage;
 }
 
 export interface GlossaryPair {

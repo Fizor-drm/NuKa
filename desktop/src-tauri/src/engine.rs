@@ -21,6 +21,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
+use crate::message::{text, LocalizedText};
 use crate::settings::Settings;
 use job_object::JobObject;
 
@@ -61,11 +62,11 @@ pub enum EnginePhase {
 pub struct EngineStatus {
     pub state: EnginePhase,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+    pub detail: Option<LocalizedText>,
 }
 
 impl EngineStatus {
-    fn new(state: EnginePhase, detail: Option<String>) -> Self {
+    fn new(state: EnginePhase, detail: Option<LocalizedText>) -> Self {
         Self { state, detail }
     }
 }
@@ -145,7 +146,10 @@ impl Engine {
             generation,
             EngineStatus::new(
                 EnginePhase::Starting,
-                Some("llama-server を起動しています。".to_string()),
+                Some(text(
+                    "engine.startingDetail",
+                    "llama-server を起動しています。",
+                )),
             ),
         );
 
@@ -167,7 +171,13 @@ impl Engine {
                     generation,
                     EngineStatus::new(
                         EnginePhase::Error,
-                        Some(format!("空きポートを確保できません: {error}")),
+                        Some(
+                            text(
+                                "engine.portUnavailable",
+                                format!("空きポートを確保できません: {error}"),
+                            )
+                            .param("detail", error),
+                        ),
                     ),
                 );
                 return;
@@ -238,8 +248,16 @@ impl Engine {
             HEALTH_INTERVAL,
             move |phase| {
                 let detail = match phase {
-                    EnginePhase::Loading => Some("モデルを読み込んでいます。".to_string()),
-                    EnginePhase::Ready => Some(format!("127.0.0.1:{port} で待ち受けています。")),
+                    EnginePhase::Loading => {
+                        Some(text("engine.loadingDetail", "モデルを読み込んでいます。"))
+                    }
+                    EnginePhase::Ready => Some(
+                        text(
+                            "engine.readyDetail",
+                            format!("127.0.0.1:{port} で待ち受けています。"),
+                        )
+                        .param("port", port),
+                    ),
                     _ => None,
                 };
                 progress_engine.set_status(generation, EngineStatus::new(phase, detail));
@@ -247,7 +265,10 @@ impl Engine {
             move || {
                 if !fatal_engine.is_current(generation) {
                     // 新しい start / kill に置き換えられた。静かに抜ける。
-                    return Some("エンジンの起動が置き換えられました。".to_string());
+                    return Some(text(
+                        "engine.superseded",
+                        "エンジンの起動が置き換えられました。",
+                    ));
                 }
                 fatal_engine.exited_detail(generation)
             },
@@ -265,10 +286,16 @@ impl Engine {
                     generation,
                     EngineStatus::new(
                         EnginePhase::Error,
-                        Some(format!(
-                            "llama-server が {} 秒以内に準備できませんでした。",
-                            HEALTH_TIMEOUT.as_secs()
-                        )),
+                        Some(
+                            text(
+                                "engine.startTimeout",
+                                format!(
+                                    "llama-server が {} 秒以内に準備できませんでした。",
+                                    HEALTH_TIMEOUT.as_secs()
+                                ),
+                            )
+                            .param("seconds", HEALTH_TIMEOUT.as_secs()),
+                        ),
                     ),
                 );
                 self.kill_now();
@@ -303,7 +330,7 @@ impl Engine {
         }
     }
 
-    fn exited_detail(&self, generation: u64) -> Option<String> {
+    fn exited_detail(&self, generation: u64) -> Option<LocalizedText> {
         let mut inner = self.lock();
         if inner.generation != generation {
             return None;
@@ -311,11 +338,21 @@ impl Engine {
         let child = inner.child.as_mut()?;
         match child.try_wait() {
             Ok(Some(status)) => Some(match status.code() {
-                Some(code) => format!("llama-server が終了しました (終了コード {code})。"),
-                None => "llama-server が終了しました。".to_string(),
+                Some(code) => text(
+                    "engine.exitedWithCode",
+                    format!("llama-server が終了しました (終了コード {code})。"),
+                )
+                .param("code", code),
+                None => text("engine.exited", "llama-server が終了しました。"),
             }),
             Ok(None) => None,
-            Err(error) => Some(format!("llama-server の状態を確認できません: {error}")),
+            Err(error) => Some(
+                text(
+                    "engine.statusUnknown",
+                    format!("llama-server の状態を確認できません: {error}"),
+                )
+                .param("detail", error),
+            ),
         }
     }
 
@@ -392,7 +429,7 @@ pub(crate) fn default_runtime_server_path(app: &AppHandle) -> Option<PathBuf> {
 pub(crate) fn resolve_model_path(
     settings: &Settings,
     search_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, LocalizedText> {
     let mut tried: Vec<String> = Vec::new();
 
     if let Some(active) = settings.active_model.as_deref() {
@@ -439,10 +476,14 @@ pub(crate) fn resolve_model_path(
         relative.display()
     ));
 
-    Err(format!(
-        "モデルが未導入です。設定でインストールしてください。確認した場所: {}",
-        tried.join(" / ")
-    ))
+    Err(text(
+        "engine.modelNotInstalled",
+        format!(
+            "モデルが未導入です。設定でインストールしてください。確認した場所: {}",
+            tried.join(" / ")
+        ),
+    )
+    .param("paths", tried.join(" / ")))
 }
 
 /// ランタイムの場所を決める。管理済み → settings.json の server_path → 既定の場所 →
@@ -451,7 +492,7 @@ pub(crate) fn resolve_runtime_path(
     settings: &Settings,
     default_server: Option<&Path>,
     search_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, LocalizedText> {
     let mut tried: Vec<String> = Vec::new();
 
     if let Some(runtime) = settings.installed_runtime.as_ref() {
@@ -496,10 +537,14 @@ pub(crate) fn resolve_runtime_path(
         relative.display()
     ));
 
-    Err(format!(
-        "ランタイムが未導入。設定でインストールしてください。確認した場所: {}",
-        tried.join(" / ")
-    ))
+    Err(text(
+        "engine.runtimeNotInstalled",
+        format!(
+            "ランタイムが未導入。設定でインストールしてください。確認した場所: {}",
+            tried.join(" / ")
+        ),
+    )
+    .param("paths", tried.join(" / ")))
 }
 
 /// モデルとサーバの場所を決める。
@@ -507,29 +552,23 @@ pub(crate) fn resolve_runtime_path(
 /// モデルは管理対象 → settings.json の model_path → 環境変数 → exe の位置からの探索。
 /// ランタイムは管理済み → settings.json の server_path → 既定の保存先 → 環境変数 → 探索。
 /// 探索はデバッグ実行では上位 6 階層まで、リリースでは隣と 1 つ上だけ。
-fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, String> {
+fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, LocalizedText> {
     let search_root = exe_directory();
     let default_server = default_runtime_server_path(app);
 
-    let mut problems: Vec<String> = Vec::new();
-    let model = match resolve_model_path(settings, &search_root) {
-        Ok(path) => Some(path),
-        Err(error) => {
-            problems.push(error);
-            None
-        }
-    };
-    let server = match resolve_runtime_path(settings, default_server.as_deref(), &search_root) {
-        Ok(path) => Some(path),
-        Err(error) => {
-            problems.push(error);
-            None
-        }
-    };
+    let model = resolve_model_path(settings, &search_root);
+    let server = resolve_runtime_path(settings, default_server.as_deref(), &search_root);
 
     match (model, server) {
-        (Some(model), Some(server)) => Ok(ServerPaths { model, server }),
-        _ => Err(problems.join(" / ")),
+        (Ok(model), Ok(server)) => Ok(ServerPaths { model, server }),
+        (Err(model_error), Err(_)) => Err(text(
+            "engine.bothNotInstalled",
+            format!(
+                "ランタイムとモデルが未導入です。設定でインストールしてください。({})",
+                model_error.fallback
+            ),
+        )),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
 
@@ -562,7 +601,7 @@ fn spawn_server(
     port: u16,
     settings: &Settings,
     log_path: Option<&Path>,
-) -> Result<Child, String> {
+) -> Result<Child, LocalizedText> {
     let (stdout, stderr) = prepare_logs(log_path, port, paths)?;
     let mut command = Command::new(&paths.server);
     command
@@ -593,10 +632,14 @@ fn spawn_server(
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command.spawn().map_err(|error| {
-        format!(
-            "llama-server を起動できません ({}): {error}",
-            paths.server.display()
+        text(
+            "engine.spawnFailed",
+            format!(
+                "llama-server を起動できません ({}): {error}",
+                paths.server.display()
+            ),
         )
+        .param("detail", error)
     })
 }
 
@@ -604,7 +647,7 @@ fn prepare_logs(
     log_path: Option<&Path>,
     port: u16,
     paths: &ServerPaths,
-) -> Result<(Stdio, Stdio), String> {
+) -> Result<(Stdio, Stdio), LocalizedText> {
     let Some(log_path) = log_path else {
         return Ok((Stdio::null(), Stdio::null()));
     };
@@ -612,16 +655,26 @@ fn prepare_logs(
         .create(true)
         .append(true)
         .open(log_path)
-        .map_err(|error| format!("ログファイルを開けません ({}): {error}", log_path.display()))?;
+        .map_err(|error| {
+            text(
+                "engine.logOpenFailed",
+                format!("ログファイルを開けません ({}): {error}", log_path.display()),
+            )
+            .param("detail", error)
+        })?;
     let _ = writeln!(
         file,
         "=== llama-server 起動: port {port} / {} / {} ===",
         paths.server.display(),
         paths.model.display()
     );
-    let stderr_file = file
-        .try_clone()
-        .map_err(|error| format!("ログファイルを複製できません: {error}"))?;
+    let stderr_file = file.try_clone().map_err(|error| {
+        text(
+            "engine.logCloneFailed",
+            format!("ログファイルを複製できません: {error}"),
+        )
+        .param("detail", error)
+    })?;
     Ok((Stdio::from(file), Stdio::from(stderr_file)))
 }
 
@@ -630,7 +683,7 @@ pub(crate) enum ReadyOutcome {
     Ready,
     TimedOut,
     /// プロセスが落ちたなど、待つまでもない失敗。
-    Failed(String),
+    Failed(LocalizedText),
 }
 
 /// `/health` を `interval` 間隔で叩き、200 が返るまで待つ。
@@ -647,7 +700,7 @@ pub(crate) async fn wait_until_ready<F, G>(
 ) -> ReadyOutcome
 where
     F: FnMut(EnginePhase),
-    G: FnMut() -> Option<String>,
+    G: FnMut() -> Option<LocalizedText>,
 {
     let deadline = Instant::now() + budget;
     let url = format!("http://127.0.0.1:{port}/health");
@@ -829,17 +882,16 @@ mod tests {
 
         let loading = serde_json::to_value(EngineStatus::new(
             EnginePhase::Loading,
-            Some("モデルを読み込んでいます。".to_string()),
+            Some(text("engine.loadingDetail", "モデルを読み込んでいます。")),
         ))
         .unwrap();
-        assert_eq!(
-            loading,
-            serde_json::json!({ "state": "loading", "detail": "モデルを読み込んでいます。" })
-        );
+        assert_eq!(loading["state"], "loading");
+        assert_eq!(loading["detail"]["key"], "engine.loadingDetail");
+        assert_eq!(loading["detail"]["fallback"], "モデルを読み込んでいます。");
 
         let error = serde_json::to_value(EngineStatus::new(
             EnginePhase::Error,
-            Some("見つかりません".to_string()),
+            Some(text("error.raw", "見つかりません")),
         ))
         .unwrap();
         assert_eq!(error["state"], "error");
@@ -931,8 +983,8 @@ mod tests {
 
         let empty = temp_dir("model-search-empty");
         let error = resolve_model_path(&settings, &empty).unwrap_err();
-        assert!(error.contains("モデルが未導入"));
-        assert!(error.contains("設定でインストール"));
+        assert!(error.fallback.contains("モデルが未導入"));
+        assert!(error.fallback.contains("設定でインストール"));
         let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&base);
     }
@@ -969,8 +1021,8 @@ mod tests {
         let error =
             resolve_runtime_path(&Settings::default(), Some(&empty.join("none.exe")), &empty)
                 .unwrap_err();
-        assert!(error.contains("ランタイムが未導入"));
-        assert!(error.contains("設定でインストール"));
+        assert!(error.fallback.contains("ランタイムが未導入"));
+        assert!(error.fallback.contains("設定でインストール"));
         let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&base);
     }
@@ -983,7 +1035,7 @@ mod tests {
             server: directory.join("missing-llama-server.exe"),
         };
         let error = spawn_server(&paths, 12345, &Settings::default(), None).unwrap_err();
-        assert!(error.contains("llama-server を起動できません"));
+        assert!(error.fallback.contains("llama-server を起動できません"));
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -1089,13 +1141,21 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(20),
             |_| {},
-            || Some("llama-server が終了しました (終了コード 1)。".to_string()),
+            || {
+                Some(text(
+                    "engine.exitedWithCode",
+                    "llama-server が終了しました (終了コード 1)。",
+                ))
+            },
         )
         .await;
 
         assert_eq!(
             outcome,
-            ReadyOutcome::Failed("llama-server が終了しました (終了コード 1)。".to_string())
+            ReadyOutcome::Failed(text(
+                "engine.exitedWithCode",
+                "llama-server が終了しました (終了コード 1)。"
+            ))
         );
     }
 }

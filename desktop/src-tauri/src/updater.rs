@@ -22,6 +22,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::engine::{Engine, EnginePhase};
 use crate::installer::DownloadManager;
+use crate::message::{text, LocalizedText};
 use crate::settings::SettingsStore;
 
 pub const REPO: &str = "Fizor-drm/NuKa";
@@ -61,7 +62,7 @@ pub struct UpdateCheck {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asset: Option<UpdateAsset>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<LocalizedText>,
 }
 
 /// 確認結果として保持する「更新候補」。ダウンロードはこの内容だけを使う。
@@ -115,7 +116,7 @@ struct DoneEvent {
 
 #[derive(Clone, Serialize)]
 struct ErrorEvent {
-    message: String,
+    message: LocalizedText,
 }
 
 fn emit_progress(app: &AppHandle, downloaded: u64, total: u64) {
@@ -135,11 +136,11 @@ fn emit_done(app: &AppHandle, version: &str) {
     }
 }
 
-fn emit_error(app: &AppHandle, message: &str) {
+fn emit_error(app: &AppHandle, message: &LocalizedText) {
     if let Err(error) = app.emit(
         "update:error",
         ErrorEvent {
-            message: message.to_string(),
+            message: message.clone(),
         },
     ) {
         eprintln!("update:error を送れません: {error}");
@@ -285,9 +286,14 @@ fn evaluate_release(current: &str, release: GitHubRelease) -> UpdateCheck {
     };
     let Some(newer) = is_newer(&latest, current) else {
         return UpdateCheck {
-            error: Some(format!(
-                "バージョンを比較できませんでした (現在 {current} / 最新 {latest})。"
-            )),
+            error: Some(
+                text(
+                    "updater.versionCompare",
+                    format!("バージョンを比較できませんでした (現在 {current} / 最新 {latest})。"),
+                )
+                .param("current", current)
+                .param("latest", latest),
+            ),
             ..base
         };
     };
@@ -301,7 +307,7 @@ fn evaluate_release(current: &str, release: GitHubRelease) -> UpdateCheck {
             ..base
         },
         Err(message) => UpdateCheck {
-            error: Some(message),
+            error: Some(text("updater.checkFailed", message.clone()).param("detail", message)),
             ..base
         },
     }
@@ -370,7 +376,7 @@ pub async fn check(_app: &AppHandle, state: &UpdateState) -> UpdateCheck {
             latest: None,
             available: false,
             asset: None,
-            error: Some(message),
+            error: Some(text("updater.assetError", message.clone()).param("detail", message)),
         },
     };
     let mut offer = state.lock_offer();
@@ -609,13 +615,13 @@ pub async fn download(
     app: &AppHandle,
     state: &UpdateState,
     downloads: &DownloadManager,
-) -> Result<(), String> {
+) -> Result<(), LocalizedText> {
     let offer = {
         let guard = state.lock_offer();
         guard
             .as_ref()
             .cloned()
-            .ok_or_else(|| "先に更新を確認してください。".to_string())?
+            .ok_or_else(|| text("updater.notChecked", "先に更新を確認してください。"))?
     };
     let cancel = downloads.begin(DOWNLOAD_ID)?;
     *state.lock_downloaded() = None;
@@ -631,13 +637,13 @@ pub async fn download(
             Ok(())
         }
         Err(message) => {
-            let message = if cancel.load(Ordering::SeqCst) && message.contains("中止") {
-                "ダウンロードを中止しました。".to_string()
+            let localized = if cancel.load(Ordering::SeqCst) && message.contains("中止") {
+                text("updater.cancelled", "ダウンロードを中止しました。")
             } else {
-                message
+                text("updater.downloadFailed", message.clone()).param("detail", message)
             };
-            emit_error(app, &message);
-            Err(message)
+            emit_error(app, &localized);
+            Err(localized)
         }
     }
 }
@@ -871,7 +877,11 @@ mod tests {
             },
         );
         assert!(!check.available);
-        assert!(check.error.unwrap_or_default().contains("比較できません"));
+        assert!(check
+            .error
+            .expect("エラーがある")
+            .fallback
+            .contains("比較できません"));
     }
 
     #[test]

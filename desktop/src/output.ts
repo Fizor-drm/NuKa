@@ -4,6 +4,8 @@
  * 訳文テキストは状態と独立して表示できる (エラー時も直前の訳文は残す)。
  */
 
+import { t } from "./i18n";
+
 export type OutputActionKind = "restart" | "retry" | "settings";
 
 export interface OutputAction {
@@ -29,8 +31,6 @@ export interface OutputElements {
   readonly copyStatus: HTMLElement;
 }
 
-const COPY_LABEL = "コピー";
-const COPY_DONE_LABEL = "コピーしました";
 const COPY_DONE_DURATION = 1500;
 const STATUS_DURATION = 2500;
 
@@ -79,22 +79,27 @@ export class OutputPane {
     elements.copy.setAttribute("aria-disabled", String(!hasText));
   }
 
+  /** 表示言語が変わったときにラベルを引き継ぐ。 */
+  relocalize(): void {
+    this.elements.copyLabel.textContent = t("output.copy");
+  }
+
   private async copy(): Promise<void> {
     const text = this.view.text;
     if (text.trim() === "") {
-      this.showCopyStatus("訳文がありません", true);
+      this.showCopyStatus(t("output.copyNoText"), true);
       return;
     }
     const copied = await writeClipboard(text);
     if (!copied) {
-      this.showCopyStatus("コピーできませんでした", true);
+      this.showCopyStatus(t("output.copyFailed"), true);
       return;
     }
     this.showCopyStatus("", false);
-    this.elements.copyLabel.textContent = COPY_DONE_LABEL;
+    this.elements.copyLabel.textContent = t("output.copied");
     window.clearTimeout(this.labelTimer);
     this.labelTimer = window.setTimeout(() => {
-      this.elements.copyLabel.textContent = COPY_LABEL;
+      this.elements.copyLabel.textContent = t("output.copy");
     }, COPY_DONE_DURATION);
   }
 

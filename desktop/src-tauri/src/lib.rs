@@ -9,6 +9,7 @@ pub mod commands;
 pub mod detect;
 pub mod engine;
 pub mod installer;
+pub mod message;
 pub mod prompt;
 pub mod settings;
 pub mod updater;

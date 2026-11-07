@@ -7,7 +7,17 @@
  */
 
 import { GlossaryEditor } from "./glossary";
-import { AUTO_CODE, AUTO_OPTION, LANGUAGES, detectedLabel } from "./languages";
+import {
+  applyTranslations,
+  getUiLanguage,
+  isUiLanguage,
+  localize,
+  setUiLanguage,
+  t,
+  type LocalizedMessage,
+  type UiLanguage,
+} from "./i18n";
+import { AUTO_CODE, AUTO_OPTION, LANGUAGES, languageLabel } from "./languages";
 import {
   ipc,
   onDownloadDone,
@@ -47,10 +57,10 @@ const DETECT_DELAY = 400;
 const MAX_BUFFERED_EVENTS = 800;
 
 const ENGINE_LABELS: Record<EngineStatus["state"], string> = {
-  starting: "エンジンを起動しています",
-  loading: "モデルを読み込んでいます",
-  ready: "準備完了",
-  error: "エンジンエラー",
+  starting: "engine.starting",
+  loading: "engine.loading",
+  ready: "engine.ready",
+  error: "engine.error",
 };
 
 type FormChoice = "" | "plain" | "polite";
@@ -78,7 +88,7 @@ interface UpdateUiState {
   phase: UpdatePhase;
   check: UpdateCheck | null;
   progress: { downloaded: number; total: number } | null;
-  message: string;
+  message: string | LocalizedMessage;
 }
 
 type JobEvent =
@@ -113,6 +123,7 @@ interface AppState {
   download: DownloadState | null;
   modelsDirSetting: string | null;
   autoUpdateCheck: boolean;
+  uiLanguage: UiLanguage;
   update: UpdateUiState;
 }
 
@@ -137,6 +148,7 @@ const state: AppState = {
   download: null,
   modelsDirSetting: null,
   autoUpdateCheck: true,
+  uiLanguage: "ja",
   update: { phase: "idle", check: null, progress: null, message: "" },
 };
 
@@ -212,8 +224,39 @@ const updateProgressTextEl = byId<HTMLSpanElement>("update-progress-text");
 const updateCancelEl = byId<HTMLButtonElement>("update-cancel");
 const autoUpdateCheckEl = byId<HTMLInputElement>("auto-update-check");
 const updateControlEl = updateToggleEl.parentElement;
+const settingsVersionEl = byId<HTMLSpanElement>("settings-version");
+type SettingsSection = "runtime" | "language" | "update" | "models";
 
-const APP_VERSION = "1.1.0";
+const SETTINGS_SECTIONS: readonly SettingsSection[] = ["runtime", "language", "update", "models"];
+
+const settingsNavEl = byId<HTMLElement>("settings-nav");
+const settingsNavItems = Array.from(
+  document.querySelectorAll<HTMLButtonElement>(".settings-nav-item"),
+);
+const settingsPanels = Array.from(document.querySelectorAll<HTMLElement>("[data-panel]"));
+
+function isSettingsSection(value: string): value is SettingsSection {
+  return (SETTINGS_SECTIONS as readonly string[]).includes(value);
+}
+
+function selectSettingsSection(section: SettingsSection, focusItem = false): void {
+  for (const item of settingsNavItems) {
+    const active = item.dataset["section"] === section;
+    item.setAttribute("aria-current", String(active));
+    if (active && focusItem) {
+      item.focus();
+    }
+  }
+  for (const panel of settingsPanels) {
+    panel.hidden = panel.dataset["panel"] !== section;
+  }
+}
+
+const uiLanguageInputs = Array.from(
+  document.querySelectorAll<HTMLInputElement>('input[name="ui-language"]'),
+);
+
+const APP_VERSION = "1.2.0";
 const RELEASES_PAGE_URL = "https://github.com/Fizor-drm/NuKa/releases/latest";
 
 const LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-en";
@@ -320,7 +363,7 @@ function computeOutputView(): OutputView {
     return {
       kind: "error",
       message: state.translationError,
-      action: { kind: "retry", label: "再試行" },
+      action: { kind: "retry", label: t("output.retry") },
       text,
     };
   }
@@ -329,8 +372,8 @@ function computeOutputView(): OutputView {
     if (setup !== null && !setup.runtime.installed) {
       return {
         kind: "error",
-        message: "ランタイムが未導入です。設定からインストールしてください。",
-        action: { kind: "settings", label: "設定を開く" },
+        message: t("output.runtimeMissing"),
+        action: { kind: "settings", label: t("output.openSettings") },
         text,
       };
     }
@@ -338,25 +381,31 @@ function computeOutputView(): OutputView {
       return {
         kind: "error",
         message:
-          setup.models.length === 0
-            ? "モデルが導入されていません。設定からインストールしてください。"
-            : "使用するモデルを選んでください。",
-        action: { kind: "settings", label: "設定を開く" },
+          setup.models.length === 0 ? t("output.modelMissing") : t("output.modelNotSelected"),
+        action: { kind: "settings", label: t("output.openSettings") },
         text,
       };
     }
     return {
       kind: "error",
-      message: state.engine.detail ?? "エンジンを起動できませんでした。",
-      action: { kind: "restart", label: "再起動" },
+      message:
+        state.engine.detail !== undefined
+          ? localize(state.engine.detail)
+          : t("output.engineStartFailed"),
+      action: { kind: "restart", label: t("output.restart") },
       text,
     };
   }
   if (state.translating) {
-    return { kind: "translating", message: text === "" ? "翻訳しています…" : "", action: null, text };
+    return {
+      kind: "translating",
+      message: text === "" ? t("output.translating") : "",
+      action: null,
+      text,
+    };
   }
   if (state.engine.state === "starting" || state.engine.state === "loading") {
-    return { kind: "loading", message: "モデルを読み込んでいます…", action: null, text };
+    return { kind: "loading", message: t("output.loading"), action: null, text };
   }
   return { kind: "idle", message: "", action: null, text };
 }
@@ -364,9 +413,10 @@ function computeOutputView(): OutputView {
 function renderEngine(): void {
   const { state: phase, detail } = state.engine;
   engineDotEl.dataset["state"] = phase;
-  engineLabelEl.textContent = ENGINE_LABELS[phase];
-  if (detail !== undefined && detail !== "") {
-    engineEl.title = detail;
+  engineLabelEl.textContent = t(ENGINE_LABELS[phase]);
+  const localizedDetail = detail !== undefined ? localize(detail) : "";
+  if (localizedDetail !== "") {
+    engineEl.title = localizedDetail;
   } else {
     engineEl.removeAttribute("title");
   }
@@ -384,13 +434,16 @@ function renderLanguageBar(): void {
   const showDetected = state.sourceLang === AUTO_CODE && detected !== null;
   detectedEl.hidden = !showDetected;
   if (showDetected && detected !== null) {
-    detectedEl.textContent = detectedLabel(detected.code);
-    detectedEl.title = `確度 ${Math.round(detected.confidence * 100)}%`;
+    detectedEl.textContent = t("lang.detected", { language: languageLabel(detected.code) });
+    detectedEl.title = t("lang.detectedTitle", {
+      percent: Math.round(detected.confidence * 100),
+    });
   }
 
   const canSwap = state.sourceLang !== AUTO_CODE || detected !== null;
   swapEl.disabled = !canSwap;
-  swapEl.title = canSwap ? "言語を入れ替える" : "自動検出のままでは入れ替えできません";
+  swapEl.title = canSwap ? t("lang.swapTitle") : t("lang.swapTitleDisabled");
+  swapEl.setAttribute("aria-label", t("lang.swapAria"));
 }
 
 function renderFormChips(): void {
@@ -402,7 +455,9 @@ function renderFormChips(): void {
 }
 
 function renderCharCount(): void {
-  charCountEl.textContent = `${Array.from(sourceInputEl.value).length} 文字`;
+  charCountEl.textContent = t("source.charCount", {
+    count: Array.from(sourceInputEl.value).length,
+  });
 }
 
 function renderChunkProgress(): void {
@@ -439,7 +494,20 @@ function describeError(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "key" in error &&
+    "fallback" in error
+  ) {
+    return localize(error as LocalizedMessage);
+  }
   return String(error);
+}
+
+/** フロントで組み立てた文字列を、言語切替でも再描画できるメッセージにする。 */
+function rawMessage(message: string): LocalizedMessage {
+  return { key: "error.raw", params: { detail: message }, fallback: message };
 }
 
 function showAppStatus(message: string): void {
@@ -469,7 +537,7 @@ async function refreshEngineStatus(): Promise<void> {
   try {
     handleEngineStatus(await ipc.getEngineStatus());
   } catch (error) {
-    handleEngineStatus({ state: "error", detail: describeError(error) });
+    handleEngineStatus({ state: "error", detail: rawMessage(describeError(error)) });
   }
 }
 
@@ -764,13 +832,13 @@ async function handleOutputAction(kind: OutputActionKind): Promise<void> {
     return;
   }
   state.translationError = null;
-  state.engine = { state: "starting", detail: "llama-server を起動し直しています。" };
+  state.engine = { state: "starting", detail: rawMessage(t("engine.startingDetail")) };
   renderEngine();
   renderOutput();
   try {
     await ipc.restartEngine();
   } catch (error) {
-    state.engine = { state: "error", detail: describeError(error) };
+    state.engine = { state: "error", detail: rawMessage(describeError(error)) };
     renderEngine();
     renderOutput();
   }
@@ -784,7 +852,7 @@ async function persistSettings(patch: SettingsPatch): Promise<void> {
   try {
     await ipc.setSettings(patch);
   } catch (error) {
-    showAppStatus(`設定を保存できませんでした: ${describeError(error)}`);
+    showAppStatus(t("status.settingsSaveFailed", { detail: describeError(error) }));
   }
 }
 
@@ -801,6 +869,40 @@ function cycleTheme(): void {
   void persistSettings({ theme: state.theme });
 }
 
+async function changeUiLanguage(language: UiLanguage): Promise<void> {
+  if (!isUiLanguage(language) || language === getUiLanguage()) {
+    return;
+  }
+  state.uiLanguage = language;
+  setUiLanguage(language);
+  applyTranslations();
+  relocalizeDynamicUi();
+  try {
+    await ipc.setSettings({ ui_language: language });
+  } catch (error) {
+    showAppStatus(t("status.settingsSaveFailed", { detail: describeError(error) }));
+  }
+  await refreshEngineStatus();
+  await refreshSetup();
+}
+
+/** 言語切替時に、JS が組み立てている文言をすべて作り直す。 */
+function relocalizeDynamicUi(): void {
+  renderThemeButton(themeToggleEl, state.theme);
+  renderAutoToggle();
+  renderEngine();
+  renderLanguageBar();
+  sourcePicker.refresh();
+  targetPicker.refresh();
+  renderCharCount();
+  glossaryEditor.relocalize();
+  buildModelRows();
+  renderSettings();
+  renderUpdate();
+  outputPane.relocalize();
+  renderOutput();
+}
+
 async function loadSettings(): Promise<void> {
   try {
     const settings = await ipc.getSettings();
@@ -810,6 +912,11 @@ async function loadSettings(): Promise<void> {
     state.autoTranslate = settings.auto_translate;
     state.autoUpdateCheck = settings.auto_update_check;
     autoUpdateCheckEl.checked = state.autoUpdateCheck;
+    if (isUiLanguage(settings.ui_language)) {
+      state.uiLanguage = settings.ui_language;
+    }
+    setUiLanguage(state.uiLanguage);
+    applyTranslations();
     state.modelsDirSetting = settings.models_dir;
   } catch {
     // 設定が読めなくても既定値で動かす
@@ -829,6 +936,8 @@ function setView(view: ViewName): void {
   viewSettingsEl.hidden = view !== "settings";
   settingsToggleEl.setAttribute("aria-pressed", String(view === "settings"));
   if (view === "settings") {
+    // 設定を開くたびに先頭 (ランタイム) から表示する。
+    selectSettingsSection("runtime");
     void refreshSetup().finally(() => {
       renderSettings();
       settingsBackEl.focus();
@@ -857,7 +966,7 @@ async function refreshCatalog(): Promise<void> {
     state.catalog = await ipc.getCatalog();
     buildModelRows();
   } catch (error) {
-    showAppStatus(`カタログを取得できません: ${describeError(error)}`);
+    showAppStatus(t("status.catalogFailed", { detail: describeError(error) }));
   }
   renderSettings();
 }
@@ -867,7 +976,7 @@ async function refreshSetup(): Promise<void> {
     state.setup = await ipc.getSetupState();
   } catch (error) {
     state.setup = null;
-    showAppStatus(`導入状態を取得できません: ${describeError(error)}`);
+    showAppStatus(t("status.setupFailed", { detail: describeError(error) }));
   }
   renderOutput();
   renderSettings();
@@ -906,20 +1015,29 @@ function buildModelRows(): void {
     const install = document.createElement("button");
     install.type = "button";
     install.className = "primary-button";
-    install.textContent = "インストール";
-    install.setAttribute("aria-label", `${entry.size.toUpperCase()} ${entry.quant} をインストール`);
+    install.textContent = t("models.install");
+    install.setAttribute(
+      "aria-label",
+      t("models.installAria", { size: entry.size.toUpperCase(), quant: entry.quant }),
+    );
 
     const use = document.createElement("button");
     use.type = "button";
     use.className = "secondary-button";
-    use.textContent = "使用する";
-    use.setAttribute("aria-label", `${entry.size.toUpperCase()} ${entry.quant} を使用する`);
+    use.textContent = t("models.use");
+    use.setAttribute(
+      "aria-label",
+      t("models.useAria", { size: entry.size.toUpperCase(), quant: entry.quant }),
+    );
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "secondary-button";
-    remove.textContent = "削除";
-    remove.setAttribute("aria-label", `${entry.size.toUpperCase()} ${entry.quant} を削除`);
+    remove.textContent = t("models.delete");
+    remove.setAttribute(
+      "aria-label",
+      t("models.deleteAria", { size: entry.size.toUpperCase(), quant: entry.quant }),
+    );
 
     actions.append(badge, install, use, remove);
 
@@ -936,10 +1054,10 @@ function buildModelRows(): void {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "secondary-button";
-    cancel.textContent = "取消";
+    cancel.textContent = t("models.cancel");
     cancel.setAttribute(
       "aria-label",
-      `${entry.size.toUpperCase()} ${entry.quant} のダウンロードを取り消す`,
+      t("models.cancelAria", { size: entry.size.toUpperCase(), quant: entry.quant }),
     );
     progress.append(bar, progressText, cancel);
 
@@ -978,20 +1096,22 @@ function buildModelRows(): void {
 function renderSettings(): void {
   const setup = state.setup;
   if (setup === null) {
-    runtimeStatusEl.textContent = "確認しています…";
+    runtimeStatusEl.textContent = t("runtime.checking");
     runtimeNoteEl.hidden = true;
     runtimeInstallEl.hidden = false;
     runtimeInstallEl.disabled = true;
   } else if (!setup.runtime.installed) {
-    runtimeStatusEl.textContent = "未導入。ランタイムをインストールすると翻訳を始められます。";
+    runtimeStatusEl.textContent = t("runtime.notInstalled");
     runtimeNoteEl.hidden = true;
     runtimeInstallEl.hidden = false;
     runtimeInstallEl.disabled = state.download !== null;
   } else {
-    const version = setup.runtime.version ?? "外部のランタイム";
+    const version = setup.runtime.version ?? t("runtime.external");
     const usage =
-      setup.runtime.bytes !== undefined ? ` / 使用量 ${formatBytes(setup.runtime.bytes)}` : "";
-    runtimeStatusEl.textContent = `導入済み: llama.cpp ${version} (CUDA 12.4)${usage}`;
+      setup.runtime.bytes !== undefined
+        ? t("runtime.usage", { size: formatBytes(setup.runtime.bytes) })
+        : "";
+    runtimeStatusEl.textContent = t("runtime.installed", { version }) + usage;
     runtimeNoteEl.hidden = false;
     runtimeInstallEl.hidden = true;
     runtimeInstallEl.disabled = true;
@@ -1024,8 +1144,9 @@ function renderSettings(): void {
     row.use.disabled = busy;
     row.remove.hidden = model === undefined;
     row.remove.disabled = isActive || busy;
-    row.remove.title = isActive ? "使用中のモデルは削除できません" : "このモデルを削除";
+    row.remove.title = isActive ? t("models.deleteActiveTitle") : t("models.deleteTitle");
     row.badge.hidden = !isActive;
+    row.badge.textContent = t("models.active");
 
     row.progress.hidden = !isDownloading;
     if (isDownloading && state.download !== null) {
@@ -1043,6 +1164,48 @@ function renderSettings(): void {
   modelsDirCustomEl.checked = custom;
   modelsDirPickEl.disabled = state.download !== null;
   autoUpdateCheckEl.checked = state.autoUpdateCheck;
+  settingsVersionEl.textContent = `v${APP_VERSION}`;
+  for (const item of settingsNavItems) {
+    item.addEventListener("click", () => {
+      const section = item.dataset["section"] ?? "";
+      if (isSettingsSection(section)) {
+        selectSettingsSection(section);
+      }
+    });
+  }
+
+  settingsNavEl.addEventListener("keydown", (event) => {
+    const currentIndex = settingsNavItems.findIndex(
+      (item) => item.getAttribute("aria-current") === "true",
+    );
+    let nextIndex: number;
+    switch (event.key) {
+      case "ArrowDown":
+        nextIndex = (currentIndex + 1) % settingsNavItems.length;
+        break;
+      case "ArrowUp":
+        nextIndex = (currentIndex - 1 + settingsNavItems.length) % settingsNavItems.length;
+        break;
+      case "Home":
+        nextIndex = 0;
+        break;
+      case "End":
+        nextIndex = settingsNavItems.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    const next = settingsNavItems[nextIndex];
+    const section = next?.dataset["section"] ?? "";
+    if (isSettingsSection(section)) {
+      selectSettingsSection(section, true);
+    }
+  });
+
+  for (const input of uiLanguageInputs) {
+    input.checked = input.value === state.uiLanguage;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,30 +1231,34 @@ function renderUpdate(): void {
   let message: string;
   switch (update.phase) {
     case "idle":
-      message = "アップデートを確認します。";
+      message = t("update.idle");
       break;
     case "checking":
-      message = "最新リリースを確認しています…";
+      message = t("update.checking");
       break;
     case "latest":
-      message = check?.latest !== undefined ? `最新です (${latest})` : "最新です。";
+      message = check?.latest !== undefined ? t("update.latest", { version: latest }) : t("update.latestUnknown");
       break;
     case "available": {
-      const size = check?.asset !== undefined ? ` (${formatBytes(check.asset.size)})` : "";
-      message = `${latest} に更新できます${size}`;
+      const size = check?.asset !== undefined ? formatBytes(check.asset.size) : "";
+      message = t("update.available", { version: latest, size });
       break;
     }
     case "downloading":
-      message = "ダウンロードしています…";
+      message = t("update.downloading");
       break;
     case "ready":
-      message = "インストーラーを起動して NuKa を終了します…";
+      message = t("update.ready");
       break;
     case "installing":
-      message = "インストーラーを起動しています…";
+      message = t("update.installing");
       break;
     case "error":
-      message = update.message !== "" ? update.message : "更新を確認できませんでした。";
+      if (typeof update.message === "string") {
+        message = update.message !== "" ? update.message : t("update.unknownError");
+      } else {
+        message = localize(update.message);
+      }
       break;
   }
   updateStatusEl.textContent = message;
@@ -1137,11 +1304,11 @@ async function checkForUpdates(manual: boolean): Promise<void> {
     }
   } catch (error) {
     state.update.phase = "error";
-    state.update.message = `更新を確認できませんでした: ${describeError(error)}`;
+    state.update.message = rawMessage(t("update.checkFailed", { detail: describeError(error) }));
   }
   renderUpdate();
   if (manual && state.update.phase === "error") {
-    showAppStatus(state.update.message);
+    showAppStatus(typeof state.update.message === "string" ? state.update.message : localize(state.update.message));
   }
 }
 
@@ -1160,7 +1327,7 @@ async function startUpdateDownload(): Promise<void> {
     if (state.update.phase === "downloading") {
       state.update.phase = "error";
       state.update.progress = null;
-      state.update.message = `ダウンロードを開始できません: ${describeError(error)}`;
+      state.update.message = rawMessage(t("update.downloadStartFailed", { detail: describeError(error) }));
       renderUpdate();
     }
   }
@@ -1170,7 +1337,7 @@ async function cancelUpdateDownload(): Promise<void> {
   try {
     await ipc.cancelUpdateDownload();
   } catch (error) {
-    showAppStatus(`ダウンロードを取り消せません: ${describeError(error)}`);
+    showAppStatus(t("update.cancelFailed", { detail: describeError(error) }));
   }
 }
 
@@ -1184,7 +1351,7 @@ async function installDownloadedUpdate(): Promise<void> {
     await ipc.installUpdate();
   } catch (error) {
     state.update.phase = "error";
-    state.update.message = `インストーラーを起動できません: ${describeError(error)}`;
+    state.update.message = rawMessage(t("update.installFailed", { detail: describeError(error) }));
     renderUpdate();
   }
 }
@@ -1205,12 +1372,16 @@ function handleUpdateDone(payload: UpdateDonePayload): void {
   state.update.progress = null;
   state.update.message = "";
   renderUpdate();
-  showAppStatus(`v${payload.version} の準備ができました。`);
+  showAppStatus(t("update.readyStatus", { version: payload.version }));
   void installDownloadedUpdate();
 }
 
 function handleUpdateError(payload: UpdateErrorPayload): void {
-  if (state.update.phase === "downloading" && payload.message === "ダウンロードを中止しました。") {
+  const cancelled =
+    typeof payload.message === "object" &&
+    payload.message !== null &&
+    (payload.message.key === "updater.cancelled" || payload.message.key === "installer.cancelled");
+  if (state.update.phase === "downloading" && cancelled) {
     state.update.phase = "available";
     state.update.progress = null;
     renderUpdate();
@@ -1238,7 +1409,7 @@ async function handleAutoUpdateCheckChange(): Promise<void> {
   } catch (error) {
     state.autoUpdateCheck = !desired;
     autoUpdateCheckEl.checked = !desired;
-    showAppStatus(`設定を保存できません: ${describeError(error)}`);
+    showAppStatus(t("status.settingsSaveFailed", { detail: describeError(error) }));
   }
 }
 
@@ -1254,7 +1425,7 @@ async function startRuntimeInstall(): Promise<void> {
     if (state.download?.kind === "runtime") {
       state.download = null;
       renderSettings();
-      showAppStatus(`ランタイムをインストールできません: ${describeError(error)}`);
+      showAppStatus(t("status.runtimeInstallFailed", { detail: describeError(error) }));
     }
   }
 }
@@ -1271,7 +1442,7 @@ async function startModelInstall(entry: CatalogEntry): Promise<void> {
     if (state.download?.kind === "model" && state.download.id === entry.id) {
       state.download = null;
       renderSettings();
-      showAppStatus(`モデルをインストールできません: ${describeError(error)}`);
+      showAppStatus(t("status.modelInstallFailed", { detail: describeError(error) }));
     }
   }
 }
@@ -1280,7 +1451,7 @@ async function cancelDownload(id: string): Promise<void> {
   try {
     await ipc.cancelDownload(id);
   } catch (error) {
-    showAppStatus(`ダウンロードを取り消せません: ${describeError(error)}`);
+    showAppStatus(t("update.cancelFailed", { detail: describeError(error) }));
   }
 }
 
@@ -1290,7 +1461,7 @@ async function activateModel(entry: CatalogEntry): Promise<void> {
     await refreshSetup();
     await refreshEngineStatus();
   } catch (error) {
-    showAppStatus(`モデルを切り替えられません: ${describeError(error)}`);
+    showAppStatus(t("status.modelSwitchFailed", { detail: describeError(error) }));
   }
 }
 
@@ -1299,7 +1470,7 @@ async function removeModel(entry: CatalogEntry): Promise<void> {
     await ipc.deleteModel(entry.file);
     await refreshSetup();
   } catch (error) {
-    showAppStatus(`モデルを削除できません: ${describeError(error)}`);
+    showAppStatus(t("status.modelDeleteFailed", { detail: describeError(error) }));
   }
 }
 
@@ -1309,7 +1480,7 @@ async function changeModelsDir(path: string): Promise<void> {
     state.modelsDirSetting = settings.models_dir;
     await refreshSetup();
   } catch (error) {
-    showAppStatus(`インストール先を変更できません: ${describeError(error)}`);
+    showAppStatus(t("status.dirChangeFailed", { detail: describeError(error) }));
     renderSettings();
   }
 }
@@ -1319,13 +1490,13 @@ async function pickModelsDir(): Promise<void> {
     const selected = await openDirectoryDialog({
       directory: true,
       multiple: false,
-      title: "モデルのインストール先",
+      title: t("models.dirDialogTitle"),
     });
     if (typeof selected === "string" && selected !== "") {
       await changeModelsDir(selected);
     }
   } catch (error) {
-    showAppStatus(`フォルダを選択できません: ${describeError(error)}`);
+    showAppStatus(t("status.dirPickFailed", { detail: describeError(error) }));
   }
 }
 
@@ -1354,7 +1525,7 @@ async function handleDownloadDone(payload: { kind: DownloadKind; id: string }): 
   renderSettings();
   if (payload.kind === "runtime") {
     await refreshSetup();
-    showAppStatus("ランタイムをインストールしました。");
+    showAppStatus(t("status.runtimeInstalled"));
     // 再起動はバックエンド (install_runtime) が行う。状態だけ取り直す。
     await refreshEngineStatus();
     return;
@@ -1362,7 +1533,7 @@ async function handleDownloadDone(payload: { kind: DownloadKind; id: string }): 
 
   const entry = state.catalog.find((item) => item.id === payload.id);
   await refreshSetup();
-  showAppStatus("モデルをインストールしました。");
+  showAppStatus(t("status.modelInstalled"));
   const active = state.setup?.active_model ?? null;
   if (entry !== undefined && active === null && !isModelResolved(state.setup)) {
     try {
@@ -1370,12 +1541,16 @@ async function handleDownloadDone(payload: { kind: DownloadKind; id: string }): 
       await refreshSetup();
       await refreshEngineStatus();
     } catch (error) {
-      showAppStatus(`モデルを切り替えられません: ${describeError(error)}`);
+      showAppStatus(t("status.modelSwitchFailed", { detail: describeError(error) }));
     }
   }
 }
 
-function handleDownloadError(payload: { kind: DownloadKind; id: string; message: string }): void {
+function handleDownloadError(payload: {
+  kind: DownloadKind;
+  id: string;
+  message: LocalizedMessage;
+}): void {
   const matches =
     state.download !== null &&
     payload.kind === state.download.kind &&
@@ -1385,7 +1560,7 @@ function handleDownloadError(payload: { kind: DownloadKind; id: string; message:
   }
   state.download = null;
   renderSettings();
-  showAppStatus(payload.message);
+  showAppStatus(localize(payload.message));
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1744,55 @@ function bindUi(): void {
     void handleAutoUpdateCheckChange();
   });
 
+  for (const item of settingsNavItems) {
+    item.addEventListener("click", () => {
+      const section = item.dataset["section"] ?? "";
+      if (isSettingsSection(section)) {
+        selectSettingsSection(section);
+      }
+    });
+  }
+
+  settingsNavEl.addEventListener("keydown", (event) => {
+    const currentIndex = settingsNavItems.findIndex(
+      (item) => item.getAttribute("aria-current") === "true",
+    );
+    let nextIndex: number;
+    switch (event.key) {
+      case "ArrowDown":
+        nextIndex = (currentIndex + 1) % settingsNavItems.length;
+        break;
+      case "ArrowUp":
+        nextIndex = (currentIndex - 1 + settingsNavItems.length) % settingsNavItems.length;
+        break;
+      case "Home":
+        nextIndex = 0;
+        break;
+      case "End":
+        nextIndex = settingsNavItems.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    const next = settingsNavItems[nextIndex];
+    const section = next?.dataset["section"] ?? "";
+    if (isSettingsSection(section)) {
+      selectSettingsSection(section, true);
+    }
+  });
+
+  for (const input of uiLanguageInputs) {
+    input.addEventListener("change", () => {
+      if (input.checked) {
+        const value = input.value;
+        if (isUiLanguage(value)) {
+          void changeUiLanguage(value);
+        }
+      }
+    });
+  }
+
   document.addEventListener("pointerdown", (event) => {
     if (updatePopoverEl.hidden) {
       return;
@@ -1597,11 +1821,13 @@ async function bootstrap(): Promise<void> {
   bindUpdateEvents();
   bindUi();
   glossaryEditor.addRow();
+  await loadSettings();
   applyTheme(state.theme);
   renderThemeButton(themeToggleEl, state.theme);
+  glossaryEditor.relocalize();
+  applyTranslations();
   renderAll();
   renderUpdate();
-  await loadSettings();
   await refreshEngineStatus();
   await refreshCatalog();
   await refreshSetup();

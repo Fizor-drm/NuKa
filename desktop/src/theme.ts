@@ -4,15 +4,10 @@
  */
 
 import { setIcon, type IconName } from "./icons";
+import { t } from "./i18n";
 import type { ThemeSetting } from "./ipc";
 
 const CYCLE: readonly ThemeSetting[] = ["light", "dark", "system"];
-
-const LABELS: Record<ThemeSetting, string> = {
-  light: "ライト",
-  dark: "ダーク",
-  system: "システム",
-};
 
 const ICONS: Record<ThemeSetting, IconName> = {
   light: "sun",
@@ -25,7 +20,7 @@ export function isThemeSetting(value: string): value is ThemeSetting {
 }
 
 export function themeLabel(theme: ThemeSetting): string {
-  return LABELS[theme];
+  return t(`theme.${theme}`);
 }
 
 export function nextTheme(theme: ThemeSetting): ThemeSetting {
@@ -40,6 +35,6 @@ export function applyTheme(theme: ThemeSetting): void {
 export function renderThemeButton(button: HTMLButtonElement, theme: ThemeSetting): void {
   const label = themeLabel(theme);
   setIcon(button, ICONS[theme], 16);
-  button.title = `テーマ: ${label}`;
-  button.setAttribute("aria-label", `テーマを切り替える（現在: ${label}）`);
+  button.title = t("header.themeTitle", { theme: label });
+  button.setAttribute("aria-label", t("header.themeAria", { theme: label }));
 }

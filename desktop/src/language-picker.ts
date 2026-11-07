@@ -10,7 +10,12 @@
  */
 
 import { icon } from "./icons";
+import { t } from "./i18n";
 import { languageLabel, type LanguageOption } from "./languages";
+
+function displayLabel(code: string): string {
+  return code === "auto" ? t("lang.autoDetect") : languageLabel(code);
+}
 
 export interface LanguagePickerElements {
   readonly trigger: HTMLButtonElement;
@@ -48,9 +53,17 @@ export class LanguagePicker {
   /** 表示だけ更新する。ユーザー操作由来のときだけ `notify` を true にする。 */
   setValue(code: string, notify = true): void {
     this.value = code;
-    this.elements.label.textContent = languageLabel(code);
+    this.elements.label.textContent = displayLabel(code);
     if (notify) {
       this.onSelect(code);
+    }
+  }
+
+  /** 表示言語の変更に合わせてラベル・一覧を作り直す。 */
+  refresh(): void {
+    this.elements.label.textContent = displayLabel(this.value);
+    if (this.open) {
+      this.filter(this.elements.search.value);
     }
   }
 
@@ -188,7 +201,7 @@ export class LanguagePicker {
 
       const label = document.createElement("span");
       label.className = "lang-option-label";
-      label.textContent = option.label;
+      label.textContent = option.code === "auto" ? t("lang.autoDetect") : option.label;
 
       const native = document.createElement("span");
       native.className = "lang-option-native";

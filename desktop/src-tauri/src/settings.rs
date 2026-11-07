@@ -20,6 +20,14 @@ pub const MIN_CONTEXT_TOKENS: u32 = 512;
 pub const MAX_CONTEXT_TOKENS: u32 = 32768;
 pub const MAX_GPU_LAYERS: u32 = 1000;
 
+/// UI 表示言語。既定は日本語。
+pub const UI_LANGUAGE_DEFAULT: &str = "ja";
+pub const UI_LANGUAGES: [&str; 3] = ["ja", "en", "zh"];
+
+pub fn is_supported_ui_language(value: &str) -> bool {
+    UI_LANGUAGES.contains(&value)
+}
+
 /// 保存用の一時ファイル名に付ける連番。同じプロセス内の同時保存でも衝突させない。
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -69,6 +77,8 @@ pub struct Settings {
     pub auto_translate: bool,
     /// 起動時に GitHub の最新リリースを確認するか (既定 true)。
     pub auto_update_check: bool,
+    /// UI の表示言語 ("ja" / "en" / "zh")。
+    pub ui_language: String,
     /// モデルの保存先。null なら `{app_local_data_dir}/models`。
     /// IPC では設定画面のフォルダ選択からだけ変更できる。
     pub models_dir: Option<String>,
@@ -90,6 +100,7 @@ impl Default for Settings {
             theme: Theme::Light,
             auto_translate: true,
             auto_update_check: true,
+            ui_language: UI_LANGUAGE_DEFAULT.to_string(),
             models_dir: None,
             installed_runtime: None,
             installed_models: Vec::new(),
@@ -109,6 +120,7 @@ pub struct SettingsPatch {
     pub theme: Option<Theme>,
     pub auto_translate: Option<bool>,
     pub auto_update_check: Option<bool>,
+    pub ui_language: Option<String>,
 }
 
 #[derive(Clone)]
@@ -174,6 +186,9 @@ impl SettingsStore {
             if let Some(value) = patch.auto_update_check {
                 settings.auto_update_check = value;
             }
+            if let Some(value) = patch.ui_language {
+                settings.ui_language = value;
+            }
             Ok(())
         })
     }
@@ -222,6 +237,9 @@ fn validate(settings: &Settings) -> Result<(), String> {
             "gpu_layers は 0〜{MAX_GPU_LAYERS} の範囲で指定してください。"
         ));
     }
+    if !is_supported_ui_language(&settings.ui_language) {
+        return Err("ui_language は ja / en / zh のいずれかで指定してください。".to_string());
+    }
     Ok(())
 }
 
@@ -231,6 +249,9 @@ fn sanitize(settings: &mut Settings) {
         .context_tokens
         .clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS);
     settings.gpu_layers = settings.gpu_layers.min(MAX_GPU_LAYERS);
+    if !is_supported_ui_language(&settings.ui_language) {
+        settings.ui_language = UI_LANGUAGE_DEFAULT.to_string();
+    }
     settings.model_path = settings.model_path.take().and_then(normalize_optional);
     settings.server_path = settings.server_path.take().and_then(normalize_optional);
     settings.models_dir = settings.models_dir.take().and_then(normalize_optional);
@@ -340,6 +361,7 @@ mod tests {
         assert_eq!(settings.theme, Theme::Light);
         assert!(settings.auto_translate);
         assert!(settings.auto_update_check);
+        assert_eq!(settings.ui_language, UI_LANGUAGE_DEFAULT);
         assert!(settings.models_dir.is_none());
         assert!(settings.installed_runtime.is_none());
         assert!(settings.installed_models.is_empty());
@@ -503,6 +525,7 @@ mod tests {
                 theme: Some(Theme::Dark),
                 auto_translate: Some(false),
                 auto_update_check: Some(false),
+                ui_language: Some("zh".to_string()),
             })
             .expect("設定を保存できる");
         assert_eq!(updated.gpu_layers, 20);
@@ -510,6 +533,7 @@ mod tests {
         assert_eq!(updated.theme, Theme::Dark);
         assert!(!updated.auto_translate);
         assert!(!updated.auto_update_check);
+        assert_eq!(updated.ui_language, "zh");
 
         let reloaded = SettingsStore::new(path).get();
         assert_eq!(reloaded, updated);
@@ -529,6 +553,40 @@ mod tests {
             .expect_err("範囲外は拒む");
         assert!(error.contains("context_tokens"));
         assert_eq!(store.get().context_tokens, 8192);
+
+        let error = store
+            .apply(SettingsPatch {
+                ui_language: Some("fr".to_string()),
+                ..Default::default()
+            })
+            .expect_err("未知の言語コードは拒む");
+        assert!(error.contains("ui_language"));
+        assert_eq!(store.get().ui_language, UI_LANGUAGE_DEFAULT);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn ui_language_round_trips_and_unknown_values_fall_back() {
+        let directory = temp_dir("ui-language");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        for code in ["en", "zh", "ja"] {
+            store
+                .apply(SettingsPatch {
+                    ui_language: Some(code.to_string()),
+                    ..Default::default()
+                })
+                .expect("保存できる");
+            assert_eq!(SettingsStore::new(path.clone()).get().ui_language, code);
+        }
+
+        // 手編集で壊れた値は既定 (ja) に戻す
+        fs::write(
+            &path,
+            r#"{"ui_language":"xx","gpu_layers":99,"context_tokens":8192}"#,
+        )
+        .unwrap();
+        assert_eq!(SettingsStore::new(path).get().ui_language, "ja");
         let _ = fs::remove_dir_all(&directory);
     }
 

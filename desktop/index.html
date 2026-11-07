@@ -13,8 +13,8 @@
           <span class="brand-mark" aria-hidden="true">訳</span>
           <span
             class="brand-name"
-            title="Powered by PLaMo 3 Translate"
-            aria-label="NuKa（Powered by PLaMo 3 Translate）"
+            data-i18n-title="app.brandTitle"
+            data-i18n-aria-label="app.brandAria"
             >NuKa</span
           >
         </div>
@@ -30,7 +30,8 @@
             class="toggle-button"
             id="auto-toggle"
             aria-pressed="true"
-            title="入力が止まったら自動で翻訳する"
+            data-i18n-title="header.autoTranslateTitle"
+            data-i18n="header.autoTranslate"
           >
             自動翻訳
           </button>
@@ -41,7 +42,8 @@
             aria-pressed="false"
             aria-expanded="false"
             aria-controls="glossary-panel"
-            title="用語の訳し方を固定する"
+            data-i18n-title="header.glossaryTitle"
+            data-i18n="header.glossary"
           >
             用語集
           </button>
@@ -84,8 +86,8 @@
               aria-haspopup="dialog"
               aria-expanded="false"
               aria-controls="update-popover"
-              title="アップデートを確認"
-              aria-label="アップデートを確認"
+              data-i18n-title="header.updateTitle"
+              data-i18n-aria-label="header.updateAria"
             >
               <svg
                 class="icon"
@@ -110,12 +112,12 @@
               class="update-popover"
               id="update-popover"
               role="dialog"
-              aria-label="アップデート"
+              data-i18n-aria-label="update.title"
               hidden
             >
               <div class="update-head">
-                <span class="update-title">アップデート</span>
-                <span class="update-current" id="update-current">v1.1.0</span>
+                <span class="update-title" data-i18n="update.title">アップデート</span>
+                <span class="update-current" id="update-current">v1.2.0</span>
               </div>
               <p class="update-status" id="update-status" role="status" aria-live="polite">
                 アップデートを確認します。
@@ -125,14 +127,40 @@
                   ><span class="download-fill" id="update-bar"></span
                 ></span>
                 <span class="download-text" id="update-progress-text"></span>
-                <button type="button" class="secondary-button" id="update-cancel">取り消し</button>
+                <button
+                  type="button"
+                  class="secondary-button"
+                  id="update-cancel"
+                  data-i18n="update.cancel"
+                >
+                  取り消し
+                </button>
               </div>
               <div class="update-actions" id="update-actions" hidden>
-                <button type="button" class="primary-button" id="update-install">更新する</button>
-                <button type="button" class="secondary-button" id="update-retry" hidden>
+                <button
+                  type="button"
+                  class="primary-button"
+                  id="update-install"
+                  data-i18n="update.update"
+                >
+                  更新する
+                </button>
+                <button
+                  type="button"
+                  class="secondary-button"
+                  id="update-retry"
+                  data-i18n="update.retry"
+                  hidden
+                >
                   再試行
                 </button>
-                <button type="button" class="link-button" id="update-release" hidden>
+                <button
+                  type="button"
+                  class="link-button"
+                  id="update-release"
+                  data-i18n="update.release"
+                  hidden
+                >
                   リリースページを開く
                 </button>
               </div>
@@ -143,8 +171,8 @@
             class="icon-button"
             id="settings-toggle"
             aria-pressed="false"
-            title="設定"
-            aria-label="設定を開く"
+            data-i18n-title="header.settingsTitle"
+            data-i18n-aria-label="header.settingsAria"
           >
             <svg
               class="icon"
@@ -221,14 +249,21 @@
                   aria-expanded="true"
                   aria-controls="source-lang-list"
                   aria-autocomplete="list"
-                  aria-label="原文の言語を検索"
-                  placeholder="言語を検索"
+                  data-i18n-aria-label="lang.sourceSearchAria"
+                  data-i18n-placeholder="lang.searchPlaceholder"
                   autocomplete="off"
                   spellcheck="false"
                 />
               </div>
-              <ul class="lang-list" id="source-lang-list" role="listbox" aria-label="原文の言語"></ul>
-              <p class="lang-empty" id="source-lang-empty" hidden>該当する言語がありません</p>
+              <ul
+                class="lang-list"
+                id="source-lang-list"
+                role="listbox"
+                data-i18n-aria-label="lang.sourceListAria"
+              ></ul>
+              <p class="lang-empty" id="source-lang-empty" data-i18n="lang.noMatches" hidden>
+                該当する言語がありません
+              </p>
             </div>
           </div>
 
@@ -312,14 +347,21 @@
                   aria-expanded="true"
                   aria-controls="target-lang-list"
                   aria-autocomplete="list"
-                  aria-label="訳文の言語を検索"
-                  placeholder="言語を検索"
+                  data-i18n-aria-label="lang.targetSearchAria"
+                  data-i18n-placeholder="lang.searchPlaceholder"
                   autocomplete="off"
                   spellcheck="false"
                 />
               </div>
-              <ul class="lang-list" id="target-lang-list" role="listbox" aria-label="訳文の言語"></ul>
-              <p class="lang-empty" id="target-lang-empty" hidden>該当する言語がありません</p>
+              <ul
+                class="lang-list"
+                id="target-lang-list"
+                role="listbox"
+                data-i18n-aria-label="lang.targetListAria"
+              ></ul>
+              <p class="lang-empty" id="target-lang-empty" data-i18n="lang.noMatches" hidden>
+                該当する言語がありません
+              </p>
             </div>
           </div>
         </div>
@@ -329,19 +371,55 @@
             <textarea
               id="source"
               class="source-input"
-              aria-label="原文"
-              placeholder="訳したい文章を入力してください"
+              data-i18n-aria-label="source.aria"
+              data-i18n-placeholder="source.placeholder"
               spellcheck="false"
             ></textarea>
             <footer class="pane-footer">
-              <div class="form-chips" id="form-chips" role="group" aria-label="文体" hidden>
-                <button type="button" class="chip" data-form="" aria-pressed="true">指定しない</button>
-                <button type="button" class="chip" data-form="polite" aria-pressed="false">です・ます</button>
-                <button type="button" class="chip" data-form="plain" aria-pressed="false">だ・である</button>
+              <div
+                class="form-chips"
+                id="form-chips"
+                role="group"
+                data-i18n-aria-label="form.groupAria"
+                hidden
+              >
+                <button
+                  type="button"
+                  class="chip"
+                  data-form=""
+                  aria-pressed="true"
+                  data-i18n="form.none"
+                >
+                  指定しない
+                </button>
+                <button
+                  type="button"
+                  class="chip"
+                  data-form="polite"
+                  aria-pressed="false"
+                  data-i18n="form.polite"
+                >
+                  です・ます
+                </button>
+                <button
+                  type="button"
+                  class="chip"
+                  data-form="plain"
+                  aria-pressed="false"
+                  data-i18n="form.plain"
+                >
+                  だ・である
+                </button>
               </div>
               <div class="pane-footer-end">
                 <span class="char-count" id="char-count">0 文字</span>
-                <button type="button" class="icon-button" id="clear" title="原文をクリア" aria-label="原文をクリア">
+                <button
+                  type="button"
+                  class="icon-button"
+                  id="clear"
+                  data-i18n-title="source.clear"
+                  data-i18n-aria-label="source.clear"
+                >
                   <svg
                     class="icon"
                     viewBox="0 0 24 24"
@@ -359,7 +437,9 @@
                     <path d="M18 6 6 18" />
                   </svg>
                 </button>
-                <button type="button" class="primary-button" id="translate">翻訳する</button>
+                <button type="button" class="primary-button" id="translate" data-i18n="translate.button">
+                  翻訳する
+                </button>
               </div>
             </footer>
           </section>
@@ -371,13 +451,17 @@
                 <span class="output-notice-text" id="output-notice-text"></span>
                 <button type="button" class="secondary-button" id="output-action" hidden></button>
               </div>
-              <p class="output-placeholder" id="output-placeholder">訳文がここに表示されます</p>
+              <p class="output-placeholder" id="output-placeholder" data-i18n="output.placeholder">
+                訳文がここに表示されます
+              </p>
               <div class="output-text" id="output-text" hidden></div>
             </div>
             <footer class="pane-footer">
               <div class="chunk-progress" id="chunk-progress" hidden>
                 <span class="chunk-label" id="chunk-label">0/0</span>
-                <span class="chunk-track" aria-hidden="true"><span class="chunk-fill" id="chunk-fill"></span></span>
+                <span class="chunk-track" aria-hidden="true"
+                  ><span class="chunk-fill" id="chunk-fill"></span
+                ></span>
               </div>
               <div class="pane-footer-end">
                 <span class="copy-status" id="copy-status" role="status" aria-live="polite"></span>
@@ -385,7 +469,7 @@
                   type="button"
                   class="secondary-button copy-button"
                   id="copy"
-                  title="訳文をコピー"
+                  data-i18n-title="output.copyTitle"
                   aria-disabled="true"
                 >
                   <svg
@@ -404,7 +488,7 @@
                     <rect x="9" y="9" width="11" height="11" rx="2" />
                     <path d="M5 15V6a2 2 0 0 1 2-2h9" />
                   </svg>
-                  <span id="copy-label">コピー</span>
+                  <span id="copy-label" data-i18n="output.copy">コピー</span>
                 </button>
               </div>
             </footer>
@@ -421,8 +505,10 @@
           <div class="glossary-clip">
             <div class="glossary-inner">
               <div class="glossary-head">
-                <h2 class="glossary-title" id="glossary-title">用語集</h2>
-                <p class="glossary-hint">登録した用語はこの訳語で固定します。</p>
+                <h2 class="glossary-title" id="glossary-title" data-i18n="glossary.title">用語集</h2>
+                <p class="glossary-hint" data-i18n="glossary.hint">
+                  登録した用語はこの訳語で固定します。
+                </p>
                 <button type="button" class="secondary-button" id="glossary-add">
                   <svg
                     class="icon"
@@ -440,11 +526,11 @@
                     <path d="M12 5v14" />
                     <path d="M5 12h14" />
                   </svg>
-                  行を追加
+                  <span data-i18n="glossary.add">行を追加</span>
                 </button>
               </div>
               <div class="glossary-rows" id="glossary-rows"></div>
-              <p class="glossary-empty" id="glossary-empty" hidden>
+              <p class="glossary-empty" id="glossary-empty" data-i18n="glossary.empty" hidden>
                 用語がまだ登録されていません。「行を追加」から登録できます。
               </p>
             </div>
@@ -453,107 +539,255 @@
       </div>
 
       <section class="view view-settings" id="settings-view" hidden>
-        <div class="settings-scroll">
-          <div class="settings-inner">
-            <div class="settings-head">
-              <button type="button" class="icon-text-button" id="settings-back" title="翻訳に戻る">
-                <svg
-                  class="icon"
-                  viewBox="0 0 24 24"
-                  width="16"
-                  height="16"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.6"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <path d="M20 12H5" />
-                  <path d="m11 6-6 6 6 6" />
+        <div class="settings-shell">
+          <header class="settings-head">
+            <button
+              type="button"
+              class="icon-text-button"
+              id="settings-back"
+              data-i18n-title="settings.back"
+            >
+              <svg
+                class="icon"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path d="M20 12H5" />
+                <path d="m11 6-6 6 6 6" />
+              </svg>
+              <span data-i18n="settings.backLabel">戻る</span>
+            </button>
+            <h1 class="settings-title" data-i18n="settings.title">設定</h1>
+          </header>
+
+          <div class="settings-layout">
+            <nav
+              class="settings-nav"
+              id="settings-nav"
+              data-i18n-aria-label="settings.navAria"
+            >
+              <button
+                type="button"
+                class="settings-nav-item"
+                data-section="runtime"
+                aria-current="true"
+              >
+                <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                  <rect x="9" y="9" width="6" height="6" />
                 </svg>
-                戻る
+                <span data-i18n="settings.runtimeHeading">ランタイム</span>
               </button>
-              <h1 class="settings-title">設定</h1>
-              <span class="settings-version">NuKa 1.1.0</span>
+              <button type="button" class="settings-nav-item" data-section="language">
+                <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M3 12h18" />
+                  <path d="M12 3a14 14 0 0 1 0 18" />
+                  <path d="M12 3a14 14 0 0 0 0 18" />
+                </svg>
+                <span data-i18n="settings.languageHeading">言語</span>
+              </button>
+              <button type="button" class="settings-nav-item" data-section="update">
+                <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <path d="M12 3v12" />
+                  <path d="m7 10 5 5 5-5" />
+                  <path d="M4 19h16" />
+                </svg>
+                <span data-i18n="settings.updateHeading">アップデート</span>
+              </button>
+              <button type="button" class="settings-nav-item" data-section="models">
+                <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <path d="m12 3 9 5-9 5-9-5 9-5Z" />
+                  <path d="m3 13 9 5 9-5" />
+                </svg>
+                <span data-i18n="settings.modelsHeading">モデル</span>
+              </button>
+            </nav>
+
+            <div class="settings-pane" id="settings-pane">
+              <section
+                class="settings-section settings-card"
+                data-panel="runtime"
+                aria-labelledby="runtime-heading"
+              >
+                <div class="settings-section-head">
+                  <h2 class="settings-heading" id="runtime-heading" data-i18n="settings.runtimeHeading">
+                    ランタイム
+                  </h2>
+                </div>
+                <p class="settings-status" id="runtime-status">確認しています…</p>
+                <p class="settings-note" id="runtime-note" data-i18n="runtime.note" hidden>
+                  導入済みです。再ダウンロードは不要です。
+                </p>
+                <div class="download-row" id="runtime-download" hidden>
+                  <span class="download-bar" aria-hidden="true"
+                    ><span class="download-fill" id="runtime-bar"></span
+                  ></span>
+                  <span class="download-text" id="runtime-progress-text"></span>
+                  <button
+                    type="button"
+                    class="secondary-button"
+                    id="runtime-cancel"
+                    data-i18n="runtime.cancel"
+                  >
+                    取消
+                  </button>
+                </div>
+                <div class="settings-actions">
+                  <button
+                    type="button"
+                    class="primary-button"
+                    id="runtime-install"
+                    data-i18n="runtime.install"
+                  >
+                    インストール
+                  </button>
+                </div>
+                <p class="settings-muted" data-i18n="runtime.meta">
+                  llama.cpp b12136 (CUDA 12.4) / 合計 約 650 MB
+                </p>
+              </section>
+
+              <section
+                class="settings-section settings-card"
+                data-panel="language"
+                aria-labelledby="language-heading"
+                hidden
+              >
+                <div class="settings-section-head">
+                  <h2 class="settings-heading" id="language-heading" data-i18n="settings.languageHeading">
+                    言語
+                  </h2>
+                </div>
+                <p class="settings-note" data-i18n="settings.languageDescription">
+                  画面の表示言語を選びます。
+                </p>
+                <div
+                  class="language-options"
+                  role="radiogroup"
+                  data-i18n-aria-label="settings.languageAria"
+                >
+                  <label class="settings-radio">
+                    <input type="radio" name="ui-language" id="ui-language-ja" value="ja" />
+                    日本語
+                  </label>
+                  <label class="settings-radio">
+                    <input type="radio" name="ui-language" id="ui-language-en" value="en" />
+                    English
+                  </label>
+                  <label class="settings-radio">
+                    <input type="radio" name="ui-language" id="ui-language-zh" value="zh" />
+                    简体中文
+                  </label>
+                </div>
+              </section>
+
+              <section
+                class="settings-section settings-card"
+                data-panel="update"
+                aria-labelledby="update-heading"
+                hidden
+              >
+                <div class="settings-section-head">
+                  <h2 class="settings-heading" id="update-heading" data-i18n="settings.updateHeading">
+                    アップデート
+                  </h2>
+                </div>
+                <label class="settings-check">
+                  <input type="checkbox" id="auto-update-check" />
+                  <span data-i18n="update.autoCheck">起動時にアップデートを確認 (GitHub にアクセスします)</span>
+                </label>
+                <p class="settings-note" data-i18n="update.privacy">
+                  確認は起動時に GitHub へ 1 回アクセスするだけです。IP アドレスは GitHub に伝わります。
+                </p>
+                <p class="settings-version-line">
+                  <span id="settings-version">v1.2.0</span>
+                </p>
+              </section>
+
+              <section
+                class="settings-section settings-card"
+                data-panel="models"
+                aria-labelledby="models-heading"
+                hidden
+              >
+                <div class="settings-section-head">
+                  <h2 class="settings-heading" id="models-heading" data-i18n="settings.modelsHeading">
+                    モデル
+                  </h2>
+                </div>
+                <div class="settings-field" role="radiogroup" aria-labelledby="models-dir-label">
+                  <span class="settings-label" id="models-dir-label" data-i18n="models.dirLabel">
+                    インストール先
+                  </span>
+                  <label class="settings-radio">
+                    <input
+                      type="radio"
+                      name="models-dir-mode"
+                      id="models-dir-default"
+                      value="default"
+                    />
+                    <span data-i18n="models.defaultDir">既定の場所</span>
+                  </label>
+                  <label class="settings-radio">
+                    <input
+                      type="radio"
+                      name="models-dir-mode"
+                      id="models-dir-custom"
+                      value="custom"
+                    />
+                    <span data-i18n="models.customDir">別の場所</span>
+                  </label>
+                  <button
+                    type="button"
+                    class="secondary-button"
+                    id="models-dir-pick"
+                    data-i18n="models.pick"
+                  >
+                    参照…
+                  </button>
+                </div>
+                <p class="settings-path" id="models-dir-path"></p>
+                <p class="settings-note" data-i18n="models.note">
+                  変更は今後のダウンロードから適用されます。インストール済みのモデルは移動されません。
+                </p>
+                <div class="model-list" id="model-list"></div>
+
+                <div class="settings-license">
+                  <div class="settings-section-head">
+                    <h2
+                      class="settings-heading"
+                      id="license-heading"
+                      data-i18n="settings.licenseHeading"
+                    >
+                      ライセンス
+                    </h2>
+                  </div>
+                  <p class="settings-text" data-i18n="license.text">
+                    モデルは PLaMo Community License です。個人利用と非商用は無償で、商用利用には登録が必要です。
+                  </p>
+                  <div class="settings-links">
+                    <button type="button" class="link-button" id="license-link" data-i18n="license.open">
+                      PLaMo Community License を開く
+                    </button>
+                    <button type="button" class="link-button" id="llama-link" data-i18n="license.llama">
+                      llama.cpp (MIT) を開く
+                    </button>
+                  </div>
+                </div>
+              </section>
             </div>
-
-            <section class="settings-section" aria-labelledby="runtime-heading">
-              <div class="settings-section-head">
-                <h2 class="settings-heading" id="runtime-heading">ランタイム</h2>
-              </div>
-              <p class="settings-status" id="runtime-status">確認しています…</p>
-              <p class="settings-note" id="runtime-note" hidden>
-                導入済みです。再ダウンロードは不要です。
-              </p>
-              <div class="download-row" id="runtime-download" hidden>
-                <span class="download-bar" aria-hidden="true"
-                  ><span class="download-fill" id="runtime-bar"></span
-                ></span>
-                <span class="download-text" id="runtime-progress-text"></span>
-                <button type="button" class="secondary-button" id="runtime-cancel">取消</button>
-              </div>
-              <div class="settings-actions">
-                <button type="button" class="primary-button" id="runtime-install">インストール</button>
-                <span class="settings-muted">llama.cpp b12136 (CUDA 12.4) / 合計 約 650 MB</span>
-              </div>
-            </section>
-
-            <section class="settings-section" aria-labelledby="models-heading">
-              <div class="settings-section-head">
-                <h2 class="settings-heading" id="models-heading">モデル</h2>
-              </div>
-              <div class="settings-field" role="radiogroup" aria-labelledby="models-dir-label">
-                <span class="settings-label" id="models-dir-label">インストール先</span>
-                <label class="settings-radio">
-                  <input type="radio" name="models-dir-mode" id="models-dir-default" value="default" />
-                  既定の場所
-                </label>
-                <label class="settings-radio">
-                  <input type="radio" name="models-dir-mode" id="models-dir-custom" value="custom" />
-                  別の場所
-                </label>
-                <button type="button" class="secondary-button" id="models-dir-pick">参照…</button>
-              </div>
-              <p class="settings-path" id="models-dir-path"></p>
-              <p class="settings-note">
-                変更は今後のダウンロードから適用されます。インストール済みのモデルは移動されません。
-              </p>
-              <div class="model-list" id="model-list"></div>
-            </section>
-
-            <section class="settings-section" aria-labelledby="update-heading">
-              <div class="settings-section-head">
-                <h2 class="settings-heading" id="update-heading">アップデート</h2>
-              </div>
-              <label class="settings-check">
-                <input type="checkbox" id="auto-update-check" />
-                <span>起動時にアップデートを確認 (GitHub にアクセスします)</span>
-              </label>
-              <p class="settings-note">
-                確認は起動時に GitHub へ 1 回アクセスするだけです。IP アドレスは GitHub に伝わります。
-              </p>
-            </section>
-
-            <section class="settings-section" aria-labelledby="license-heading">
-              <div class="settings-section-head">
-                <h2 class="settings-heading" id="license-heading">ライセンス</h2>
-              </div>
-              <p class="settings-text">
-                モデルは PLaMo Community License です。個人利用と非商用は無償で、商用利用には登録が必要です。
-              </p>
-              <div class="settings-links">
-                <button type="button" class="link-button" id="license-link">
-                  PLaMo Community License を開く
-                </button>
-                <button type="button" class="link-button" id="llama-link">llama.cpp (MIT) を開く</button>
-              </div>
-            </section>
           </div>
         </div>
-      </section>
-    </div>
+      </section>    </div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

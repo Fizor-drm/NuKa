@@ -4,6 +4,7 @@
  */
 
 import { icon } from "./icons";
+import { t } from "./i18n";
 import type { GlossaryPair } from "./ipc";
 
 export class GlossaryEditor {
@@ -25,8 +26,8 @@ export class GlossaryEditor {
     const source = document.createElement("input");
     source.type = "text";
     source.className = "glossary-input";
-    source.placeholder = "原文の用語";
-    source.setAttribute("aria-label", "原文の用語");
+    source.placeholder = t("glossary.sourcePlaceholder");
+    source.setAttribute("aria-label", t("glossary.sourcePlaceholder"));
     source.spellcheck = false;
 
     const arrow = icon("arrowRight", 14);
@@ -35,15 +36,15 @@ export class GlossaryEditor {
     const target = document.createElement("input");
     target.type = "text";
     target.className = "glossary-input";
-    target.placeholder = "訳文の用語";
-    target.setAttribute("aria-label", "訳文の用語");
+    target.placeholder = t("glossary.targetPlaceholder");
+    target.setAttribute("aria-label", t("glossary.targetPlaceholder"));
     target.spellcheck = false;
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "icon-button";
-    remove.title = "この用語を削除";
-    remove.setAttribute("aria-label", "この用語を削除");
+    remove.title = t("glossary.remove");
+    remove.setAttribute("aria-label", t("glossary.remove"));
     remove.append(icon("trash", 14));
 
     if (pair !== undefined) {
@@ -80,6 +81,22 @@ export class GlossaryEditor {
         target: inputs[1]?.value ?? "",
       };
     });
+  }
+
+  /** 表示言語の変更に合わせて、既存行のプレースホルダー等を更新する。 */
+  relocalize(): void {
+    for (const row of this.rows.querySelectorAll<HTMLElement>(".glossary-row")) {
+      const inputs = row.querySelectorAll<HTMLInputElement>("input");
+      inputs[0]?.setAttribute("placeholder", t("glossary.sourcePlaceholder"));
+      inputs[0]?.setAttribute("aria-label", t("glossary.sourcePlaceholder"));
+      inputs[1]?.setAttribute("placeholder", t("glossary.targetPlaceholder"));
+      inputs[1]?.setAttribute("aria-label", t("glossary.targetPlaceholder"));
+      const remove = row.querySelector<HTMLButtonElement>(".icon-button");
+      if (remove !== null) {
+        remove.title = t("glossary.remove");
+        remove.setAttribute("aria-label", t("glossary.remove"));
+      }
+    }
   }
 
   private updateEmptyHint(): void {
