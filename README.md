@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/github/license/Fizor-drm/NuKa?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2B%20x64-0078D6?logo=windows&logoColor=white&style=flat-square)
 ![Privacy](https://img.shields.io/badge/privacy-100%25_local-2EA043?style=flat-square)
-![Engine](https://img.shields.io/badge/llama.cpp-b12136_–_CUDA_12.4-gray?style=flat-square)
+![Engine](https://img.shields.io/badge/llama.cpp-b12136_CUDA_12.4-gray?style=flat-square)
 ![Model](https://img.shields.io/badge/powered_by-PLaMo_3_Translate-9E2B25?style=flat-square)
 
 [ダウンロード / Download](https://github.com/Fizor-drm/NuKa/releases/latest) · **日本語** · [English](#english) · [中文](#中文)
