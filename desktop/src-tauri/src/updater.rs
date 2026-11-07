@@ -596,8 +596,10 @@ async fn download_to_directory(
     })?;
     let status = response.status();
     if !status.is_success() {
+        // updater.httpStatus は「更新情報の取得」専用の文言なので、
+        // モデル/ランタイムの DL では installer.httpStatus を使う。
         return Err(text(
-            "updater.httpStatus",
+            "installer.httpStatus",
             format!("配布元が {status} を返しました。"),
         )
         .param("status", status));
@@ -605,7 +607,7 @@ async fn download_to_directory(
     if let Some(length) = response.content_length() {
         if length != asset.size {
             return Err(text(
-                "updater.sizeMismatch",
+                "installer.remoteSizeMismatch",
                 format!(
                     "配布元のサイズが想定と違います ({length} / {} バイト)。",
                     asset.size

@@ -889,8 +889,14 @@ async fn install_model_inner(
 ) -> Result<InstalledModel, DownloadError> {
     const KIND: &str = "model";
     let current = settings.get();
-    let models_dir = models_dir_for(app, &current).map_err(|message| {
-        failed(text("installer.localDataFailed", message.clone()).param("detail", message))
+    let models_dir = models_dir_for(app, &current).map_err(|error| {
+        failed(
+            text(
+                "installer.localDataFailed",
+                format!("保存先を取得できません: {error}"),
+            )
+            .param("detail", error),
+        )
     })?;
     let dest = models_dir.join(&entry.file);
 
@@ -973,7 +979,8 @@ pub fn delete_model(settings: &SettingsStore, file: &str) -> Result<Settings, Lo
                 path.display(),
                 entry.file
             ),
-        ));
+        )
+        .param("detail", path.display()));
     }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1030,7 +1037,8 @@ pub fn set_active_model(settings: &SettingsStore, file: &str) -> Result<Settings
                 "モデルファイルが見つかりません。再インストールしてください: {}",
                 model.path
             ),
-        ));
+        )
+        .param("detail", &model.path));
     }
     settings
         .update(|next| {
@@ -1197,11 +1205,11 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// モデルの保存先。設定値が無ければ `{app_local_data_dir}/models`。
-pub fn models_dir_for(app: &AppHandle, settings: &Settings) -> Result<PathBuf, String> {
+pub fn models_dir_for(app: &AppHandle, settings: &Settings) -> Result<PathBuf, std::io::Error> {
     let local_data = app
         .path()
         .app_local_data_dir()
-        .map_err(|error| format!("保存先を取得できません: {error}"))?;
+        .map_err(std::io::Error::other)?;
     Ok(models_dir_from(&local_data, settings))
 }
 
