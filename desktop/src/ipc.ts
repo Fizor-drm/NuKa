@@ -30,6 +30,10 @@ export interface Settings {
   context_tokens: number;
   theme: ThemeSetting;
   auto_translate: boolean;
+  models_dir: string | null;
+  installed_runtime: InstalledRuntime | null;
+  installed_models: InstalledModel[];
+  active_model: string | null;
 }
 
 export interface SettingsPatch {
@@ -37,6 +41,68 @@ export interface SettingsPatch {
   context_tokens?: number;
   theme?: ThemeSetting;
   auto_translate?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// 設定画面: カタログとインストール
+// ---------------------------------------------------------------------------
+
+export interface CatalogEntry {
+  id: string;
+  size: string;
+  quant: string;
+  bytes: number;
+  url: string;
+  repo: string;
+  file: string;
+}
+
+export interface InstalledRuntime {
+  server_path: string;
+  version: string;
+  installed_at: number;
+}
+
+export interface InstalledModel {
+  file: string;
+  repo: string;
+  bytes: number;
+  path: string;
+  installed_at: number;
+}
+
+export interface RuntimeState {
+  installed: boolean;
+  server_path?: string;
+  version?: string;
+  bytes?: number;
+}
+
+export interface SetupState {
+  runtime: RuntimeState;
+  models: InstalledModel[];
+  active_model: string | null;
+  models_dir: string;
+}
+
+export type DownloadKind = "runtime" | "model";
+
+export interface DownloadProgressPayload {
+  kind: DownloadKind;
+  id: string;
+  downloaded: number;
+  total: number;
+}
+
+export interface DownloadDonePayload {
+  kind: DownloadKind;
+  id: string;
+}
+
+export interface DownloadErrorPayload {
+  kind: DownloadKind;
+  id: string;
+  message: string;
 }
 
 export interface GlossaryPair {
@@ -86,6 +152,16 @@ export const ipc = {
     invoke<number>("translate", { req: request }),
   cancelTranslation: (jobId: number): Promise<void> =>
     invoke<void>("cancel_translation", { jobId }),
+  getCatalog: (): Promise<CatalogEntry[]> => invoke<CatalogEntry[]>("get_catalog"),
+  getSetupState: (): Promise<SetupState> => invoke<SetupState>("get_setup_state"),
+  installRuntime: (): Promise<void> => invoke<void>("install_runtime"),
+  installModel: (id: string): Promise<InstalledModel> =>
+    invoke<InstalledModel>("install_model", { id }),
+  cancelDownload: (id: string): Promise<void> => invoke<void>("cancel_download", { id }),
+  deleteModel: (file: string): Promise<Settings> => invoke<Settings>("delete_model", { file }),
+  setActiveModel: (file: string): Promise<Settings> =>
+    invoke<Settings>("set_active_model", { file }),
+  setModelsDir: (path: string): Promise<Settings> => invoke<Settings>("set_models_dir", { path }),
 };
 
 function subscribe<T>(event: string, handler: (payload: T) => void): void {
@@ -112,4 +188,16 @@ export function onTranslationDone(handler: (payload: DonePayload) => void): void
 
 export function onTranslationError(handler: (payload: ErrorPayload) => void): void {
   subscribe("translation:error", handler);
+}
+
+export function onDownloadProgress(handler: (payload: DownloadProgressPayload) => void): void {
+  subscribe("download:progress", handler);
+}
+
+export function onDownloadDone(handler: (payload: DownloadDonePayload) => void): void {
+  subscribe("download:done", handler);
+}
+
+export function onDownloadError(handler: (payload: DownloadErrorPayload) => void): void {
+  subscribe("download:error", handler);
 }

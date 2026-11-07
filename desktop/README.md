@@ -15,23 +15,54 @@ NuKa は、手元の PC だけで動くデスクトップ翻訳アプリです�
 - 53 言語 (簡体字と繁体字は別扱い)。
 - 日本語向けの文体指定 (常体 / 敬体)、用語集、自動翻訳。
 - ライト / ダーク / システムのテーマ切り替え。
+- ランタイムとモデルを設定画面からダウンロード (アプリ本体は小容量)。
+
+## インストール (配布版)
+
+配布パッケージ (`NuKa_1.0.0_x64-setup.exe`) を実行すると、アプリ本体だけが
+インストールされます。ランタイムとモデルは初回起動後に設定画面から取得します。
+
+1. NuKa を起動し、右上の歯車 (設定) を開きます。
+2. 「ランタイム」の「インストール」を押します。llama.cpp b12136 (CUDA 12.4) の
+   2 つの zip (合計 約 650 MB) をダウンロードして展開します。
+3. 「モデル」から使いたいサイズと量子化を選んでインストールします。
+   インストール先は「既定の場所」または「別の場所」から選べます。
+4. モデルをインストールすると自動的に使用するモデルになり、エンジンが起動します。
+
+モデルのライセンスは PLaMo Community License です。個人利用と非商用は無償で、
+商用利用には登録が必要です。設定画面の「ライセンス」から案内ページを開けます。
+
+ダウンロードは設定画面からいつでも取消できます。途中で止まった残骸 (`.part`) は
+次回のインストール時に作り直されます。
 
 ## 必要条件
 
 - Windows 10/11 (WebView2 ランタイム)
-- `runtime\llama\llama-server.exe` (llama.cpp の CUDA ビルド)
-- `runtime\models\plamo-3-translate-0.8b-Q4_K_M.gguf`
+- ランタイム: 設定画面からインストール (llama.cpp b12136 / CUDA 12.4)
+- モデル: 設定画面からインストール (PFM 公式の GGUF)
 
-モデルと `llama-server` はリポジトリに含まれません。リポジトリ直下の `runtime\` を
-配置するか、次のいずれかで場所を指定してください。
+手動で配置する場合:
 
-1. exe と同じ階層、または 1 つ上の階層に `runtime\` を置く
+1. exe と同じ階層、または 1 つ上の階層に `runtime\llama\llama-server.exe` と
+   `runtime\models\*.gguf` を置く
 2. 設定ファイル (`%APPDATA%\app.nuka.translate\settings.json`) の
    `model_path` / `server_path` を編集する
 3. 環境変数 `PLAMO_MODEL_PATH` / `PLAMO_LLAMA_SERVER` で指定する
 
-優先順位は 設定ファイル、環境変数、exe からの探索の順です。探索は開発ビルドでは
-上位 6 階層まで、リリースビルドでは exe の隣と 1 つ上だけです。
+解決の優先順位:
+
+- モデル: 設定画面で管理しているモデル (使用中) → `model_path` → 環境変数 → exe の探索
+- ランタイム: 設定画面で管理しているランタイム → `server_path` → 既定の保存先 →
+  環境変数 → exe の探索
+
+探索は開発ビルドでは上位 6 階層まで、リリースビルドでは exe の隣と 1 つ上だけです。
+
+## 保存先
+
+- 設定: `%APPDATA%\app.nuka.translate\settings.json`
+- ログ: `%LOCALAPPDATA%\app.nuka.translate\logs\llama-server.log`
+- ランタイム (既定): `%LOCALAPPDATA%\app.nuka.translate\runtime\llama\`
+- モデル (既定): `%LOCALAPPDATA%\app.nuka.translate\models\`
 
 ## 開発
 

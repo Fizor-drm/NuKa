@@ -10,21 +10,30 @@ import { GlossaryEditor } from "./glossary";
 import { AUTO_CODE, AUTO_OPTION, LANGUAGES, detectedLabel } from "./languages";
 import {
   ipc,
+  onDownloadDone,
+  onDownloadError,
+  onDownloadProgress,
   onEngineStatus,
   onTranslationChunk,
   onTranslationDone,
   onTranslationError,
   onTranslationProgress,
+  type CatalogEntry,
   type DetectedLanguage,
+  type DownloadKind,
   type EngineStatus,
   type GlossaryPair,
+  type InstalledModel,
   type SettingsPatch,
+  type SetupState,
   type ThemeSetting,
   type TranslateRequest,
 } from "./ipc";
 import { LanguagePicker } from "./language-picker";
 import { OutputPane, type OutputActionKind, type OutputView } from "./output";
 import { applyTheme, isThemeSetting, nextTheme, renderThemeButton } from "./theme";
+import { open as openDirectoryDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 const AUTO_TRANSLATE_DELAY = 700;
 const DETECT_DELAY = 400;
@@ -38,6 +47,15 @@ const ENGINE_LABELS: Record<EngineStatus["state"], string> = {
 };
 
 type FormChoice = "" | "plain" | "polite";
+
+type ViewName = "translate" | "settings";
+
+interface DownloadState {
+  kind: DownloadKind;
+  id: string;
+  downloaded: number;
+  total: number;
+}
 
 type JobEvent =
   | { kind: "progress"; jobId: number; done: number; total: number }
@@ -65,6 +83,11 @@ interface AppState {
   translating: boolean;
   progress: { done: number; total: number } | null;
   theme: ThemeSetting;
+  view: ViewName;
+  setup: SetupState | null;
+  catalog: CatalogEntry[];
+  download: DownloadState | null;
+  modelsDirSetting: string | null;
 }
 
 const state: AppState = {
@@ -82,6 +105,11 @@ const state: AppState = {
   translating: false,
   progress: null,
   theme: "light",
+  view: "translate",
+  setup: null,
+  catalog: [],
+  download: null,
+  modelsDirSetting: null,
 };
 
 function byId<T extends HTMLElement>(id: string): T {
@@ -121,6 +149,44 @@ const glossaryEmptyEl = byId<HTMLParagraphElement>("glossary-empty");
 const glossaryAddEl = byId<HTMLButtonElement>("glossary-add");
 
 const formChipButtons = Array.from(formChipsEl.querySelectorAll<HTMLButtonElement>(".chip"));
+
+const viewTranslateEl = byId<HTMLDivElement>("translate-view");
+const viewSettingsEl = byId<HTMLElement>("settings-view");
+const settingsToggleEl = byId<HTMLButtonElement>("settings-toggle");
+const settingsBackEl = byId<HTMLButtonElement>("settings-back");
+const runtimeStatusEl = byId<HTMLParagraphElement>("runtime-status");
+const runtimeNoteEl = byId<HTMLParagraphElement>("runtime-note");
+const runtimeInstallEl = byId<HTMLButtonElement>("runtime-install");
+const runtimeDownloadEl = byId<HTMLDivElement>("runtime-download");
+const runtimeBarEl = byId<HTMLSpanElement>("runtime-bar");
+const runtimeProgressTextEl = byId<HTMLSpanElement>("runtime-progress-text");
+const runtimeCancelEl = byId<HTMLButtonElement>("runtime-cancel");
+const modelListEl = byId<HTMLDivElement>("model-list");
+const modelsDirPathEl = byId<HTMLParagraphElement>("models-dir-path");
+const modelsDirDefaultEl = byId<HTMLInputElement>("models-dir-default");
+const modelsDirCustomEl = byId<HTMLInputElement>("models-dir-custom");
+const modelsDirPickEl = byId<HTMLButtonElement>("models-dir-pick");
+const licenseLinkEl = byId<HTMLButtonElement>("license-link");
+const llamaLinkEl = byId<HTMLButtonElement>("llama-link");
+
+const LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-en";
+const LLAMA_URL = "https://github.com/ggml-org/llama.cpp";
+
+interface ModelRow {
+  readonly entry: CatalogEntry;
+  readonly root: HTMLDivElement;
+  readonly actions: HTMLDivElement;
+  readonly install: HTMLButtonElement;
+  readonly use: HTMLButtonElement;
+  readonly remove: HTMLButtonElement;
+  readonly badge: HTMLSpanElement;
+  readonly progress: HTMLDivElement;
+  readonly fill: HTMLSpanElement;
+  readonly progressText: HTMLSpanElement;
+  readonly cancel: HTMLButtonElement;
+}
+
+const modelRows = new Map<string, ModelRow>();
 
 const sourcePicker = new LanguagePicker(
   {
@@ -212,6 +278,33 @@ function computeOutputView(): OutputView {
     };
   }
   if (state.engine.state === "error") {
+    const setup = state.setup;
+    if (setup !== null && !setup.runtime.installed) {
+      return {
+        kind: "error",
+        message: "ランタイムが未導入です。設定からインストールしてください。",
+        action: { kind: "settings", label: "設定を開く" },
+        text,
+      };
+    }
+    const models = setup?.models ?? [];
+    if (setup !== null && models.length === 0) {
+      return {
+        kind: "error",
+        message: "モデルが導入されていません。設定からインストールしてください。",
+        action: { kind: "settings", label: "設定を開く" },
+        text,
+      };
+    }
+    const active = setup?.active_model ?? null;
+    if (setup !== null && (active === null || !models.some((model) => model.file === active))) {
+      return {
+        kind: "error",
+        message: "使用するモデルを選んでください。",
+        action: { kind: "settings", label: "設定を開く" },
+        text,
+      };
+    }
     return {
       kind: "error",
       message: state.engine.detail ?? "エンジンを起動できませんでした。",
@@ -626,6 +719,10 @@ async function handleOutputAction(kind: OutputActionKind): Promise<void> {
     void requestTranslate();
     return;
   }
+  if (kind === "settings") {
+    setView("settings");
+    return;
+  }
   state.translationError = null;
   state.engine = { state: "starting", detail: "llama-server を起動し直しています。" };
   renderEngine();
@@ -671,12 +768,392 @@ async function loadSettings(): Promise<void> {
       state.theme = settings.theme;
     }
     state.autoTranslate = settings.auto_translate;
+    state.modelsDirSetting = settings.models_dir;
   } catch {
     // 設定が読めなくても既定値で動かす
   }
   applyTheme(state.theme);
   renderThemeButton(themeToggleEl, state.theme);
   renderAutoToggle();
+}
+
+// ---------------------------------------------------------------------------
+// 設定ビュー
+// ---------------------------------------------------------------------------
+
+function setView(view: ViewName): void {
+  state.view = view;
+  viewTranslateEl.hidden = view !== "translate";
+  viewSettingsEl.hidden = view !== "settings";
+  settingsToggleEl.setAttribute("aria-pressed", String(view === "settings"));
+  if (view === "settings") {
+    void refreshSetup().finally(() => {
+      renderSettings();
+      settingsBackEl.focus();
+    });
+  } else {
+    sourceInputEl.focus();
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 MB";
+  }
+  const megabytes = bytes / (1024 * 1024);
+  if (megabytes >= 1024) {
+    return `${(megabytes / 1024).toFixed(2)} GB`;
+  }
+  if (megabytes >= 10) {
+    return `${Math.round(megabytes)} MB`;
+  }
+  return `${megabytes.toFixed(1)} MB`;
+}
+
+async function refreshCatalog(): Promise<void> {
+  try {
+    state.catalog = await ipc.getCatalog();
+    buildModelRows();
+  } catch (error) {
+    showAppStatus(`カタログを取得できません: ${describeError(error)}`);
+  }
+  renderSettings();
+}
+
+async function refreshSetup(): Promise<void> {
+  try {
+    state.setup = await ipc.getSetupState();
+  } catch (error) {
+    state.setup = null;
+    showAppStatus(`導入状態を取得できません: ${describeError(error)}`);
+  }
+  renderOutput();
+  renderSettings();
+}
+
+function hasActiveModel(setup: SetupState | null): boolean {
+  if (setup === null || setup.active_model === null) {
+    return false;
+  }
+  return setup.models.some((model) => model.file === setup.active_model);
+}
+
+function buildModelRows(): void {
+  modelListEl.replaceChildren();
+  modelRows.clear();
+  for (const entry of state.catalog) {
+    const root = document.createElement("div");
+    root.className = "model-row";
+    root.dataset["id"] = entry.id;
+
+    const main = document.createElement("div");
+    main.className = "model-main";
+    const name = document.createElement("span");
+    name.className = "model-name";
+    name.textContent = `${entry.size.toUpperCase()} · ${entry.quant}`;
+    const size = document.createElement("span");
+    size.className = "model-size";
+    size.textContent = formatBytes(entry.bytes);
+    main.append(name, size);
+
+    const actions = document.createElement("div");
+    actions.className = "model-actions";
+
+    const badge = document.createElement("span");
+    badge.className = "model-badge";
+    badge.textContent = "使用中";
+    badge.hidden = true;
+
+    const install = document.createElement("button");
+    install.type = "button";
+    install.className = "primary-button";
+    install.textContent = "インストール";
+    install.setAttribute("aria-label", `${entry.size.toUpperCase()} ${entry.quant} をインストール`);
+
+    const use = document.createElement("button");
+    use.type = "button";
+    use.className = "secondary-button";
+    use.textContent = "使用する";
+    use.setAttribute("aria-label", `${entry.size.toUpperCase()} ${entry.quant} を使用する`);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "secondary-button";
+    remove.textContent = "削除";
+    remove.setAttribute("aria-label", `${entry.size.toUpperCase()} ${entry.quant} を削除`);
+
+    actions.append(badge, install, use, remove);
+
+    const progress = document.createElement("div");
+    progress.className = "download-row model-download";
+    progress.hidden = true;
+    const bar = document.createElement("span");
+    bar.className = "download-bar";
+    const fill = document.createElement("span");
+    fill.className = "download-fill";
+    bar.append(fill);
+    const progressText = document.createElement("span");
+    progressText.className = "download-text";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "secondary-button";
+    cancel.textContent = "取消";
+    cancel.setAttribute(
+      "aria-label",
+      `${entry.size.toUpperCase()} ${entry.quant} のダウンロードを取り消す`,
+    );
+    progress.append(bar, progressText, cancel);
+
+    root.append(main, actions, progress);
+    modelListEl.append(root);
+
+    modelRows.set(entry.id, {
+      entry,
+      root,
+      actions,
+      install,
+      use,
+      remove,
+      badge,
+      progress,
+      fill,
+      progressText,
+      cancel,
+    });
+
+    install.addEventListener("click", () => {
+      void startModelInstall(entry);
+    });
+    use.addEventListener("click", () => {
+      void activateModel(entry);
+    });
+    remove.addEventListener("click", () => {
+      void removeModel(entry);
+    });
+    cancel.addEventListener("click", () => {
+      void cancelDownload(entry.id);
+    });
+  }
+}
+
+function renderSettings(): void {
+  const setup = state.setup;
+  if (setup === null) {
+    runtimeStatusEl.textContent = "確認しています…";
+    runtimeNoteEl.hidden = true;
+    runtimeInstallEl.hidden = false;
+    runtimeInstallEl.disabled = true;
+  } else if (!setup.runtime.installed) {
+    runtimeStatusEl.textContent = "未導入。ランタイムをインストールすると翻訳を始められます。";
+    runtimeNoteEl.hidden = true;
+    runtimeInstallEl.hidden = false;
+    runtimeInstallEl.disabled = state.download !== null;
+  } else {
+    const version = setup.runtime.version ?? "外部のランタイム";
+    const usage =
+      setup.runtime.bytes !== undefined ? ` / 使用量 ${formatBytes(setup.runtime.bytes)}` : "";
+    runtimeStatusEl.textContent = `導入済み: llama.cpp ${version} (CUDA 12.4)${usage}`;
+    runtimeNoteEl.hidden = false;
+    runtimeInstallEl.hidden = true;
+    runtimeInstallEl.disabled = true;
+  }
+
+  const runtimeDownloading = state.download?.kind === "runtime";
+  runtimeDownloadEl.hidden = !runtimeDownloading;
+  if (runtimeDownloading && state.download !== null) {
+    const { downloaded, total } = state.download;
+    const ratio = total > 0 ? Math.min(1, downloaded / total) : 0;
+    runtimeBarEl.style.width = `${Math.round(ratio * 100)}%`;
+    runtimeProgressTextEl.textContent =
+      total > 0 ? `${formatBytes(downloaded)} / ${formatBytes(total)}` : formatBytes(downloaded);
+  }
+
+  const installed = new Map<string, InstalledModel>();
+  for (const model of setup?.models ?? []) {
+    installed.set(model.file, model);
+  }
+  const active = setup?.active_model ?? null;
+  for (const row of modelRows.values()) {
+    const model = installed.get(row.entry.file);
+    const isActive = model !== undefined && active === model.file;
+    const isDownloading = state.download?.kind === "model" && state.download.id === row.entry.id;
+    const busy = state.download !== null;
+
+    row.install.hidden = model !== undefined || isDownloading;
+    row.install.disabled = busy;
+    row.use.hidden = model === undefined || isActive;
+    row.use.disabled = busy;
+    row.remove.hidden = model === undefined;
+    row.remove.disabled = isActive || busy;
+    row.remove.title = isActive ? "使用中のモデルは削除できません" : "このモデルを削除";
+    row.badge.hidden = !isActive;
+
+    row.progress.hidden = !isDownloading;
+    if (isDownloading && state.download !== null) {
+      const { downloaded, total } = state.download;
+      const ratio = total > 0 ? Math.min(1, downloaded / total) : 0;
+      row.fill.style.width = `${Math.round(ratio * 100)}%`;
+      row.progressText.textContent =
+        total > 0 ? `${formatBytes(downloaded)} / ${formatBytes(total)}` : formatBytes(downloaded);
+    }
+  }
+
+  modelsDirPathEl.textContent = setup?.models_dir ?? "";
+  const custom = state.modelsDirSetting !== null && state.modelsDirSetting !== "";
+  modelsDirDefaultEl.checked = !custom;
+  modelsDirCustomEl.checked = custom;
+  modelsDirPickEl.disabled = state.download !== null;
+}
+
+async function startRuntimeInstall(): Promise<void> {
+  if (state.download !== null) {
+    return;
+  }
+  state.download = { kind: "runtime", id: "runtime", downloaded: 0, total: 0 };
+  renderSettings();
+  try {
+    await ipc.installRuntime();
+  } catch (error) {
+    if (state.download?.kind === "runtime") {
+      state.download = null;
+      renderSettings();
+      showAppStatus(`ランタイムをインストールできません: ${describeError(error)}`);
+    }
+  }
+}
+
+async function startModelInstall(entry: CatalogEntry): Promise<void> {
+  if (state.download !== null) {
+    return;
+  }
+  state.download = { kind: "model", id: entry.id, downloaded: 0, total: entry.bytes };
+  renderSettings();
+  try {
+    await ipc.installModel(entry.id);
+  } catch (error) {
+    if (state.download?.kind === "model" && state.download.id === entry.id) {
+      state.download = null;
+      renderSettings();
+      showAppStatus(`モデルをインストールできません: ${describeError(error)}`);
+    }
+  }
+}
+
+async function cancelDownload(id: string): Promise<void> {
+  try {
+    await ipc.cancelDownload(id);
+  } catch (error) {
+    showAppStatus(`ダウンロードを取り消せません: ${describeError(error)}`);
+  }
+}
+
+async function activateModel(entry: CatalogEntry): Promise<void> {
+  try {
+    await ipc.setActiveModel(entry.file);
+    await refreshSetup();
+    await refreshEngineStatus();
+  } catch (error) {
+    showAppStatus(`モデルを切り替えられません: ${describeError(error)}`);
+  }
+}
+
+async function removeModel(entry: CatalogEntry): Promise<void> {
+  try {
+    await ipc.deleteModel(entry.file);
+    await refreshSetup();
+  } catch (error) {
+    showAppStatus(`モデルを削除できません: ${describeError(error)}`);
+  }
+}
+
+async function changeModelsDir(path: string): Promise<void> {
+  try {
+    const settings = await ipc.setModelsDir(path);
+    state.modelsDirSetting = settings.models_dir;
+    await refreshSetup();
+  } catch (error) {
+    showAppStatus(`インストール先を変更できません: ${describeError(error)}`);
+    renderSettings();
+  }
+}
+
+async function pickModelsDir(): Promise<void> {
+  try {
+    const selected = await openDirectoryDialog({
+      directory: true,
+      multiple: false,
+      title: "モデルのインストール先",
+    });
+    if (typeof selected === "string" && selected !== "") {
+      await changeModelsDir(selected);
+    }
+  } catch (error) {
+    showAppStatus(`フォルダを選択できません: ${describeError(error)}`);
+  }
+}
+
+function handleDownloadProgress(payload: {
+  kind: DownloadKind;
+  id: string;
+  downloaded: number;
+  total: number;
+}): void {
+  if (state.download === null) {
+    return;
+  }
+  if (payload.kind !== state.download.kind || payload.id !== state.download.id) {
+    return;
+  }
+  state.download = {
+    ...state.download,
+    downloaded: payload.downloaded,
+    total: payload.total > 0 ? payload.total : state.download.total,
+  };
+  renderSettings();
+}
+
+async function handleDownloadDone(payload: { kind: DownloadKind; id: string }): Promise<void> {
+  state.download = null;
+  renderSettings();
+  if (payload.kind === "runtime") {
+    await refreshSetup();
+    showAppStatus("ランタイムをインストールしました。");
+    if (hasActiveModel(state.setup)) {
+      try {
+        await ipc.restartEngine();
+      } catch (error) {
+        showAppStatus(`エンジンを起動できません: ${describeError(error)}`);
+      }
+      await refreshEngineStatus();
+    }
+    return;
+  }
+
+  const entry = state.catalog.find((item) => item.id === payload.id);
+  await refreshSetup();
+  showAppStatus("モデルをインストールしました。");
+  if (entry !== undefined && (state.setup?.active_model ?? null) === null) {
+    try {
+      await ipc.setActiveModel(entry.file);
+      await refreshSetup();
+      await refreshEngineStatus();
+    } catch (error) {
+      showAppStatus(`モデルを切り替えられません: ${describeError(error)}`);
+    }
+  }
+}
+
+function handleDownloadError(payload: { kind: DownloadKind; id: string; message: string }): void {
+  const matches =
+    state.download !== null &&
+    payload.kind === state.download.kind &&
+    payload.id === state.download.id;
+  if (state.download !== null && !matches) {
+    return;
+  }
+  state.download = null;
+  renderSettings();
+  showAppStatus(payload.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +1201,18 @@ function bindTranslationEvents(): void {
   });
 }
 
+function bindDownloadEvents(): void {
+  onDownloadProgress((payload) => {
+    handleDownloadProgress(payload);
+  });
+  onDownloadDone((payload) => {
+    void handleDownloadDone(payload);
+  });
+  onDownloadError((payload) => {
+    handleDownloadError(payload);
+  });
+}
+
 function bindUi(): void {
   sourceInputEl.addEventListener("input", () => {
     renderCharCount();
@@ -767,10 +1256,55 @@ function bindUi(): void {
       }
     });
   }
+
+  settingsToggleEl.addEventListener("click", () => {
+    setView(state.view === "settings" ? "translate" : "settings");
+  });
+
+  settingsBackEl.addEventListener("click", () => {
+    setView("translate");
+  });
+
+  runtimeInstallEl.addEventListener("click", () => {
+    void startRuntimeInstall();
+  });
+
+  runtimeCancelEl.addEventListener("click", () => {
+    void cancelDownload("runtime");
+  });
+
+  modelsDirPickEl.addEventListener("click", () => {
+    void pickModelsDir().finally(() => {
+      renderSettings();
+    });
+  });
+
+  modelsDirDefaultEl.addEventListener("change", () => {
+    if (modelsDirDefaultEl.checked) {
+      void changeModelsDir("");
+    }
+  });
+
+  modelsDirCustomEl.addEventListener("change", () => {
+    if (modelsDirCustomEl.checked) {
+      void pickModelsDir().finally(() => {
+        renderSettings();
+      });
+    }
+  });
+
+  licenseLinkEl.addEventListener("click", () => {
+    void openUrl(LICENSE_URL);
+  });
+
+  llamaLinkEl.addEventListener("click", () => {
+    void openUrl(LLAMA_URL);
+  });
 }
 
 async function bootstrap(): Promise<void> {
   bindTranslationEvents();
+  bindDownloadEvents();
   bindUi();
   glossaryEditor.addRow();
   applyTheme(state.theme);
@@ -778,6 +1312,8 @@ async function bootstrap(): Promise<void> {
   renderAll();
   await loadSettings();
   await refreshEngineStatus();
+  await refreshCatalog();
+  await refreshSetup();
 }
 
 void bootstrap();

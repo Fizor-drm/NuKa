@@ -4,7 +4,7 @@
  * 訳文テキストは状態と独立して表示できる (エラー時も直前の訳文は残す)。
  */
 
-export type OutputActionKind = "restart" | "retry";
+export type OutputActionKind = "restart" | "retry" | "settings";
 
 export interface OutputAction {
   readonly kind: OutputActionKind;

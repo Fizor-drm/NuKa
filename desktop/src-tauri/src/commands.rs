@@ -204,6 +204,69 @@ pub fn cancel_translation(state: State<'_, AppState>, job_id: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// 設定画面: カタログとインストール
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_catalog() -> Vec<crate::catalog::CatalogEntry> {
+    crate::catalog::entries()
+}
+
+#[tauri::command]
+pub fn get_setup_state(app: AppHandle, state: State<'_, AppState>) -> crate::installer::SetupState {
+    crate::installer::setup_state(&app, &state.settings)
+}
+
+/// ランタイム (llama.cpp の 2 zip) をダウンロードして展開する。
+#[tauri::command]
+pub async fn install_runtime(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.clone();
+    let downloads = state.downloads.clone();
+    crate::installer::install_runtime(&app, &settings, &downloads).await?;
+    Ok(())
+}
+
+/// カタログの 1 件を models_dir へダウンロードする。
+#[tauri::command]
+pub async fn install_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<crate::settings::InstalledModel, String> {
+    let settings = state.settings.clone();
+    let downloads = state.downloads.clone();
+    crate::installer::install_model(&app, &settings, &downloads, &id).await
+}
+
+#[tauri::command]
+pub fn cancel_download(state: State<'_, AppState>, id: String) {
+    let _ = state.downloads.cancel(&id);
+}
+
+#[tauri::command]
+pub fn delete_model(state: State<'_, AppState>, file: String) -> Result<Settings, String> {
+    crate::installer::delete_model(&state.settings, &file)
+}
+
+/// 使用するモデルを切り替え、エンジンを起こし直す。
+#[tauri::command]
+pub async fn set_active_model(
+    state: State<'_, AppState>,
+    file: String,
+) -> Result<Settings, String> {
+    let settings = crate::installer::set_active_model(&state.settings, &file)?;
+    let engine = state.engine.clone();
+    engine.start(&settings).await;
+    Ok(settings)
+}
+
+/// モデルの保存先を変更する (空文字なら既定の場所)。
+#[tauri::command]
+pub fn set_models_dir(state: State<'_, AppState>, path: String) -> Result<Settings, String> {
+    crate::installer::set_models_dir(&state.settings, &path)
+}
+
+// ---------------------------------------------------------------------------
 // ジョブの実行
 // ---------------------------------------------------------------------------
 

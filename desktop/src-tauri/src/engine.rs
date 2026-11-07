@@ -149,7 +149,7 @@ impl Engine {
             ),
         );
 
-        let paths = match resolve_paths(settings) {
+        let paths = match resolve_paths(settings, &self.app) {
             Ok(paths) => paths,
             Err(detail) => {
                 self.set_status(
@@ -372,49 +372,154 @@ fn server_relative() -> PathBuf {
         .join("llama-server.exe")
 }
 
-fn exe_directory() -> PathBuf {
+pub(crate) fn exe_directory() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 設定画面から導入する既定のランタイム (llama-server.exe)。
+pub(crate) fn default_runtime_server_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_local_data_dir()
+        .ok()
+        .map(|dir| dir.join("runtime").join("llama").join("llama-server.exe"))
+}
+
+/// モデルの場所を決める。管理対象 (active_model) → settings.json の model_path →
+/// 環境変数 → exe からの探索。
+pub(crate) fn resolve_model_path(
+    settings: &Settings,
+    search_root: &Path,
+) -> Result<PathBuf, String> {
+    let mut tried: Vec<String> = Vec::new();
+
+    if let Some(active) = settings.active_model.as_deref() {
+        match settings
+            .installed_models
+            .iter()
+            .find(|model| model.file == active)
+        {
+            Some(model) => {
+                let path = PathBuf::from(&model.path);
+                if path.is_file() {
+                    return Ok(path);
+                }
+                tried.push(format!("管理対象のモデル {}", path.display()));
+            }
+            None => tried.push(format!("管理対象のモデル {active} (未登録)")),
+        }
+    }
+
+    if let Some(value) = settings.model_path.as_deref() {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("settings.json の model_path {}", path.display()));
+    }
+
+    if let Ok(value) = std::env::var(MODEL_ENV) {
+        let path = PathBuf::from(&value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("{MODEL_ENV} の値 {}", path.display()));
+    }
+
+    let depth = max_search_depth();
+    let relative = model_relative();
+    if let Some(found) = find_in_ancestors(search_root, &relative, depth) {
+        return Ok(found);
+    }
+    tried.push(format!(
+        "{} から上位 {depth} 階層の {}",
+        search_root.display(),
+        relative.display()
+    ));
+
+    Err(format!(
+        "モデルが未導入です。設定でインストールしてください。確認した場所: {}",
+        tried.join(" / ")
+    ))
+}
+
+/// ランタイムの場所を決める。管理済み → settings.json の server_path → 既定の場所 →
+/// 環境変数 → exe からの探索。
+pub(crate) fn resolve_runtime_path(
+    settings: &Settings,
+    default_server: Option<&Path>,
+    search_root: &Path,
+) -> Result<PathBuf, String> {
+    let mut tried: Vec<String> = Vec::new();
+
+    if let Some(runtime) = settings.installed_runtime.as_ref() {
+        let path = PathBuf::from(&runtime.server_path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("管理中のランタイム {}", path.display()));
+    }
+
+    if let Some(value) = settings.server_path.as_deref() {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("settings.json の server_path {}", path.display()));
+    }
+
+    if let Some(path) = default_server {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        tried.push(format!("既定のランタイム {}", path.display()));
+    }
+
+    if let Ok(value) = std::env::var(SERVER_ENV) {
+        let path = PathBuf::from(&value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("{SERVER_ENV} の値 {}", path.display()));
+    }
+
+    let depth = max_search_depth();
+    let relative = server_relative();
+    if let Some(found) = find_in_ancestors(search_root, &relative, depth) {
+        return Ok(found);
+    }
+    tried.push(format!(
+        "{} から上位 {depth} 階層の {}",
+        search_root.display(),
+        relative.display()
+    ));
+
+    Err(format!(
+        "ランタイムが未導入。設定でインストールしてください。確認した場所: {}",
+        tried.join(" / ")
+    ))
+}
+
 /// モデルとサーバの場所を決める。
 ///
-/// 優先順位は settings.json → 環境変数 → exe の位置からの探索。
+/// モデルは管理対象 → settings.json の model_path → 環境変数 → exe の位置からの探索。
+/// ランタイムは管理済み → settings.json の server_path → 既定の保存先 → 環境変数 → 探索。
 /// 探索はデバッグ実行では上位 6 階層まで、リリースでは隣と 1 つ上だけ。
-/// どれも無ければ、確認した場所を並べてエラーにする。
-fn resolve_paths(settings: &Settings) -> Result<ServerPaths, String> {
-    let root = exe_directory();
-    let model_env = std::env::var(MODEL_ENV).ok();
-    let server_env = std::env::var(SERVER_ENV).ok();
-
-    let model = resolve_resource(
-        "モデル",
-        settings.model_path.as_deref(),
-        MODEL_ENV,
-        model_env.as_deref(),
-        &root,
-        &model_relative(),
-    );
-    let server = resolve_resource(
-        "llama-server",
-        settings.server_path.as_deref(),
-        SERVER_ENV,
-        server_env.as_deref(),
-        &root,
-        &server_relative(),
-    );
+fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, String> {
+    let search_root = exe_directory();
+    let default_server = default_runtime_server_path(app);
 
     let mut problems: Vec<String> = Vec::new();
-    let model = match model {
+    let model = match resolve_model_path(settings, &search_root) {
         Ok(path) => Some(path),
         Err(error) => {
             problems.push(error);
             None
         }
     };
-    let server = match server {
+    let server = match resolve_runtime_path(settings, default_server.as_deref(), &search_root) {
         Ok(path) => Some(path),
         Err(error) => {
             problems.push(error);
@@ -426,48 +531,6 @@ fn resolve_paths(settings: &Settings) -> Result<ServerPaths, String> {
         (Some(model), Some(server)) => Ok(ServerPaths { model, server }),
         _ => Err(problems.join(" / ")),
     }
-}
-
-fn resolve_resource(
-    label: &str,
-    settings_value: Option<&str>,
-    env_name: &str,
-    env_value: Option<&str>,
-    search_root: &Path,
-    relative: &Path,
-) -> Result<PathBuf, String> {
-    let mut tried: Vec<String> = Vec::new();
-
-    if let Some(value) = settings_value {
-        let path = PathBuf::from(value);
-        if path.is_file() {
-            return Ok(path);
-        }
-        tried.push(format!("settings.json の値 {}", path.display()));
-    }
-
-    if let Some(value) = env_value {
-        let path = PathBuf::from(value);
-        if path.is_file() {
-            return Ok(path);
-        }
-        tried.push(format!("{env_name} の値 {}", path.display()));
-    }
-
-    let depth = max_search_depth();
-    if let Some(found) = find_in_ancestors(search_root, relative, depth) {
-        return Ok(found);
-    }
-    tried.push(format!(
-        "{} から上位 {depth} 階層の {}",
-        search_root.display(),
-        relative.display()
-    ));
-
-    Err(format!(
-        "{label}が見つかりません。確認した場所: {}",
-        tried.join(" / ")
-    ))
 }
 
 /// `start` から親を最大 `depth` 階層たどり、`relative` が実在する場所を返す。
@@ -739,6 +802,7 @@ mod job_object {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{InstalledModel, InstalledRuntime};
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -825,59 +889,89 @@ mod tests {
     }
 
     #[test]
-    fn resolve_resource_prefers_settings_then_env_then_search() {
-        let base = temp_dir("resolve");
-        let bin = base.join("bin");
-        fs::create_dir_all(&bin).unwrap();
+    fn model_resolution_prefers_managed_active_model() {
+        let base = temp_dir("model-managed");
+        let managed = base.join("managed.gguf");
+        fs::write(&managed, b"m").unwrap();
+        let manual = base.join("manual.gguf");
+        fs::write(&manual, b"m").unwrap();
+
+        let mut settings = Settings {
+            model_path: Some(manual.to_string_lossy().into_owned()),
+            active_model: Some("managed.gguf".to_string()),
+            installed_models: vec![InstalledModel {
+                file: "managed.gguf".to_string(),
+                repo: "pfnet/test".to_string(),
+                bytes: 1,
+                path: managed.to_string_lossy().into_owned(),
+                installed_at: 0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_model_path(&settings, &base).unwrap(), managed);
+
+        // 管理対象のファイルが消えていれば settings.json の model_path に落ちる
+        settings.installed_models[0].path =
+            base.join("missing.gguf").to_string_lossy().into_owned();
+        assert_eq!(resolve_model_path(&settings, &base).unwrap(), manual);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn model_resolution_falls_back_to_search_and_reports_missing() {
+        let base = temp_dir("model-search");
+        let exe_dir = base.join("bin");
+        fs::create_dir_all(&exe_dir).unwrap();
         let relative = model_relative();
         let searched = base.join(&relative);
         fs::create_dir_all(searched.parent().unwrap()).unwrap();
-        fs::write(&searched, b"model").unwrap();
+        fs::write(&searched, b"m").unwrap();
+        let settings = Settings::default();
+        assert_eq!(resolve_model_path(&settings, &exe_dir).unwrap(), searched);
 
-        let explicit = base.join("custom.gguf");
-        fs::write(&explicit, b"model").unwrap();
-        let env_file = base.join("env.gguf");
-        fs::write(&env_file, b"model").unwrap();
+        let empty = temp_dir("model-search-empty");
+        let error = resolve_model_path(&settings, &empty).unwrap_err();
+        assert!(error.contains("モデルが未導入"));
+        assert!(error.contains("設定でインストール"));
+        let _ = fs::remove_dir_all(&empty);
+        let _ = fs::remove_dir_all(&base);
+    }
 
-        // 設定値が実在すればそれ
+    #[test]
+    fn runtime_resolution_prefers_managed_then_default() {
+        let base = temp_dir("runtime-resolve");
+        let managed = base.join("managed-llama-server.exe");
+        fs::write(&managed, b"x").unwrap();
+        let default = base.join("default-llama-server.exe");
+        fs::write(&default, b"x").unwrap();
+
+        let managed_settings = Settings {
+            installed_runtime: Some(InstalledRuntime {
+                server_path: managed.to_string_lossy().into_owned(),
+                version: "b12136".to_string(),
+                installed_at: 0,
+            }),
+            ..Default::default()
+        };
         assert_eq!(
-            resolve_resource(
-                "モデル",
-                Some(explicit.to_str().unwrap()),
-                MODEL_ENV,
-                Some(env_file.to_str().unwrap()),
-                &bin,
-                &relative,
-            )
-            .unwrap(),
-            explicit
+            resolve_runtime_path(&managed_settings, Some(&default), &base).unwrap(),
+            managed
         );
-        // 設定値が無ければ環境変数
+
+        // 管理対象が無ければ既定の場所
         assert_eq!(
-            resolve_resource(
-                "モデル",
-                Some(base.join("missing.gguf").to_str().unwrap()),
-                MODEL_ENV,
-                Some(env_file.to_str().unwrap()),
-                &bin,
-                &relative,
-            )
-            .unwrap(),
-            env_file
+            resolve_runtime_path(&Settings::default(), Some(&default), &base).unwrap(),
+            default
         );
-        // どちらも無ければ exe の親をたどる
-        assert_eq!(
-            resolve_resource("モデル", None, MODEL_ENV, None, &bin, &relative).unwrap(),
-            searched
-        );
-        // 見つからなければ、確認した場所を detail に残す。
-        // runtime を含まないディレクトリから探し、祖先にも無いことを確かめる。
-        let empty_base = temp_dir("resolve-empty");
+
+        // どちらも無ければ「未導入」の案内を出す
+        let empty = temp_dir("runtime-resolve-empty");
         let error =
-            resolve_resource("モデル", None, MODEL_ENV, None, &empty_base, &relative).unwrap_err();
-        assert!(error.contains("モデルが見つかりません"));
-        assert!(error.contains("runtime"));
-        let _ = fs::remove_dir_all(&empty_base);
+            resolve_runtime_path(&Settings::default(), Some(&empty.join("none.exe")), &empty)
+                .unwrap_err();
+        assert!(error.contains("ランタイムが未導入"));
+        assert!(error.contains("設定でインストール"));
+        let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&base);
     }
 

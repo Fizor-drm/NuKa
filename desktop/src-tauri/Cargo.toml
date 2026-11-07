@@ -1,6 +1,6 @@
 [package]
 name = "nuka"
-version = "0.1.0"
+version = "1.0.0"
 description = "NuKa desktop translation app (Powered by PLaMo 3 Translate)"
 authors = ["NuKa"]
 edition = "2021"
@@ -15,6 +15,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
@@ -25,14 +27,21 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "io-util",
+    "fs",
     "net",
 ] }
-# llama-server はループバックの http だけなので TLS は要らない。
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+# llama-server はループバックの http なので TLS は要らないが、ランタイムとモデルの
+# ダウンロード (https) に native-tls (Windows は schannel) を使う。
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "native-tls",
+] }
 futures-util = "0.3"
 whatlang = "0.18"
 regex = "1"
 thiserror = "2"
+zip = "2"
 
 # 子プロセス (llama-server) を Job Object で OS に後始末させるため (Windows のみ)。
 [target.'cfg(windows)'.dependencies]

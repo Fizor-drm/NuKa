@@ -32,6 +32,26 @@ pub enum Theme {
     System,
 }
 
+/// 設定画面から導入した llama.cpp ランタイム。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledRuntime {
+    pub server_path: String,
+    pub version: String,
+    /// Unix 秒。
+    pub installed_at: u64,
+}
+
+/// 設定画面から導入したモデル。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledModel {
+    pub file: String,
+    pub repo: String,
+    pub bytes: u64,
+    pub path: String,
+    /// Unix 秒。
+    pub installed_at: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -47,6 +67,15 @@ pub struct Settings {
     pub context_tokens: u32,
     pub theme: Theme,
     pub auto_translate: bool,
+    /// モデルの保存先。null なら `{app_local_data_dir}/models`。
+    /// IPC では設定画面のフォルダ選択からだけ変更できる。
+    pub models_dir: Option<String>,
+    /// 設定画面から導入したランタイム。
+    pub installed_runtime: Option<InstalledRuntime>,
+    /// 設定画面から導入したモデル一覧。
+    pub installed_models: Vec<InstalledModel>,
+    /// 使用するモデルのファイル名 (installed_models の file)。
+    pub active_model: Option<String>,
 }
 
 impl Default for Settings {
@@ -58,6 +87,10 @@ impl Default for Settings {
             context_tokens: 8192,
             theme: Theme::Light,
             auto_translate: true,
+            models_dir: None,
+            installed_runtime: None,
+            installed_models: Vec::new(),
+            active_model: None,
         }
     }
 }
@@ -121,20 +154,32 @@ impl SettingsStore {
     /// lock を取ったまま「読む → 差分適用 → 検証 → 保存 → メモリ反映」まで行う。
     /// 並行して `set_settings` が呼ばれても更新が混ざらない (lost update を防ぐ)。
     pub fn apply(&self, patch: SettingsPatch) -> Result<Settings, String> {
+        self.update(|settings| {
+            if let Some(value) = patch.gpu_layers {
+                settings.gpu_layers = value;
+            }
+            if let Some(value) = patch.context_tokens {
+                settings.context_tokens = value;
+            }
+            if let Some(value) = patch.theme {
+                settings.theme = value;
+            }
+            if let Some(value) = patch.auto_translate {
+                settings.auto_translate = value;
+            }
+            Ok(())
+        })
+    }
+
+    /// 任意の変更を lock 内で行い、検証して保存する。
+    /// インストール系のコマンドはここを通して設定を更新する。
+    pub fn update<F>(&self, change: F) -> Result<Settings, String>
+    where
+        F: FnOnce(&mut Settings) -> Result<(), String>,
+    {
         let mut current = self.lock();
         let mut next = current.clone();
-        if let Some(value) = patch.gpu_layers {
-            next.gpu_layers = value;
-        }
-        if let Some(value) = patch.context_tokens {
-            next.context_tokens = value;
-        }
-        if let Some(value) = patch.theme {
-            next.theme = value;
-        }
-        if let Some(value) = patch.auto_translate {
-            next.auto_translate = value;
-        }
+        change(&mut next)?;
         validate(&next)?;
         if let Some(path) = &self.path {
             save(path, &next)?;
@@ -181,6 +226,19 @@ fn sanitize(settings: &mut Settings) {
     settings.gpu_layers = settings.gpu_layers.min(MAX_GPU_LAYERS);
     settings.model_path = settings.model_path.take().and_then(normalize_optional);
     settings.server_path = settings.server_path.take().and_then(normalize_optional);
+    settings.models_dir = settings.models_dir.take().and_then(normalize_optional);
+    settings.active_model = settings.active_model.take().and_then(normalize_optional);
+    settings.installed_runtime = settings.installed_runtime.take().and_then(|mut runtime| {
+        runtime.server_path = normalize_optional(runtime.server_path)?;
+        Some(runtime)
+    });
+    settings
+        .installed_models
+        .retain(|model| !model.file.trim().is_empty() && !model.path.trim().is_empty());
+    for model in &mut settings.installed_models {
+        model.file = model.file.trim().to_string();
+        model.path = model.path.trim().to_string();
+    }
 }
 
 fn load_or_default(path: &Path) -> Settings {
@@ -274,6 +332,73 @@ mod tests {
         assert_eq!(settings.context_tokens, 8192);
         assert_eq!(settings.theme, Theme::Light);
         assert!(settings.auto_translate);
+        assert!(settings.models_dir.is_none());
+        assert!(settings.installed_runtime.is_none());
+        assert!(settings.installed_models.is_empty());
+        assert!(settings.active_model.is_none());
+    }
+
+    #[test]
+    fn install_state_round_trips() {
+        let directory = temp_dir("install-state");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let runtime = InstalledRuntime {
+            server_path: "C:\\nuka\\runtime\\llama\\llama-server.exe".to_string(),
+            version: "b12136".to_string(),
+            installed_at: 42,
+        };
+        let models = vec![InstalledModel {
+            file: "plamo-3-translate-0.8b-Q2_K.gguf".to_string(),
+            repo: "pfnet/plamo-3-translate-0.8b-GGUF".to_string(),
+            bytes: 410135168,
+            path: "C:\\nuka\\models\\plamo-3-translate-0.8b-Q2_K.gguf".to_string(),
+            installed_at: 43,
+        }];
+        store
+            .update(|settings| {
+                settings.installed_runtime = Some(runtime.clone());
+                settings.installed_models = models.clone();
+                settings.active_model = Some("plamo-3-translate-0.8b-Q2_K.gguf".to_string());
+                settings.models_dir = Some("D:\\models".to_string());
+                Ok(())
+            })
+            .expect("インストール状態を保存できる");
+
+        let reloaded = SettingsStore::new(path).get();
+        assert_eq!(reloaded.installed_runtime, Some(runtime));
+        assert_eq!(reloaded.installed_models, models);
+        assert_eq!(
+            reloaded.active_model.as_deref(),
+            Some("plamo-3-translate-0.8b-Q2_K.gguf")
+        );
+        assert_eq!(reloaded.models_dir.as_deref(), Some("D:\\models"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn blank_install_entries_are_dropped_on_load() {
+        let directory = temp_dir("install-sanitize");
+        let path = directory.join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+                "active_model": "   ",
+                "installed_runtime": {"server_path": "  ", "version": "b12136", "installed_at": 1},
+                "installed_models": [
+                    {"file": " ", "repo": "pfnet/x", "bytes": 1, "path": "  ", "installed_at": 1},
+                    {"file": "a.gguf", "repo": "pfnet/x", "bytes": 1, "path": " C:\\m\\a.gguf ", "installed_at": 1}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert!(settings.active_model.is_none());
+        assert!(settings.installed_runtime.is_none());
+        assert_eq!(settings.installed_models.len(), 1);
+        assert_eq!(settings.installed_models[0].file, "a.gguf");
+        assert_eq!(settings.installed_models[0].path, "C:\\m\\a.gguf");
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
