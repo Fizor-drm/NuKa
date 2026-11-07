@@ -1,0 +1,24 @@
+{
+  "name": "nuka",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "NuKa: 手元の llama.cpp で訳す翻訳デスクトップアプリ (Powered by PLaMo 3 Translate)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.6"
+  }
+}

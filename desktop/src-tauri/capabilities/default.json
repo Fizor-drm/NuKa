@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "メインウィンドウが core のイベント購読とコマンド呼び出しだけを行えるようにする。",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

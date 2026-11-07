@@ -1,0 +1,1007 @@
+//! llama-server の子プロセス管理。
+//!
+//! - 起動はシェルを介さず、引数配列で `llama-server.exe` を直接叩く
+//!   (パスに空白があってもクォート崩れが起きない)。
+//! - 127.0.0.1:0 で空きポートを取ってから、そのポートで起動する。
+//! - `/health` が 200 を返すまで 500ms 間隔で最大 300 秒待つ。
+//! - 進み具合は `engine:status` イベントで流す。
+//! - 異常終了したら error を流し、`restart_engine` で起こし直せる。
+//! - アプリ終了時 (RunEvent) と Drop で必ず kill する。
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::process::{Child, Command};
+use tokio::time::sleep;
+
+use crate::settings::Settings;
+use job_object::JobObject;
+
+pub const SERVER_ALIAS: &str = "plamo-3-translate";
+pub const MODEL_FILE: &str = "plamo-3-translate-0.8b-Q4_K_M.gguf";
+pub const MODEL_ENV: &str = "PLAMO_MODEL_PATH";
+pub const SERVER_ENV: &str = "PLAMO_LLAMA_SERVER";
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
+pub const HEALTH_INTERVAL: Duration = Duration::from_millis(500);
+
+const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
+/// 開発時は exe の位置から上位 6 階層までランタイムを探す。
+const DEBUG_SEARCH_DEPTH: usize = 6;
+/// リリースでは exe の隣と 1 つ上だけ。親ディレクトリに置かれた runtime を拾わない。
+const RELEASE_SEARCH_DEPTH: usize = 1;
+
+/// 探索する親階層の上限。リリース配布では上位への planting を避けるため浅くする。
+fn max_search_depth() -> usize {
+    if cfg!(debug_assertions) {
+        DEBUG_SEARCH_DEPTH
+    } else {
+        RELEASE_SEARCH_DEPTH
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnginePhase {
+    Starting,
+    Loading,
+    Ready,
+    Error,
+}
+
+/// `engine:status` イベントと `get_engine_status` の返り値。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EngineStatus {
+    pub state: EnginePhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl EngineStatus {
+    fn new(state: EnginePhase, detail: Option<String>) -> Self {
+        Self { state, detail }
+    }
+}
+
+#[derive(Clone)]
+pub struct Engine {
+    app: AppHandle,
+    inner: Arc<Mutex<Inner>>,
+    http: reqwest::Client,
+}
+
+struct Inner {
+    /// start / kill のたびに増える。古い監視タスクはこれで自分を止める。
+    generation: u64,
+    status: EngineStatus,
+    port: Option<u16>,
+    child: Option<Child>,
+    /// llama-server を道連れにする Job Object (Windows のみ意味を持つ)。
+    /// このハンドルを閉じると OS が割り当て済みの子プロセスも終了させる。
+    job: Option<JobObject>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // アプリ終了時に子プロセスを残さない。kill_on_drop もあるが、ここでも明示的に止める。
+        // job はこのあと field の drop で閉じられ、残っている子はカーネルが終了させる。
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Engine {
+    pub fn new(app: AppHandle) -> Self {
+        // llama-server はループバックにしか居ない。OS や環境変数のプロキシを読むと
+        // 127.0.0.1 宛の /health までプロキシへ中継され、起動待ちが必ずタイムアウトする。
+        // ここで失敗するのは設定不備だけなので、プロキシを読む既定クライアントには戻さない。
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("ループバック専用の HTTP クライアントを作れません");
+        Self {
+            app,
+            inner: Arc::new(Mutex::new(Inner {
+                generation: 0,
+                status: EngineStatus::new(EnginePhase::Starting, None),
+                port: None,
+                child: None,
+                job: None,
+            })),
+            http,
+        }
+    }
+
+    pub fn status(&self) -> EngineStatus {
+        self.lock().status.clone()
+    }
+
+    /// 準備できていれば llama-server の待ち受けポート。
+    pub fn port(&self) -> Option<u16> {
+        self.lock().port
+    }
+
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// 起動して `/health` の監視を始める。結果は `engine:status` で流れる。
+    ///
+    /// tokio のプロセスドライバを使うので、ランタイムの中で呼ぶこと
+    /// (`tauri::async_runtime::spawn` の中など)。
+    pub async fn start(&self, settings: &Settings) {
+        self.kill_now();
+        let generation = self.next_generation();
+        self.set_status(
+            generation,
+            EngineStatus::new(
+                EnginePhase::Starting,
+                Some("llama-server を起動しています。".to_string()),
+            ),
+        );
+
+        let paths = match resolve_paths(settings) {
+            Ok(paths) => paths,
+            Err(detail) => {
+                self.set_status(
+                    generation,
+                    EngineStatus::new(EnginePhase::Error, Some(detail)),
+                );
+                return;
+            }
+        };
+
+        let port = match pick_free_port() {
+            Ok(port) => port,
+            Err(error) => {
+                self.set_status(
+                    generation,
+                    EngineStatus::new(
+                        EnginePhase::Error,
+                        Some(format!("空きポートを確保できません: {error}")),
+                    ),
+                );
+                return;
+            }
+        };
+
+        let log_path = self.log_path();
+        let child = match spawn_server(&paths, port, settings, log_path.as_deref()) {
+            Ok(child) => child,
+            Err(detail) => {
+                self.set_status(
+                    generation,
+                    EngineStatus::new(EnginePhase::Error, Some(detail)),
+                );
+                return;
+            }
+        };
+        // 起動直後に Job Object へ割り当てておく。以後はアプリがどう落ちても
+        // カーネルが llama-server を道連れにする。
+        let job = attach_job_object(&child);
+
+        {
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                // 起動の途中で別の start / kill が入った。起動した子は捨てる
+                // (kill_on_drop が有効なので drop で止まる)。
+                drop(inner);
+                drop(child);
+                drop(job);
+                return;
+            }
+            inner.child = Some(child);
+            inner.job = job;
+            inner.port = Some(port);
+        }
+
+        let engine = self.clone();
+        tauri::async_runtime::spawn(async move {
+            engine.supervise(generation, port).await;
+        });
+    }
+
+    /// 子プロセスを止める。状態はそのまま (次の start が starting にする)。
+    pub fn kill_now(&self) {
+        let (child, job) = {
+            let mut inner = self.lock();
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.port = None;
+            (inner.child.take(), inner.job.take())
+        };
+        if let Some(mut child) = child {
+            if let Err(error) = child.start_kill() {
+                eprintln!("llama-server を止められません: {error}");
+            }
+            let _ = child.try_wait();
+        }
+        // Job Object を閉じると、割り当て済みの子は OS が終了させる (二重の保険)。
+        drop(job);
+    }
+
+    async fn supervise(self, generation: u64, port: u16) {
+        let progress_engine = self.clone();
+        let fatal_engine = self.clone();
+        let outcome = wait_until_ready(
+            &self.http,
+            port,
+            HEALTH_TIMEOUT,
+            HEALTH_INTERVAL,
+            move |phase| {
+                let detail = match phase {
+                    EnginePhase::Loading => Some("モデルを読み込んでいます。".to_string()),
+                    EnginePhase::Ready => Some(format!("127.0.0.1:{port} で待ち受けています。")),
+                    _ => None,
+                };
+                progress_engine.set_status(generation, EngineStatus::new(phase, detail));
+            },
+            move || {
+                if !fatal_engine.is_current(generation) {
+                    // 新しい start / kill に置き換えられた。静かに抜ける。
+                    return Some("エンジンの起動が置き換えられました。".to_string());
+                }
+                fatal_engine.exited_detail(generation)
+            },
+        )
+        .await;
+
+        match outcome {
+            ReadyOutcome::Ready => self.watchdog(generation).await,
+            ReadyOutcome::TimedOut => {
+                // 置き換えられていたら、新しい子プロセスに手を出さない。
+                if !self.is_current(generation) {
+                    return;
+                }
+                self.set_status(
+                    generation,
+                    EngineStatus::new(
+                        EnginePhase::Error,
+                        Some(format!(
+                            "llama-server が {} 秒以内に準備できませんでした。",
+                            HEALTH_TIMEOUT.as_secs()
+                        )),
+                    ),
+                );
+                self.kill_now();
+            }
+            ReadyOutcome::Failed(detail) => {
+                if !self.is_current(generation) {
+                    return;
+                }
+                self.set_status(
+                    generation,
+                    EngineStatus::new(EnginePhase::Error, Some(detail)),
+                );
+                self.kill_now();
+            }
+        }
+    }
+
+    /// 準備完了後も、勝手に落ちていないかを見張る。
+    async fn watchdog(self, generation: u64) {
+        loop {
+            sleep(WATCHDOG_INTERVAL).await;
+            if self.lock().generation != generation {
+                return;
+            }
+            if let Some(detail) = self.exited_detail(generation) {
+                self.set_status(
+                    generation,
+                    EngineStatus::new(EnginePhase::Error, Some(detail)),
+                );
+                return;
+            }
+        }
+    }
+
+    fn exited_detail(&self, generation: u64) -> Option<String> {
+        let mut inner = self.lock();
+        if inner.generation != generation {
+            return None;
+        }
+        let child = inner.child.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => Some(match status.code() {
+                Some(code) => format!("llama-server が終了しました (終了コード {code})。"),
+                None => "llama-server が終了しました。".to_string(),
+            }),
+            Ok(None) => None,
+            Err(error) => Some(format!("llama-server の状態を確認できません: {error}")),
+        }
+    }
+
+    fn next_generation(&self) -> u64 {
+        let mut inner = self.lock();
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.generation
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.lock().generation == generation
+    }
+
+    fn set_status(&self, generation: u64, status: EngineStatus) {
+        let payload = {
+            let mut inner = self.lock();
+            if inner.generation != generation || inner.status == status {
+                return;
+            }
+            inner.status = status;
+            inner.status.clone()
+        };
+        if let Err(error) = self.app.emit("engine:status", payload) {
+            eprintln!("engine:status を送れません: {error}");
+        }
+    }
+
+    fn log_path(&self) -> Option<PathBuf> {
+        let directory = self.app.path().app_log_dir().ok()?;
+        std::fs::create_dir_all(&directory).ok()?;
+        Some(directory.join("llama-server.log"))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerPaths {
+    pub model: PathBuf,
+    pub server: PathBuf,
+}
+
+fn model_relative() -> PathBuf {
+    PathBuf::from("runtime").join("models").join(MODEL_FILE)
+}
+
+fn server_relative() -> PathBuf {
+    PathBuf::from("runtime")
+        .join("llama")
+        .join("llama-server.exe")
+}
+
+fn exe_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// モデルとサーバの場所を決める。
+///
+/// 優先順位は settings.json → 環境変数 → exe の位置からの探索。
+/// 探索はデバッグ実行では上位 6 階層まで、リリースでは隣と 1 つ上だけ。
+/// どれも無ければ、確認した場所を並べてエラーにする。
+fn resolve_paths(settings: &Settings) -> Result<ServerPaths, String> {
+    let root = exe_directory();
+    let model_env = std::env::var(MODEL_ENV).ok();
+    let server_env = std::env::var(SERVER_ENV).ok();
+
+    let model = resolve_resource(
+        "モデル",
+        settings.model_path.as_deref(),
+        MODEL_ENV,
+        model_env.as_deref(),
+        &root,
+        &model_relative(),
+    );
+    let server = resolve_resource(
+        "llama-server",
+        settings.server_path.as_deref(),
+        SERVER_ENV,
+        server_env.as_deref(),
+        &root,
+        &server_relative(),
+    );
+
+    let mut problems: Vec<String> = Vec::new();
+    let model = match model {
+        Ok(path) => Some(path),
+        Err(error) => {
+            problems.push(error);
+            None
+        }
+    };
+    let server = match server {
+        Ok(path) => Some(path),
+        Err(error) => {
+            problems.push(error);
+            None
+        }
+    };
+
+    match (model, server) {
+        (Some(model), Some(server)) => Ok(ServerPaths { model, server }),
+        _ => Err(problems.join(" / ")),
+    }
+}
+
+fn resolve_resource(
+    label: &str,
+    settings_value: Option<&str>,
+    env_name: &str,
+    env_value: Option<&str>,
+    search_root: &Path,
+    relative: &Path,
+) -> Result<PathBuf, String> {
+    let mut tried: Vec<String> = Vec::new();
+
+    if let Some(value) = settings_value {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("settings.json の値 {}", path.display()));
+    }
+
+    if let Some(value) = env_value {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(format!("{env_name} の値 {}", path.display()));
+    }
+
+    let depth = max_search_depth();
+    if let Some(found) = find_in_ancestors(search_root, relative, depth) {
+        return Ok(found);
+    }
+    tried.push(format!(
+        "{} から上位 {depth} 階層の {}",
+        search_root.display(),
+        relative.display()
+    ));
+
+    Err(format!(
+        "{label}が見つかりません。確認した場所: {}",
+        tried.join(" / ")
+    ))
+}
+
+/// `start` から親を最大 `depth` 階層たどり、`relative` が実在する場所を返す。
+pub(crate) fn find_in_ancestors(start: &Path, relative: &Path, depth: usize) -> Option<PathBuf> {
+    let mut current = Some(start);
+    for _ in 0..=depth {
+        let directory = current?;
+        let candidate = directory.join(relative);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+/// OS に空きポートを選ばせてから解放する。
+/// 取得と起動のあいだに他のプロセスが使う可能性はゼロではないが、
+/// 固定ポートを奪い合うよりは衝突が少ない。
+pub(crate) fn pick_free_port() -> std::io::Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn spawn_server(
+    paths: &ServerPaths,
+    port: u16,
+    settings: &Settings,
+    log_path: Option<&Path>,
+) -> Result<Child, String> {
+    let (stdout, stderr) = prepare_logs(log_path, port, paths)?;
+    let mut command = Command::new(&paths.server);
+    command
+        .arg("-m")
+        .arg(&paths.model)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("-c")
+        .arg(settings.context_tokens.to_string())
+        .arg("-ngl")
+        .arg(settings.gpu_layers.to_string())
+        .arg("--alias")
+        .arg(SERVER_ALIAS)
+        .arg("--no-webui")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .kill_on_drop(true);
+    if let Some(directory) = paths.server.parent() {
+        command.current_dir(directory);
+    }
+    #[cfg(windows)]
+    {
+        // コンソールウィンドウを出さない。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.spawn().map_err(|error| {
+        format!(
+            "llama-server を起動できません ({}): {error}",
+            paths.server.display()
+        )
+    })
+}
+
+fn prepare_logs(
+    log_path: Option<&Path>,
+    port: u16,
+    paths: &ServerPaths,
+) -> Result<(Stdio, Stdio), String> {
+    let Some(log_path) = log_path else {
+        return Ok((Stdio::null(), Stdio::null()));
+    };
+    let mut file: File = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|error| format!("ログファイルを開けません ({}): {error}", log_path.display()))?;
+    let _ = writeln!(
+        file,
+        "=== llama-server 起動: port {port} / {} / {} ===",
+        paths.server.display(),
+        paths.model.display()
+    );
+    let stderr_file = file
+        .try_clone()
+        .map_err(|error| format!("ログファイルを複製できません: {error}"))?;
+    Ok((Stdio::from(file), Stdio::from(stderr_file)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadyOutcome {
+    Ready,
+    TimedOut,
+    /// プロセスが落ちたなど、待つまでもない失敗。
+    Failed(String),
+}
+
+/// `/health` を `interval` 間隔で叩き、200 が返るまで待つ。
+///
+/// `fatal` が毎回の試行前に呼ばれ、`Some` を返したら即座に諦める
+/// (プロセスの異常終了を拾うため)。
+pub(crate) async fn wait_until_ready<F, G>(
+    client: &reqwest::Client,
+    port: u16,
+    budget: Duration,
+    interval: Duration,
+    mut on_progress: F,
+    mut fatal: G,
+) -> ReadyOutcome
+where
+    F: FnMut(EnginePhase),
+    G: FnMut() -> Option<String>,
+{
+    let deadline = Instant::now() + budget;
+    let url = format!("http://127.0.0.1:{port}/health");
+    loop {
+        if let Some(detail) = fatal() {
+            return ReadyOutcome::Failed(detail);
+        }
+        if let Ok(response) = client
+            .get(&url)
+            .timeout(HEALTH_REQUEST_TIMEOUT)
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                on_progress(EnginePhase::Ready);
+                return ReadyOutcome::Ready;
+            }
+            // モデル読み込み中は 503 が返る。
+            on_progress(EnginePhase::Loading);
+        }
+        // 接続拒否やタイムアウトは「まだ待ち受けていない」。同じ扱いで次の試行へ進む。
+        if Instant::now() >= deadline {
+            return ReadyOutcome::TimedOut;
+        }
+        sleep(interval).await;
+    }
+}
+
+/// llama-server を Job Object に割り当てる。
+///
+/// 失敗しても kill_on_drop / kill_now は残っているので、起動自体は続ける
+/// (Job Object が使えない環境でも従来どおり動く)。
+fn attach_job_object(child: &Child) -> Option<JobObject> {
+    let job = match JobObject::kill_on_close() {
+        Ok(job) => job,
+        Err(error) => {
+            eprintln!("Job Object を作れません (子プロセスの後始末は kill で行います): {error}");
+            return None;
+        }
+    };
+    let Some(pid) = child.id() else {
+        eprintln!("llama-server の PID を取得できません");
+        return None;
+    };
+    if let Err(error) = job.assign_pid(pid) {
+        eprintln!("llama-server (pid {pid}) を Job Object に割り当てられません: {error}");
+        return None;
+    }
+    Some(job)
+}
+
+/// Windows の Job Object。アプリがクラッシュしたり `std::process::exit` で終わっても、
+/// ハンドルが閉じた時点でカーネルが割り当て済みの子プロセスを終了させる。
+#[cfg(windows)]
+mod job_object {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    pub(super) struct JobObject {
+        handle: HANDLE,
+    }
+
+    impl JobObject {
+        pub(super) fn kill_on_close() -> io::Result<Self> {
+            // SAFETY: 生成したハンドルは全て null チェックし、失敗時は閉じる。
+            // 成功したハンドルの所有権は返す JobObject だけが持つ。
+            unsafe {
+                let handle = CreateJobObjectW(ptr::null(), ptr::null());
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let configured = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if configured == 0 {
+                    let error = io::Error::last_os_error();
+                    CloseHandle(handle);
+                    return Err(error);
+                }
+                Ok(Self { handle })
+            }
+        }
+
+        /// pid のプロセスをこの Job Object に割り当てる。
+        pub(super) fn assign_pid(&self, pid: u32) -> io::Result<()> {
+            // SAFETY: OpenProcess の戻り値は必ず CloseHandle する。
+            // AssignProcessToJobObject は失敗時だけ last_os_error を返す。
+            unsafe {
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let assigned = AssignProcessToJobObject(self.handle, process);
+                let error = io::Error::last_os_error();
+                CloseHandle(process);
+                if assigned == 0 {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            // SAFETY: このハンドルは kill_on_close で作ったもので、所有者はここだけ。
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+
+    // SAFETY: Windows の HANDLE はプロセス内で共有できるカーネルハンドルで、
+    // CloseHandle はどのスレッドから呼んでもよい。所有権は JobObject が 1 つだけ持つ。
+    unsafe impl Send for JobObject {}
+}
+
+#[cfg(not(windows))]
+mod job_object {
+    use std::io;
+
+    /// Windows 以外では何もしない。kill_on_drop / kill_now が後始末を担う。
+    pub(super) struct JobObject;
+
+    impl JobObject {
+        pub(super) fn kill_on_close() -> io::Result<Self> {
+            Ok(Self)
+        }
+
+        pub(super) fn assign_pid(&self, _pid: u32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("plamo3-engine-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("一時ディレクトリを作れる");
+        directory
+    }
+
+    #[test]
+    fn picks_a_port_that_can_be_bound() {
+        let port = pick_free_port().expect("空きポートを取れる");
+        assert!(port > 0);
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("取ったポートを bind できる");
+        drop(listener);
+    }
+
+    #[test]
+    fn status_matches_the_event_contract() {
+        let ready = serde_json::to_value(EngineStatus::new(EnginePhase::Ready, None)).unwrap();
+        assert_eq!(ready, serde_json::json!({ "state": "ready" }));
+
+        let loading = serde_json::to_value(EngineStatus::new(
+            EnginePhase::Loading,
+            Some("モデルを読み込んでいます。".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(
+            loading,
+            serde_json::json!({ "state": "loading", "detail": "モデルを読み込んでいます。" })
+        );
+
+        let error = serde_json::to_value(EngineStatus::new(
+            EnginePhase::Error,
+            Some("見つかりません".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(error["state"], "error");
+    }
+
+    #[test]
+    fn finds_runtime_next_to_an_ancestor() {
+        let base = temp_dir("ancestors");
+        let exe_dir = base
+            .join("desktop")
+            .join("src-tauri")
+            .join("target")
+            .join("debug");
+        fs::create_dir_all(&exe_dir).unwrap();
+        let relative = server_relative();
+        let expected = base.join(&relative);
+        fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        fs::write(&expected, b"stub").unwrap();
+
+        assert_eq!(
+            find_in_ancestors(&exe_dir, &relative, 6),
+            Some(expected.clone())
+        );
+        // 4 階層上にあるので、2 階層では届かない
+        assert_eq!(find_in_ancestors(&exe_dir, &relative, 2), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn release_search_depth_is_shallower_than_debug() {
+        assert_eq!(DEBUG_SEARCH_DEPTH, 6);
+        assert_eq!(RELEASE_SEARCH_DEPTH, 1);
+        let expected = if cfg!(debug_assertions) {
+            DEBUG_SEARCH_DEPTH
+        } else {
+            RELEASE_SEARCH_DEPTH
+        };
+        assert_eq!(max_search_depth(), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_object_can_be_created_with_kill_on_close() {
+        // 何も割り当てずに作って閉じるだけなので、プロセスに影響はない。
+        let job = JobObject::kill_on_close().expect("Job Object を作れる");
+        drop(job);
+    }
+
+    #[test]
+    fn resolve_resource_prefers_settings_then_env_then_search() {
+        let base = temp_dir("resolve");
+        let bin = base.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let relative = model_relative();
+        let searched = base.join(&relative);
+        fs::create_dir_all(searched.parent().unwrap()).unwrap();
+        fs::write(&searched, b"model").unwrap();
+
+        let explicit = base.join("custom.gguf");
+        fs::write(&explicit, b"model").unwrap();
+        let env_file = base.join("env.gguf");
+        fs::write(&env_file, b"model").unwrap();
+
+        // 設定値が実在すればそれ
+        assert_eq!(
+            resolve_resource(
+                "モデル",
+                Some(explicit.to_str().unwrap()),
+                MODEL_ENV,
+                Some(env_file.to_str().unwrap()),
+                &bin,
+                &relative,
+            )
+            .unwrap(),
+            explicit
+        );
+        // 設定値が無ければ環境変数
+        assert_eq!(
+            resolve_resource(
+                "モデル",
+                Some(base.join("missing.gguf").to_str().unwrap()),
+                MODEL_ENV,
+                Some(env_file.to_str().unwrap()),
+                &bin,
+                &relative,
+            )
+            .unwrap(),
+            env_file
+        );
+        // どちらも無ければ exe の親をたどる
+        assert_eq!(
+            resolve_resource("モデル", None, MODEL_ENV, None, &bin, &relative).unwrap(),
+            searched
+        );
+        // 見つからなければ、確認した場所を detail に残す。
+        // runtime を含まないディレクトリから探し、祖先にも無いことを確かめる。
+        let empty_base = temp_dir("resolve-empty");
+        let error =
+            resolve_resource("モデル", None, MODEL_ENV, None, &empty_base, &relative).unwrap_err();
+        assert!(error.contains("モデルが見つかりません"));
+        assert!(error.contains("runtime"));
+        let _ = fs::remove_dir_all(&empty_base);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn spawn_reports_a_missing_binary() {
+        let directory = temp_dir("missing-binary");
+        let paths = ServerPaths {
+            model: directory.join("missing.gguf"),
+            server: directory.join("missing-llama-server.exe"),
+        };
+        let error = spawn_server(&paths, 12345, &Settings::default(), None).unwrap_err();
+        assert!(error.contains("llama-server を起動できません"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn logs_are_appended_to_the_given_file() {
+        let directory = temp_dir("logs");
+        let log_path = directory.join("llama-server.log");
+        let paths = ServerPaths {
+            model: PathBuf::from("model.gguf"),
+            server: PathBuf::from("llama-server.exe"),
+        };
+        let (stdout, stderr) = prepare_logs(Some(&log_path), 9999, &paths).unwrap();
+        drop(stdout);
+        drop(stderr);
+        let written = fs::read_to_string(&log_path).unwrap();
+        assert!(written.contains("port 9999"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// `/health` の応答を順番に返すだけの小さなサーバ。
+    async fn spawn_stub_health(statuses: Vec<u16>) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("stub を bind できる");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut remaining = statuses;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let status = if remaining.is_empty() {
+                    200
+                } else {
+                    remaining.remove(0)
+                };
+                let body = if status == 200 {
+                    "{\"status\":\"ok\"}"
+                } else {
+                    "{\"error\":\"loading model\"}"
+                };
+                let reason = if status == 200 { "OK" } else { "Loading" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn health_polling_reports_loading_then_ready() {
+        let port = spawn_stub_health(vec![503, 503, 200]).await;
+        let client = reqwest::Client::new();
+        let mut phases = Vec::new();
+        let outcome = wait_until_ready(
+            &client,
+            port,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            |phase| phases.push(phase),
+            || None,
+        )
+        .await;
+
+        assert_eq!(outcome, ReadyOutcome::Ready);
+        assert_eq!(phases.first(), Some(&EnginePhase::Loading));
+        assert_eq!(phases.last(), Some(&EnginePhase::Ready));
+    }
+
+    #[tokio::test]
+    async fn health_polling_times_out_when_nothing_listens() {
+        let port = pick_free_port().unwrap();
+        let client = reqwest::Client::new();
+        let mut phases = Vec::new();
+        let outcome = wait_until_ready(
+            &client,
+            port,
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+            |phase| phases.push(phase),
+            || None,
+        )
+        .await;
+
+        assert_eq!(outcome, ReadyOutcome::TimedOut);
+        assert!(phases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fatal_probe_stops_the_wait_immediately() {
+        let port = pick_free_port().unwrap();
+        let client = reqwest::Client::new();
+        let outcome = wait_until_ready(
+            &client,
+            port,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            |_| {},
+            || Some("llama-server が終了しました (終了コード 1)。".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ReadyOutcome::Failed("llama-server が終了しました (終了コード 1)。".to_string())
+        );
+    }
+}
