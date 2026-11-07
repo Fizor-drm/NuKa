@@ -78,11 +78,16 @@ export interface RuntimeState {
   bytes?: number;
 }
 
+export interface ModelState {
+  resolved: boolean;
+}
+
 export interface SetupState {
   runtime: RuntimeState;
   models: InstalledModel[];
   active_model: string | null;
   models_dir: string;
+  model: ModelState;
 }
 
 export type DownloadKind = "runtime" | "model";

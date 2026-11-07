@@ -38,6 +38,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "native-tls",
 ] }
 futures-util = "0.3"
+sha2 = "0.10"
 whatlang = "0.18"
 regex = "1"
 thiserror = "2"

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "メインウィンドウが core のイベント購読、コマンド呼び出し、フォルダ選択、外部リンクを開くことを許可する。",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "opener:default"]
+  "permissions": ["core:default", "dialog:allow-open", "opener:allow-open-url"]
 }

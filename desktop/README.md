@@ -32,19 +32,20 @@ NuKa は、手元の PC だけで動くデスクトップ翻訳アプリです�
 モデルのライセンスは PLaMo Community License です。個人利用と非商用は無償で、
 商用利用には登録が必要です。設定画面の「ライセンス」から案内ページを開けます。
 
-ダウンロードは設定画面からいつでも取消できます。途中で止まった残骸 (`.part`) は
-次回のインストール時に作り直されます。
+ダウンロードは設定画面からいつでも取消できます。失敗・キャンセル時は `.part` と
+ダウンロードした zip を残しません。
 
 ## 必要条件
 
 - Windows 10/11 (WebView2 ランタイム)
 - ランタイム: 設定画面からインストール (llama.cpp b12136 / CUDA 12.4)
-- モデル: 設定画面からインストール (PFM 公式の GGUF)
+- モデル: 設定画面からインストール (PFN 公式の GGUF)
 
 手動で配置する場合:
 
 1. exe と同じ階層、または 1 つ上の階層に `runtime\llama\llama-server.exe` と
-   `runtime\models\*.gguf` を置く
+   `runtime\models\plamo-3-translate-0.8b-Q4_K_M.gguf` を置く
+   (探索はこの固定ファイル名だけを見ます。別名の GGUF は 2 か 3 の方法で指定してください)
 2. 設定ファイル (`%APPDATA%\app.nuka.translate\settings.json`) の
    `model_path` / `server_path` を編集する
 3. 環境変数 `PLAMO_MODEL_PATH` / `PLAMO_LLAMA_SERVER` で指定する
@@ -56,6 +57,22 @@ NuKa は、手元の PC だけで動くデスクトップ翻訳アプリです�
   環境変数 → exe の探索
 
 探索は開発ビルドでは上位 6 階層まで、リリースビルドでは exe の隣と 1 つ上だけです。
+
+## ランタイムの検証
+
+設定画面からのランタイム導入では、次の 2 つの zip を
+[ggml-org/llama.cpp の b12136 リリース](https://github.com/ggml-org/llama.cpp/releases/tag/b12136)
+から HTTPS で取得し、**サイズと SHA-256 を固定値と照合してから** 展開します。
+一致しない場合はダウンロードファイルを破棄して失敗します。
+
+| ファイル | サイズ (バイト) | SHA-256 |
+| --- | ---: | --- |
+| `llama-b12136-bin-win-cuda-12.4-x64.zip` | 288,912,954 | `A7F383874199086EB6AE88344A5CBFAD9204AE02D6A5FD6D1C0A84298BA94CC0` |
+| `cudart-llama-bin-win-cuda-12.4-x64.zip` | 391,443,627 | `8C79A9B226DE4B3CACFD1F83D24F962D0773BE79F1E7B75C6AF4DED7E32AE1D6` |
+
+公式リリースはチェックサムを公表していないため、公式 b12136 から取得した
+検証済み zip をもとに固定しています。展開は `runtime\llama.staging` に対して行い、
+必須ファイルの検証が通ってから `runtime\llama` と入れ替えます。
 
 ## 保存先
 

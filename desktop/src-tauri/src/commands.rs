@@ -222,7 +222,8 @@ pub fn get_setup_state(app: AppHandle, state: State<'_, AppState>) -> crate::ins
 pub async fn install_runtime(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.clone();
     let downloads = state.downloads.clone();
-    crate::installer::install_runtime(&app, &settings, &downloads).await?;
+    let engine = state.engine.clone();
+    crate::installer::install_runtime(&app, &settings, &downloads, &engine).await?;
     Ok(())
 }
 

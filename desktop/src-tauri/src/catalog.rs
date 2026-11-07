@@ -71,6 +71,11 @@ pub fn find(id: &str) -> Option<CatalogEntry> {
     entries().into_iter().find(|entry| entry.id == id)
 }
 
+/// 保存ファイル名からカタログを引く (削除時の整合性確認に使う)。
+pub fn find_by_file(file: &str) -> Option<CatalogEntry> {
+    entries().into_iter().find(|entry| entry.file == file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +125,13 @@ mod tests {
     fn unknown_id_is_none() {
         assert!(find("1b-Q4_K_M").is_none());
         assert!(find("").is_none());
+    }
+
+    #[test]
+    fn find_by_file_matches_the_saved_name() {
+        let entry = find_by_file("plamo-3-translate-2b-Q3_K_M.gguf").expect("カタログにある");
+        assert_eq!(entry.id, "2b-Q3_K_M");
+        assert!(find_by_file("unknown.gguf").is_none());
+        assert!(find_by_file("").is_none());
     }
 }

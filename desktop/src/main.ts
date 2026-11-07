@@ -287,20 +287,13 @@ function computeOutputView(): OutputView {
         text,
       };
     }
-    const models = setup?.models ?? [];
-    if (setup !== null && models.length === 0) {
+    if (setup !== null && !setup.model.resolved) {
       return {
         kind: "error",
-        message: "モデルが導入されていません。設定からインストールしてください。",
-        action: { kind: "settings", label: "設定を開く" },
-        text,
-      };
-    }
-    const active = setup?.active_model ?? null;
-    if (setup !== null && (active === null || !models.some((model) => model.file === active))) {
-      return {
-        kind: "error",
-        message: "使用するモデルを選んでください。",
+        message:
+          setup.models.length === 0
+            ? "モデルが導入されていません。設定からインストールしてください。"
+            : "使用するモデルを選んでください。",
         action: { kind: "settings", label: "設定を開く" },
         text,
       };
@@ -831,11 +824,8 @@ async function refreshSetup(): Promise<void> {
   renderSettings();
 }
 
-function hasActiveModel(setup: SetupState | null): boolean {
-  if (setup === null || setup.active_model === null) {
-    return false;
-  }
-  return setup.models.some((model) => model.file === setup.active_model);
+function isModelResolved(setup: SetupState | null): boolean {
+  return setup?.model.resolved === true;
 }
 
 function buildModelRows(): void {
@@ -1118,21 +1108,16 @@ async function handleDownloadDone(payload: { kind: DownloadKind; id: string }): 
   if (payload.kind === "runtime") {
     await refreshSetup();
     showAppStatus("ランタイムをインストールしました。");
-    if (hasActiveModel(state.setup)) {
-      try {
-        await ipc.restartEngine();
-      } catch (error) {
-        showAppStatus(`エンジンを起動できません: ${describeError(error)}`);
-      }
-      await refreshEngineStatus();
-    }
+    // 再起動はバックエンド (install_runtime) が行う。状態だけ取り直す。
+    await refreshEngineStatus();
     return;
   }
 
   const entry = state.catalog.find((item) => item.id === payload.id);
   await refreshSetup();
   showAppStatus("モデルをインストールしました。");
-  if (entry !== undefined && (state.setup?.active_model ?? null) === null) {
+  const active = state.setup?.active_model ?? null;
+  if (entry !== undefined && active === null && !isModelResolved(state.setup)) {
     try {
       await ipc.setActiveModel(entry.file);
       await refreshSetup();
