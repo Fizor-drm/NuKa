@@ -25,7 +25,7 @@ LANGUAGES = {
     "ru", "si", "sk", "sl", "sr", "sw", "ta", "te", "th", "tl", "ur", "uz", "vi",
 }
 
-CONTROL_RE = re.compile(r"<\|plamo:[a-z0-9_]+\|>", re.IGNORECASE)
+CONTROL_RE = re.compile(r"<\|plamo:[a-z0-9_:.\-]+\|>", re.IGNORECASE)
 
 
 def strip_control_tokens(value: object) -> str:

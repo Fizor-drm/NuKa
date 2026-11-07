@@ -76,12 +76,15 @@ async function ensureContentScript(id) {
   await chrome.scripting.executeScript({ target: { tabId: id }, files: ["content/content.js"] });
 }
 
+/**
+ * 操作のたびに、そのタブに content.js があることを確かめてから送る。
+ * ポップアップを開いたままタブが遷移・再読み込みされると、前の注入は消えている。
+ * content.js は二重注入を自分で弾くので、毎回入れても安全。
+ */
 async function sendToPage(message) {
-  if (tabId == null) {
-    const tab = await activeTab();
-    tabId = tab.id;
-    await ensureContentScript(tabId);
-  }
+  const tab = await activeTab();
+  tabId = tab.id;
+  await ensureContentScript(tabId);
   return chrome.tabs.sendMessage(tabId, message);
 }
 

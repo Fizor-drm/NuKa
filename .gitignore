@@ -3,3 +3,5 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
+tools/popup-preview.html
+tools/popup-preview-light.html

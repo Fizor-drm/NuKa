@@ -9,6 +9,7 @@
   --quiet: #6f675c;
   --seal: #9c2b2b;
   --seal-ink: #fff8f2;
+  --accent-text: #9c2b2b;
   --focus: #1c1915;
   font-family: "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
 }
@@ -35,7 +36,7 @@ body {
 }
 
 .mark span {
-  color: var(--seal);
+  color: var(--accent-text);
 }
 
 /* 朱は「ページを訳す」と、ブリッジが止まっているという一点だけ。状態の緑は使わない。 */
@@ -53,7 +54,7 @@ h1 {
   font-size: 12px;
 }
 
-.status[data-state="down"] { color: var(--seal); }
+.status[data-state="down"] { color: var(--accent-text); }
 
 form {
   display: flex;
@@ -162,7 +163,7 @@ button.primary {
 .count,
 .progress { color: var(--quiet); }
 
-.error { color: var(--seal); }
+.error { color: var(--accent-text); }
 
 @media (prefers-color-scheme: dark) {
   :root {
@@ -171,8 +172,10 @@ button.primary {
     --paper: #1b1916;
     --rule: #3a342c;
     --quiet: #b7ad9f;
-    --seal: #e06a5c;
-    --seal-ink: #1b1916;
+    /* 面は濃い朱のまま。明るい朱にすると、印ではなく汎用のアクセント色に見える。 */
+    --seal: #a8332b;
+    --seal-ink: #fff8f2;
+    --accent-text: #ffb3a7;
     --focus: #f3ecdf;
   }
 

@@ -9,6 +9,7 @@
 import importlib.util
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -156,14 +157,32 @@ class BridgeTest(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=5) as response:
             self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "chrome-extension://abcdef")
 
+    def test_rejects_foreign_origin_before_inference(self):
+        RECEIVED.clear()
         request = urllib.request.Request(
             f"{self.base}/v1/completions",
             data=json.dumps({"text": "hello", "target_lang": "en"}).encode(),
-            headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+            headers={"Content-Type": "text/plain", "Origin": "https://evil.example"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 403)
+        self.assertEqual(RECEIVED, [], "推論まで届かない")
+
+    def test_rejects_deeply_nested_json(self):
+        status, _, _ = self.post(b"[" * 5000)
+        self.assertEqual(status, 400)
+
+    def test_binds_ipv6_loopback(self):
+        try:
+            server = self.bridge_module.make_server("::1", 0)
+        except OSError as exc:  # IPv6 が無効な環境
+            self.skipTest(f"IPv6 unavailable: {exc}")
+        try:
+            self.assertEqual(server.address_family, socket.AF_INET6)
+        finally:
+            server.server_close()
 
     def test_requires_loopback_upstream(self):
         module = load_bridge("http://example.com:8090")

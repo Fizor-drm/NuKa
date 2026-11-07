@@ -13,9 +13,11 @@ const pairs = [
   ["light ink on paper", "#1c1915", "#f6f1e7"],
   ["light quiet on paper", "#6f675c", "#f6f1e7"],
   ["light seal-ink on seal", "#fff8f2", "#9c2b2b"],
-  ["light error(seal) on paper", "#9c2b2b", "#f6f1e7"],
+  ["light accent text on paper", "#9c2b2b", "#f6f1e7"],
   ["dark ink on paper", "#f3ecdf", "#1b1916"],
   ["dark quiet on paper", "#b7ad9f", "#1b1916"],
-  ["dark sheet ink on sheet", "#1b1916", "#e06a5c"],
+  ["dark seal-ink on seal", "#fff8f2", "#a8332b"],
+  ["dark accent text on paper", "#ffb3a7", "#1b1916"],
+  ["dark input text on input", "#f3ecdf", "#241f1b"],
 ];
 for (const [name, a, b] of pairs) console.log(`${name}: ${contrast(a, b)}:1`);

@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -77,6 +78,19 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "")
         return origin.startswith("chrome-extension://") or origin.startswith("extension://")
 
+    def _reject_foreign_origin(self) -> bool:
+        """Origin 付きで来たなら、拡張機能のものだけを受ける。
+
+        ブラウザから単純リクエスト (text/plain) で投げられても、ここで 403 にする。
+        Origin の無いものは curl などのローカル用途なので通す。
+        """
+        if not self.headers.get("Origin"):
+            return False
+        if self._origin_allowed():
+            return False
+        self._send(403, {"error": "このブリッジは拡張機能からのみ受けます。"})
+        return True
+
     def _reject_remote(self) -> bool:
         host = self.client_address[0]
         if is_loopback(host):
@@ -106,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        if self._reject_remote():
+        if self._reject_remote() or self._reject_foreign_origin():
             return
         if self.path.split("?", 1)[0] != "/health":
             self._send(404, {"error": "not found"})
@@ -118,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ready": ready, "upstream": UPSTREAM, "detail": detail[:300]})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self._reject_remote():
+        if self._reject_remote() or self._reject_foreign_origin():
             return
         if self.path.split("?", 1)[0] != "/v1/completions":
             self._send(404, {"error": "not found"})
@@ -170,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest("本文が UTF-8 として読めません。") from exc
         try:
             parsed = json.loads(text or "{}")
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise BadRequest("JSON として読めません。") from exc
         if not isinstance(parsed, dict):
             raise BadRequest("JSON オブジェクトを送ってください。")
@@ -209,12 +223,22 @@ class Handler(BaseHTTPRequestHandler):
         }
 
 
+class _IPv6Server(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def make_server(host: str, port: int) -> ThreadingHTTPServer:
+    """::1 のような IPv6 ループバックでも待ち受けられるよう、アドレスの種類で選ぶ。"""
+    server_class = _IPv6Server if ipaddress.ip_address(host).version == 6 else ThreadingHTTPServer
+    return server_class((host, port), Handler)
+
+
 def main() -> None:
     if not is_loopback(HOST):
-        sys.exit("PLAMO_BRIDGE_HOST は 127.0.0.1 だけを許可しています。")
+        sys.exit("PLAMO_BRIDGE_HOST はループバック (127.0.0.0/8 か ::1) だけを許可しています。")
     if not upstream_is_loopback():
         sys.exit("PLAMO_UPSTREAM は 127.0.0.1 のようなループバックだけを許可しています。")
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = make_server(HOST, PORT)
     print(f"bridge listening on http://{HOST}:{PORT} -> {UPSTREAM}", flush=True)
     server.serve_forever()
 

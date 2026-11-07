@@ -22,9 +22,10 @@ const ITEM = "<|plamo:item|>";
 
 export const STOP_TOKENS = [TAG, "<|plamo:bos|>"];
 
-// <|plamo:xxx|> をすべて対象にする。埋め込みで <|plamo:<|plamo:tag|>tag|> のような
-// 入れ子を書かれても、除去を繰り返せば平文だけが残る。
-const CONTROL_RE = /<\|plamo:[a-z0-9_]+\|>/gi;
+// <|plamo:xxx|> をすべて対象にする。予約トークンは <|plamo:reserved:0x106|> のように
+// コロンを含むので、名前の文字種を狭めない。埋め込みで <|plamo:<|plamo:tag|>tag|> の
+// ような入れ子を書かれても、除去を繰り返せば平文だけが残る。
+const CONTROL_RE = /<\|plamo:[a-z0-9_:.\-]+\|>/gi;
 
 export function stripControlTokens(value) {
   let text = String(value ?? "");
@@ -189,9 +190,9 @@ export function splitText(text, limit = 400) {
   });
 }
 
-/** 訳文を連結する。日本語・中国語・韓国語は語間の空白を入れない。 */
+/** 訳文を連結する。日本語と中国語は語間の空白を入れない。韓国語は分かち書きする。 */
 export function joinTranslations(parts, targetLang) {
-  const separator = ["ja", "zh-hans", "zh-hant", "ko"].includes(targetLang) ? "" : " ";
+  const separator = ["ja", "zh-hans", "zh-hant"].includes(targetLang) ? "" : " ";
   return parts.filter(Boolean).join(separator);
 }
 
