@@ -298,7 +298,8 @@ pub fn cancel_update_download(state: State<'_, AppState>) {
 #[tauri::command]
 pub fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let engine = state.engine.clone();
-    crate::updater::install(&app, &state.updates, &engine)
+    let settings = state.settings.clone();
+    crate::updater::install(&app, &state.updates, &engine, &settings)
 }
 
 // ---------------------------------------------------------------------------

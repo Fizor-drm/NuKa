@@ -20,7 +20,9 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
+use crate::engine::{Engine, EnginePhase};
 use crate::installer::DownloadManager;
+use crate::settings::SettingsStore;
 
 pub const REPO: &str = "Fizor-drm/NuKa";
 pub const RELEASES_URL: &str = "https://github.com/Fizor-drm/NuKa/releases/latest";
@@ -649,11 +651,18 @@ pub fn cancel(downloads: &DownloadManager) -> bool {
 // インストール
 // ---------------------------------------------------------------------------
 
+/// spawn 失敗時にエンジンを再起動すべきか。以前 ready だったときだけ復元する
+/// (元々止まっていたなら止まったままにする)。
+fn should_restore_engine(state: &EnginePhase) -> bool {
+    matches!(state, EnginePhase::Ready)
+}
+
 /// ダウンロード済みのインストーラーを切り離して起動し、少し待ってアプリを終了する。
 pub fn install(
     app: &AppHandle,
     state: &UpdateState,
-    engine: &crate::engine::Engine,
+    engine: &Engine,
+    settings: &SettingsStore,
 ) -> Result<(), String> {
     // take() で消費し、二重起動を防ぐ。起動に失敗したときだけ戻す。
     let downloaded = {
@@ -688,6 +697,8 @@ pub fn install(
     }
 
     // インストーラーとファイルロックが競合しないよう、先にエンジンを止める。
+    // spawn に失敗したときは、もともと動いていた場合だけ裏で復元する。
+    let engine_was_ready = should_restore_engine(&engine.status().state);
     engine.kill_now();
 
     let mut command = Command::new(&downloaded.path);
@@ -704,6 +715,13 @@ pub fn install(
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            if engine_was_ready {
+                let engine = engine.clone();
+                let settings = settings.get();
+                tauri::async_runtime::spawn(async move {
+                    engine.start(&settings).await;
+                });
+            }
             return restore(format!("インストーラーを起動できません: {error}"));
         }
     };
@@ -967,6 +985,14 @@ mod tests {
         assert!(verify_download(&path, 3, &format!("sha256:{digest}")).is_err());
         assert!(verify_download(&path, 3, "not-a-digest").is_err());
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn engine_is_restored_only_when_it_was_ready() {
+        assert!(should_restore_engine(&EnginePhase::Ready));
+        assert!(!should_restore_engine(&EnginePhase::Starting));
+        assert!(!should_restore_engine(&EnginePhase::Loading));
+        assert!(!should_restore_engine(&EnginePhase::Error));
     }
 
     #[test]
