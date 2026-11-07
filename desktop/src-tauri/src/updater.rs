@@ -472,12 +472,12 @@ fn remove_if_exists(path: &Path) {
 fn sha256_file(path: &Path) -> Result<String, LocalizedText> {
     let mut file = fs::File::open(path).map_err(|error| {
         eprintln!("SHA-256 の対象を開けません ({}): {error}", path.display());
-        text("updater.fileCheck", "SHA-256 を計算できませんでした。")
+        text("updater.hashFailed", "SHA-256 を計算できませんでした。")
     })?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).map_err(|error| {
         eprintln!("SHA-256 を計算できません ({}): {error}", path.display());
-        text("updater.fileCheck", "SHA-256 を計算できませんでした。")
+        text("updater.hashFailed", "SHA-256 を計算できませんでした。")
     })?;
     Ok(format!("{:x}", hasher.finalize()))
 }

@@ -234,16 +234,18 @@ fn check_cancelled(cancel: &AtomicBool) -> Result<(), DownloadError> {
 
 fn sha256_file(path: &Path) -> Result<String, DownloadError> {
     let mut file = fs::File::open(path).map_err(|error| {
-        failed(format!(
-            "SHA-256 の対象を開けません ({}): {error}",
-            path.display()
+        eprintln!("SHA-256 の対象を開けません ({}): {error}", path.display());
+        failed(text(
+            "installer.hashFailed",
+            "SHA-256 を計算できませんでした。",
         ))
     })?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).map_err(|error| {
-        failed(format!(
-            "SHA-256 を計算できません ({}): {error}",
-            path.display()
+        eprintln!("SHA-256 を計算できません ({}): {error}", path.display());
+        failed(text(
+            "installer.hashFailed",
+            "SHA-256 を計算できませんでした。",
         ))
     })?;
     Ok(format!("{:x}", hasher.finalize()))
@@ -589,24 +591,24 @@ async fn install_runtime_inner(
     let staging_dir = runtime_root.join("llama.staging");
     let downloads_dir = runtime_root.join(".downloads");
     fs::create_dir_all(&runtime_root).map_err(|error| {
-        failed(format!(
-            "保存先を作れません ({}): {error}",
-            runtime_root.display()
-        ))
+        failed(
+            text("installer.savePath", format!("保存先を作れません: {error}"))
+                .param("detail", error),
+        )
     })?;
     // 前回の失敗で残った staging は捨てる。
     let _ = fs::remove_dir_all(&staging_dir);
     fs::create_dir_all(&staging_dir).map_err(|error| {
-        failed(format!(
-            "保存先を作れません ({}): {error}",
-            staging_dir.display()
-        ))
+        failed(
+            text("installer.savePath", format!("保存先を作れません: {error}"))
+                .param("detail", error),
+        )
     })?;
     fs::create_dir_all(&downloads_dir).map_err(|error| {
-        failed(format!(
-            "保存先を作れません ({}): {error}",
-            downloads_dir.display()
-        ))
+        failed(
+            text("installer.savePath", format!("保存先を作れません: {error}"))
+                .param("detail", error),
+        )
     })?;
 
     let llama_zip = downloads_dir.join(LLAMA_ZIP.file_name);
@@ -702,17 +704,23 @@ async fn install_runtime_inner(
 fn swap_runtime_dir(staging: &Path, target: &Path) -> Result<(), DownloadError> {
     if target.exists() {
         fs::remove_dir_all(target).map_err(|error| {
-            failed(format!(
-                "既存のランタイムを置き換えられません ({}): {error}",
-                target.display()
-            ))
+            failed(
+                text(
+                    "installer.swapRemove",
+                    format!("既存のランタイムを置き換えられません: {error}"),
+                )
+                .param("detail", error),
+            )
         })?;
     }
     fs::rename(staging, target).map_err(|error| {
-        failed(format!(
-            "ランタイムを配置できません ({}): {error}",
-            target.display()
-        ))
+        failed(
+            text(
+                "installer.swapRename",
+                format!("ランタイムを配置できません: {error}"),
+            )
+            .param("detail", error),
+        )
     })
 }
 
@@ -1585,6 +1593,16 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
+    #[test]
+    fn extract_zip_reports_a_localized_error_key() {
+        let directory = temp_dir("zip-error");
+        let bad = directory.join("bad.zip");
+        fs::write(&bad, b"this is not a zip").unwrap();
+        let error = extract_zip(&bad, &directory).expect_err("壊れた zip は失敗する");
+        assert_eq!(error.message().key, "installer.zipRead");
+        assert!(!error.message().fallback.is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
     #[test]
     fn swap_runtime_dir_replaces_the_target() {
         let directory = temp_dir("runtime-swap");

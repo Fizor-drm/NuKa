@@ -1165,44 +1165,6 @@ function renderSettings(): void {
   modelsDirPickEl.disabled = state.download !== null;
   autoUpdateCheckEl.checked = state.autoUpdateCheck;
   settingsVersionEl.textContent = `v${APP_VERSION}`;
-  for (const item of settingsNavItems) {
-    item.addEventListener("click", () => {
-      const section = item.dataset["section"] ?? "";
-      if (isSettingsSection(section)) {
-        selectSettingsSection(section);
-      }
-    });
-  }
-
-  settingsNavEl.addEventListener("keydown", (event) => {
-    const currentIndex = settingsNavItems.findIndex(
-      (item) => item.getAttribute("aria-current") === "true",
-    );
-    let nextIndex: number;
-    switch (event.key) {
-      case "ArrowDown":
-        nextIndex = (currentIndex + 1) % settingsNavItems.length;
-        break;
-      case "ArrowUp":
-        nextIndex = (currentIndex - 1 + settingsNavItems.length) % settingsNavItems.length;
-        break;
-      case "Home":
-        nextIndex = 0;
-        break;
-      case "End":
-        nextIndex = settingsNavItems.length - 1;
-        break;
-      default:
-        return;
-    }
-    event.preventDefault();
-    const next = settingsNavItems[nextIndex];
-    const section = next?.dataset["section"] ?? "";
-    if (isSettingsSection(section)) {
-      selectSettingsSection(section, true);
-    }
-  });
-
   for (const input of uiLanguageInputs) {
     input.checked = input.value === state.uiLanguage;
   }

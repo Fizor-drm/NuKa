@@ -552,6 +552,16 @@ pub(crate) fn resolve_runtime_path(
 /// モデルは管理対象 → settings.json の model_path → 環境変数 → exe の位置からの探索。
 /// ランタイムは管理済み → settings.json の server_path → 既定の保存先 → 環境変数 → 探索。
 /// 探索はデバッグ実行では上位 6 階層まで、リリースでは隣と 1 つ上だけ。
+fn both_not_installed(model_error: &LocalizedText) -> LocalizedText {
+    text(
+        "engine.bothNotInstalled",
+        format!(
+            "ランタイムとモデルが未導入です。設定でインストールしてください。({})",
+            model_error.fallback
+        ),
+    )
+    .param("detail", &model_error.fallback)
+}
 fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, LocalizedText> {
     let search_root = exe_directory();
     let default_server = default_runtime_server_path(app);
@@ -561,13 +571,7 @@ fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, Lo
 
     match (model, server) {
         (Ok(model), Ok(server)) => Ok(ServerPaths { model, server }),
-        (Err(model_error), Err(_)) => Err(text(
-            "engine.bothNotInstalled",
-            format!(
-                "ランタイムとモデルが未導入です。設定でインストールしてください。({})",
-                model_error.fallback
-            ),
-        )),
+        (Err(model_error), Err(_)) => Err(both_not_installed(&model_error)),
         (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
@@ -875,6 +879,13 @@ mod tests {
         drop(listener);
     }
 
+    #[test]
+    fn both_not_installed_carries_detail_param() {
+        let model = text("engine.modelNotInstalled", "モデルが未導入です。");
+        let combined = both_not_installed(&model);
+        assert_eq!(combined.key, "engine.bothNotInstalled");
+        assert_eq!(combined.params.get("detail"), Some(&model.fallback));
+    }
     #[test]
     fn status_matches_the_event_contract() {
         let ready = serde_json::to_value(EngineStatus::new(EnginePhase::Ready, None)).unwrap();

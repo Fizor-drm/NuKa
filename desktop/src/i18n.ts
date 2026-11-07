@@ -240,6 +240,7 @@ const ja: Dict = {
   "installer.verifyInfo": "配布ファイルの検証に失敗しました: {detail}",
   "installer.partSizeMismatch": "ダウンロードの書き込み量が一致しません ({actual} / {expected} バイト)。",
   "installer.hashMismatch": "配布ファイルの SHA-256 が一致しません: {file}",
+  "installer.hashFailed": "SHA-256 を計算できませんでした。",
   "installer.archiveSizeMismatch": "配布ファイルのサイズが一致しません ({actual} / {expected} バイト): {file}",
   "installer.archiveMissing": "配布ファイルが見つかりません: {file}",
   "installer.runtimeSizeExpected": "配布元のサイズが想定と違います ({actual} / {expected} バイト) {url}",
@@ -247,6 +248,9 @@ const ja: Dict = {
   "installer.modelFileMissing": "モデルファイルが見つかりません。再インストールしてください: {detail}",
   "installer.deleteNameMismatch": "削除対象のファイル名が一致しません: {detail}",
 
+  "installer.remoteSizeUnknown": "配布元のサイズを確認できませんでした。",
+  "installer.dataTooLarge": "配布元のデータが想定より大きいため中止しました ({actual} / {expected} バイト)。",
+  "installer.registerFailed": "モデルの登録に失敗しました: {detail}",
   "installer.modelExistingMismatchSimple":
     "サイズの合わないファイルが既にあります: {detail}",
 
@@ -265,6 +269,7 @@ const ja: Dict = {
   "updater.digestMissing": "更新ファイルの検証情報が取得できませんでした。",
   "updater.versionCompare": "バージョンを比較できませんでした (現在 {current} / 最新 {latest})。",
   "updater.hashMismatch": "更新ファイルの SHA-256 が一致しません。",
+  "updater.hashFailed": "SHA-256 を計算できませんでした。",
   "updater.digestInvalid": "更新ファイルの検証情報が不正です。",
   "updater.sizeMismatch": "更新ファイルのサイズが一致しません ({actual} / {expected} バイト)。",
   "updater.downloadClient": "ダウンロード用クライアントを作れません: {detail}",
@@ -514,6 +519,7 @@ const en: Dict = {
   "installer.verifyInfo": "Could not verify the downloaded file: {detail}",
   "installer.partSizeMismatch": "The written size does not match ({actual} / {expected} bytes).",
   "installer.hashMismatch": "SHA-256 mismatch for {file}",
+  "installer.hashFailed": "Could not compute SHA-256.",
   "installer.archiveSizeMismatch": "Size mismatch for {file} ({actual} / {expected} bytes)",
   "installer.archiveMissing": "Downloaded file not found: {file}",
   "installer.runtimeSizeExpected": "The server size does not match ({actual} / {expected} bytes) {url}",
@@ -541,6 +547,7 @@ const en: Dict = {
   "updater.versionCompare":
     "Could not compare versions (current {current} / latest {latest}).",
   "updater.hashMismatch": "The update file's SHA-256 does not match.",
+  "updater.hashFailed": "Could not compute SHA-256.",
   "updater.digestInvalid": "The update file verification information is invalid.",
   "updater.sizeMismatch": "The update file size does not match ({actual} / {expected} bytes).",
   "updater.downloadClient": "Could not create the download client: {detail}",
@@ -784,6 +791,7 @@ const zh: Dict = {
   "installer.verifyInfo": "下载文件校验失败：{detail}",
   "installer.partSizeMismatch": "写入大小不一致（{actual} / {expected} 字节）。",
   "installer.hashMismatch": "文件 {file} 的 SHA-256 不一致。",
+  "installer.hashFailed": "无法计算 SHA-256。",
   "installer.archiveSizeMismatch": "文件 {file} 大小不一致（{actual} / {expected} 字节）。",
   "installer.archiveMissing": "找不到下载文件：{file}",
   "installer.runtimeSizeExpected": "服务器返回的大小与预期不符（{actual} / {expected} 字节）{url}",
@@ -810,6 +818,7 @@ const zh: Dict = {
   "updater.digestMissing": "无法获取更新文件的校验信息。",
   "updater.versionCompare": "无法比较版本（当前 {current} / 最新 {latest}）。",
   "updater.hashMismatch": "更新文件的 SHA-256 不一致。",
+  "updater.hashFailed": "无法计算 SHA-256。",
   "updater.digestInvalid": "更新文件的校验信息无效。",
   "updater.sizeMismatch": "更新文件大小不一致（{actual} / {expected} 字节）。",
   "updater.downloadClient": "无法创建下载客户端：{detail}",
