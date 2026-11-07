@@ -30,6 +30,7 @@ export interface Settings {
   context_tokens: number;
   theme: ThemeSetting;
   auto_translate: boolean;
+  auto_update_check: boolean;
   models_dir: string | null;
   installed_runtime: InstalledRuntime | null;
   installed_models: InstalledModel[];
@@ -41,6 +42,7 @@ export interface SettingsPatch {
   context_tokens?: number;
   theme?: ThemeSetting;
   auto_translate?: boolean;
+  auto_update_check?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,39 @@ export interface DownloadErrorPayload {
   message: string;
 }
 
+// ---------------------------------------------------------------------------
+// アップデート
+// ---------------------------------------------------------------------------
+
+export interface UpdateAsset {
+  name: string;
+  size: number;
+  url: string;
+  digest?: string;
+}
+
+export interface UpdateCheck {
+  current: string;
+  latest?: string;
+  available: boolean;
+  asset?: UpdateAsset;
+  error?: string;
+}
+
+export interface UpdateProgressPayload {
+  downloaded: number;
+  total: number;
+}
+
+export interface UpdateDonePayload {
+  path: string;
+  version: string;
+}
+
+export interface UpdateErrorPayload {
+  message: string;
+}
+
 export interface GlossaryPair {
   source: string;
   target: string;
@@ -167,6 +202,10 @@ export const ipc = {
   setActiveModel: (file: string): Promise<Settings> =>
     invoke<Settings>("set_active_model", { file }),
   setModelsDir: (path: string): Promise<Settings> => invoke<Settings>("set_models_dir", { path }),
+  checkUpdate: (): Promise<UpdateCheck> => invoke<UpdateCheck>("check_update"),
+  downloadUpdate: (): Promise<void> => invoke<void>("download_update"),
+  cancelUpdateDownload: (): Promise<void> => invoke<void>("cancel_update_download"),
+  installUpdate: (): Promise<void> => invoke<void>("install_update"),
 };
 
 function subscribe<T>(event: string, handler: (payload: T) => void): void {
@@ -205,4 +244,16 @@ export function onDownloadDone(handler: (payload: DownloadDonePayload) => void):
 
 export function onDownloadError(handler: (payload: DownloadErrorPayload) => void): void {
   subscribe("download:error", handler);
+}
+
+export function onUpdateProgress(handler: (payload: UpdateProgressPayload) => void): void {
+  subscribe("update:progress", handler);
+}
+
+export function onUpdateDone(handler: (payload: UpdateDonePayload) => void): void {
+  subscribe("update:done", handler);
+}
+
+export function onUpdateError(handler: (payload: UpdateErrorPayload) => void): void {
+  subscribe("update:error", handler);
 }

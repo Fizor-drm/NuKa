@@ -76,6 +76,68 @@
               <path d="m17.7 6.3 1.4-1.4" />
             </svg>
           </button>
+          <div class="update-control">
+            <button
+              type="button"
+              class="icon-button update-button"
+              id="update-toggle"
+              aria-haspopup="dialog"
+              aria-expanded="false"
+              aria-controls="update-popover"
+              title="アップデートを確認"
+              aria-label="アップデートを確認"
+            >
+              <svg
+                class="icon"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path d="M12 3v12" />
+                <path d="m7 10 5 5 5-5" />
+                <path d="M4 19h16" />
+              </svg>
+              <span class="update-dot" id="update-dot" hidden aria-hidden="true"></span>
+            </button>
+            <div
+              class="update-popover"
+              id="update-popover"
+              role="dialog"
+              aria-label="アップデート"
+              hidden
+            >
+              <div class="update-head">
+                <span class="update-title">アップデート</span>
+                <span class="update-current" id="update-current">v1.1.0</span>
+              </div>
+              <p class="update-status" id="update-status" role="status" aria-live="polite">
+                アップデートを確認します。
+              </p>
+              <div class="download-row" id="update-download" hidden>
+                <span class="download-bar" aria-hidden="true"
+                  ><span class="download-fill" id="update-bar"></span
+                ></span>
+                <span class="download-text" id="update-progress-text"></span>
+                <button type="button" class="secondary-button" id="update-cancel">取り消し</button>
+              </div>
+              <div class="update-actions" id="update-actions" hidden>
+                <button type="button" class="primary-button" id="update-install">更新する</button>
+                <button type="button" class="secondary-button" id="update-retry" hidden>
+                  再試行
+                </button>
+                <button type="button" class="link-button" id="update-release" hidden>
+                  リリースページを開く
+                </button>
+              </div>
+            </div>
+          </div>
           <button
             type="button"
             class="icon-button"
@@ -414,7 +476,7 @@
                 戻る
               </button>
               <h1 class="settings-title">設定</h1>
-              <span class="settings-version">NuKa 1.0.0</span>
+              <span class="settings-version">NuKa 1.1.0</span>
             </div>
 
             <section class="settings-section" aria-labelledby="runtime-heading">
@@ -459,6 +521,19 @@
                 変更は今後のダウンロードから適用されます。インストール済みのモデルは移動されません。
               </p>
               <div class="model-list" id="model-list"></div>
+            </section>
+
+            <section class="settings-section" aria-labelledby="update-heading">
+              <div class="settings-section-head">
+                <h2 class="settings-heading" id="update-heading">アップデート</h2>
+              </div>
+              <label class="settings-check">
+                <input type="checkbox" id="auto-update-check" />
+                <span>起動時にアップデートを確認 (GitHub にアクセスします)</span>
+              </label>
+              <p class="settings-note">
+                確認は起動時に GitHub へ 1 回アクセスするだけです。IP アドレスは GitHub に伝わります。
+              </p>
             </section>
 
             <section class="settings-section" aria-labelledby="license-heading">

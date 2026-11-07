@@ -11,6 +11,7 @@ pub mod engine;
 pub mod installer;
 pub mod prompt;
 pub mod settings;
+pub mod updater;
 
 use tauri::Manager;
 
@@ -18,6 +19,7 @@ use crate::commands::JobManager;
 use crate::engine::Engine;
 use crate::installer::DownloadManager;
 use crate::settings::SettingsStore;
+use crate::updater::UpdateState;
 
 /// Tauri が管理する共有状態。
 pub struct AppState {
@@ -25,6 +27,7 @@ pub struct AppState {
     pub settings: SettingsStore,
     pub jobs: JobManager,
     pub downloads: DownloadManager,
+    pub updates: UpdateState,
 }
 
 pub fn run() {
@@ -47,11 +50,14 @@ pub fn run() {
 
             let engine = Engine::new(app.handle().clone());
             let initial = settings.get();
+            // 中断されたアップデートの残骸を起動時に掃除する。
+            updater::clean_cache(app.handle());
             app.manage(AppState {
                 engine: engine.clone(),
                 settings,
                 jobs: JobManager::new(),
                 downloads: DownloadManager::new(),
+                updates: UpdateState::new(),
             });
 
             // 起動と同時に llama-server を起こす。準備できるまで UI には starting が見える。
@@ -76,6 +82,10 @@ pub fn run() {
             commands::delete_model,
             commands::set_active_model,
             commands::set_models_dir,
+            commands::check_update,
+            commands::download_update,
+            commands::cancel_update_download,
+            commands::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("Tauri アプリを構築できません");

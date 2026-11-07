@@ -18,6 +18,9 @@ import {
   onTranslationDone,
   onTranslationError,
   onTranslationProgress,
+  onUpdateDone,
+  onUpdateError,
+  onUpdateProgress,
   type CatalogEntry,
   type DetectedLanguage,
   type DownloadKind,
@@ -28,6 +31,10 @@ import {
   type SetupState,
   type ThemeSetting,
   type TranslateRequest,
+  type UpdateCheck,
+  type UpdateDonePayload,
+  type UpdateErrorPayload,
+  type UpdateProgressPayload,
 } from "./ipc";
 import { LanguagePicker } from "./language-picker";
 import { OutputPane, type OutputActionKind, type OutputView } from "./output";
@@ -55,6 +62,23 @@ interface DownloadState {
   id: string;
   downloaded: number;
   total: number;
+}
+
+type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "latest"
+  | "available"
+  | "downloading"
+  | "ready"
+  | "installing"
+  | "error";
+
+interface UpdateUiState {
+  phase: UpdatePhase;
+  check: UpdateCheck | null;
+  progress: { downloaded: number; total: number } | null;
+  message: string;
 }
 
 type JobEvent =
@@ -88,6 +112,8 @@ interface AppState {
   catalog: CatalogEntry[];
   download: DownloadState | null;
   modelsDirSetting: string | null;
+  autoUpdateCheck: boolean;
+  update: UpdateUiState;
 }
 
 const state: AppState = {
@@ -110,6 +136,8 @@ const state: AppState = {
   catalog: [],
   download: null,
   modelsDirSetting: null,
+  autoUpdateCheck: true,
+  update: { phase: "idle", check: null, progress: null, message: "" },
 };
 
 function byId<T extends HTMLElement>(id: string): T {
@@ -168,6 +196,25 @@ const modelsDirCustomEl = byId<HTMLInputElement>("models-dir-custom");
 const modelsDirPickEl = byId<HTMLButtonElement>("models-dir-pick");
 const licenseLinkEl = byId<HTMLButtonElement>("license-link");
 const llamaLinkEl = byId<HTMLButtonElement>("llama-link");
+
+const updateToggleEl = byId<HTMLButtonElement>("update-toggle");
+const updatePopoverEl = byId<HTMLDivElement>("update-popover");
+const updateDotEl = byId<HTMLSpanElement>("update-dot");
+const updateStatusEl = byId<HTMLParagraphElement>("update-status");
+const updateCurrentEl = byId<HTMLSpanElement>("update-current");
+const updateActionsEl = byId<HTMLDivElement>("update-actions");
+const updateInstallEl = byId<HTMLButtonElement>("update-install");
+const updateRetryEl = byId<HTMLButtonElement>("update-retry");
+const updateReleaseEl = byId<HTMLButtonElement>("update-release");
+const updateDownloadEl = byId<HTMLDivElement>("update-download");
+const updateBarEl = byId<HTMLSpanElement>("update-bar");
+const updateProgressTextEl = byId<HTMLSpanElement>("update-progress-text");
+const updateCancelEl = byId<HTMLButtonElement>("update-cancel");
+const autoUpdateCheckEl = byId<HTMLInputElement>("auto-update-check");
+const updateControlEl = updateToggleEl.parentElement;
+
+const APP_VERSION = "1.1.0";
+const RELEASES_PAGE_URL = "https://github.com/Fizor-drm/NuKa/releases/latest";
 
 const LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-en";
 const LLAMA_URL = "https://github.com/ggml-org/llama.cpp";
@@ -761,6 +808,8 @@ async function loadSettings(): Promise<void> {
       state.theme = settings.theme;
     }
     state.autoTranslate = settings.auto_translate;
+    state.autoUpdateCheck = settings.auto_update_check;
+    autoUpdateCheckEl.checked = state.autoUpdateCheck;
     state.modelsDirSetting = settings.models_dir;
   } catch {
     // 設定が読めなくても既定値で動かす
@@ -993,6 +1042,204 @@ function renderSettings(): void {
   modelsDirDefaultEl.checked = !custom;
   modelsDirCustomEl.checked = custom;
   modelsDirPickEl.disabled = state.download !== null;
+  autoUpdateCheckEl.checked = state.autoUpdateCheck;
+}
+
+// ---------------------------------------------------------------------------
+// アップデート
+// ---------------------------------------------------------------------------
+
+function setUpdateOpen(open: boolean): void {
+  updatePopoverEl.hidden = !open;
+  updateToggleEl.setAttribute("aria-expanded", String(open));
+  if (open) {
+    renderUpdate();
+  }
+}
+
+function renderUpdate(): void {
+  const update = state.update;
+  const check = update.check;
+  const latest = check?.latest !== undefined ? `v${check.latest}` : "";
+  updateCurrentEl.textContent = `v${check?.current ?? APP_VERSION}`;
+  updateToggleEl.classList.toggle("is-checking", update.phase === "checking");
+  updateDotEl.hidden = update.phase !== "available" && update.phase !== "ready";
+
+  let message: string;
+  switch (update.phase) {
+    case "idle":
+      message = "アップデートを確認します。";
+      break;
+    case "checking":
+      message = "最新リリースを確認しています…";
+      break;
+    case "latest":
+      message = check?.latest !== undefined ? `最新です (${latest})` : "最新です。";
+      break;
+    case "available": {
+      const size = check?.asset !== undefined ? ` (${formatBytes(check.asset.size)})` : "";
+      message = `${latest} に更新できます${size}`;
+      break;
+    }
+    case "downloading":
+      message = "ダウンロードしています…";
+      break;
+    case "ready":
+      message = "インストーラーを起動して NuKa を終了します…";
+      break;
+    case "installing":
+      message = "インストーラーを起動しています…";
+      break;
+    case "error":
+      message = update.message !== "" ? update.message : "更新を確認できませんでした。";
+      break;
+  }
+  updateStatusEl.textContent = message;
+
+  const downloading = update.phase === "downloading";
+  updateDownloadEl.hidden = !downloading;
+  if (downloading && update.progress !== null) {
+    const { downloaded, total } = update.progress;
+    const ratio = total > 0 ? Math.min(1, downloaded / total) : 0;
+    updateBarEl.style.width = `${Math.round(ratio * 100)}%`;
+    updateProgressTextEl.textContent =
+      total > 0 ? `${formatBytes(downloaded)} / ${formatBytes(total)}` : formatBytes(downloaded);
+  }
+
+  updateActionsEl.hidden = update.phase !== "available" && update.phase !== "error";
+  updateInstallEl.hidden = update.phase !== "available";
+  updateRetryEl.hidden = update.phase !== "error";
+  updateReleaseEl.hidden = update.phase !== "available";
+}
+
+async function checkForUpdates(manual: boolean): Promise<void> {
+  if (
+    state.update.phase === "checking" ||
+    state.update.phase === "downloading" ||
+    state.update.phase === "installing"
+  ) {
+    return;
+  }
+  state.update.phase = "checking";
+  state.update.progress = null;
+  state.update.message = "";
+  renderUpdate();
+  try {
+    const check = await ipc.checkUpdate();
+    state.update.check = check;
+    if (check.error !== undefined) {
+      state.update.phase = "error";
+      state.update.message = check.error;
+    } else if (check.available) {
+      state.update.phase = "available";
+    } else {
+      state.update.phase = "latest";
+    }
+  } catch (error) {
+    state.update.phase = "error";
+    state.update.message = `更新を確認できませんでした: ${describeError(error)}`;
+  }
+  renderUpdate();
+  if (manual && state.update.phase === "error") {
+    showAppStatus(state.update.message);
+  }
+}
+
+async function startUpdateDownload(): Promise<void> {
+  const asset = state.update.check?.asset;
+  if (state.update.phase !== "available" || asset === undefined) {
+    return;
+  }
+  state.update.phase = "downloading";
+  state.update.progress = { downloaded: 0, total: asset.size };
+  state.update.message = "";
+  renderUpdate();
+  try {
+    await ipc.downloadUpdate();
+  } catch (error) {
+    if (state.update.phase === "downloading") {
+      state.update.phase = "error";
+      state.update.progress = null;
+      state.update.message = `ダウンロードを開始できません: ${describeError(error)}`;
+      renderUpdate();
+    }
+  }
+}
+
+async function cancelUpdateDownload(): Promise<void> {
+  try {
+    await ipc.cancelUpdateDownload();
+  } catch (error) {
+    showAppStatus(`ダウンロードを取り消せません: ${describeError(error)}`);
+  }
+}
+
+async function installDownloadedUpdate(): Promise<void> {
+  if (state.update.phase !== "ready") {
+    return;
+  }
+  state.update.phase = "installing";
+  renderUpdate();
+  try {
+    await ipc.installUpdate();
+  } catch (error) {
+    state.update.phase = "error";
+    state.update.message = `インストーラーを起動できません: ${describeError(error)}`;
+    renderUpdate();
+  }
+}
+
+function handleUpdateProgress(payload: UpdateProgressPayload): void {
+  if (state.update.phase !== "downloading") {
+    return;
+  }
+  state.update.progress = {
+    downloaded: payload.downloaded,
+    total: payload.total > 0 ? payload.total : (state.update.progress?.total ?? 0),
+  };
+  renderUpdate();
+}
+
+function handleUpdateDone(payload: UpdateDonePayload): void {
+  state.update.phase = "ready";
+  state.update.progress = null;
+  state.update.message = "";
+  renderUpdate();
+  showAppStatus(`v${payload.version} の準備ができました。`);
+  void installDownloadedUpdate();
+}
+
+function handleUpdateError(payload: UpdateErrorPayload): void {
+  if (state.update.phase === "downloading" && payload.message === "ダウンロードを中止しました。") {
+    state.update.phase = "available";
+    state.update.progress = null;
+    renderUpdate();
+    return;
+  }
+  state.update.phase = "error";
+  state.update.progress = null;
+  state.update.message = payload.message;
+  renderUpdate();
+}
+
+function toggleUpdatePopover(): void {
+  const open = updatePopoverEl.hidden;
+  setUpdateOpen(open);
+  if (open && state.update.phase === "idle") {
+    void checkForUpdates(true);
+  }
+}
+
+async function handleAutoUpdateCheckChange(): Promise<void> {
+  const desired = autoUpdateCheckEl.checked;
+  state.autoUpdateCheck = desired;
+  try {
+    await ipc.setSettings({ auto_update_check: desired });
+  } catch (error) {
+    state.autoUpdateCheck = !desired;
+    autoUpdateCheckEl.checked = !desired;
+    showAppStatus(`設定を保存できません: ${describeError(error)}`);
+  }
 }
 
 async function startRuntimeInstall(): Promise<void> {
@@ -1198,6 +1445,18 @@ function bindDownloadEvents(): void {
   });
 }
 
+function bindUpdateEvents(): void {
+  onUpdateProgress((payload) => {
+    handleUpdateProgress(payload);
+  });
+  onUpdateDone((payload) => {
+    handleUpdateDone(payload);
+  });
+  onUpdateError((payload) => {
+    handleUpdateError(payload);
+  });
+}
+
 function bindUi(): void {
   sourceInputEl.addEventListener("input", () => {
     renderCharCount();
@@ -1285,20 +1544,70 @@ function bindUi(): void {
   llamaLinkEl.addEventListener("click", () => {
     void openUrl(LLAMA_URL);
   });
+
+  updateToggleEl.addEventListener("click", () => {
+    toggleUpdatePopover();
+  });
+
+  updateInstallEl.addEventListener("click", () => {
+    void startUpdateDownload();
+  });
+
+  updateRetryEl.addEventListener("click", () => {
+    void checkForUpdates(true);
+  });
+
+  updateReleaseEl.addEventListener("click", () => {
+    void openUrl(RELEASES_PAGE_URL);
+  });
+
+  updateCancelEl.addEventListener("click", () => {
+    void cancelUpdateDownload();
+  });
+
+  autoUpdateCheckEl.addEventListener("change", () => {
+    void handleAutoUpdateCheckChange();
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    if (updatePopoverEl.hidden) {
+      return;
+    }
+    const target = event.target;
+    if (!(target instanceof Node)) {
+      return;
+    }
+    if (updateControlEl?.contains(target) === true) {
+      return;
+    }
+    setUpdateOpen(false);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !updatePopoverEl.hidden) {
+      setUpdateOpen(false);
+      updateToggleEl.focus();
+    }
+  });
 }
 
 async function bootstrap(): Promise<void> {
   bindTranslationEvents();
   bindDownloadEvents();
+  bindUpdateEvents();
   bindUi();
   glossaryEditor.addRow();
   applyTheme(state.theme);
   renderThemeButton(themeToggleEl, state.theme);
   renderAll();
+  renderUpdate();
   await loadSettings();
   await refreshEngineStatus();
   await refreshCatalog();
   await refreshSetup();
+  if (state.autoUpdateCheck) {
+    void checkForUpdates(false);
+  }
 }
 
 void bootstrap();

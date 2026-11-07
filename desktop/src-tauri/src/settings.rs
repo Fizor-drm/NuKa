@@ -67,6 +67,8 @@ pub struct Settings {
     pub context_tokens: u32,
     pub theme: Theme,
     pub auto_translate: bool,
+    /// 起動時に GitHub の最新リリースを確認するか (既定 true)。
+    pub auto_update_check: bool,
     /// モデルの保存先。null なら `{app_local_data_dir}/models`。
     /// IPC では設定画面のフォルダ選択からだけ変更できる。
     pub models_dir: Option<String>,
@@ -87,6 +89,7 @@ impl Default for Settings {
             context_tokens: 8192,
             theme: Theme::Light,
             auto_translate: true,
+            auto_update_check: true,
             models_dir: None,
             installed_runtime: None,
             installed_models: Vec::new(),
@@ -105,6 +108,7 @@ pub struct SettingsPatch {
     pub context_tokens: Option<u32>,
     pub theme: Option<Theme>,
     pub auto_translate: Option<bool>,
+    pub auto_update_check: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -166,6 +170,9 @@ impl SettingsStore {
             }
             if let Some(value) = patch.auto_translate {
                 settings.auto_translate = value;
+            }
+            if let Some(value) = patch.auto_update_check {
+                settings.auto_update_check = value;
             }
             Ok(())
         })
@@ -332,6 +339,7 @@ mod tests {
         assert_eq!(settings.context_tokens, 8192);
         assert_eq!(settings.theme, Theme::Light);
         assert!(settings.auto_translate);
+        assert!(settings.auto_update_check);
         assert!(settings.models_dir.is_none());
         assert!(settings.installed_runtime.is_none());
         assert!(settings.installed_models.is_empty());
@@ -494,12 +502,14 @@ mod tests {
                 context_tokens: Some(4096),
                 theme: Some(Theme::Dark),
                 auto_translate: Some(false),
+                auto_update_check: Some(false),
             })
             .expect("設定を保存できる");
         assert_eq!(updated.gpu_layers, 20);
         assert_eq!(updated.context_tokens, 4096);
         assert_eq!(updated.theme, Theme::Dark);
         assert!(!updated.auto_translate);
+        assert!(!updated.auto_update_check);
 
         let reloaded = SettingsStore::new(path).get();
         assert_eq!(reloaded, updated);

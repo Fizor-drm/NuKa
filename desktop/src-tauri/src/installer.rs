@@ -135,7 +135,7 @@ impl DownloadManager {
     }
 
     /// 新しいダウンロードを始める。既に走っていればエラー。
-    fn begin(&self, id: &str) -> Result<Arc<AtomicBool>, String> {
+    pub(crate) fn begin(&self, id: &str) -> Result<Arc<AtomicBool>, String> {
         let mut slot = self.lock();
         if let Some(active) = slot.as_ref() {
             return Err(format!(
@@ -151,7 +151,7 @@ impl DownloadManager {
         Ok(cancel)
     }
 
-    fn finish(&self, id: &str) {
+    pub(crate) fn finish(&self, id: &str) {
         let mut slot = self.lock();
         if slot.as_ref().is_some_and(|active| active.id == id) {
             *slot = None;

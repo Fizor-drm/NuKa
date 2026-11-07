@@ -137,6 +137,8 @@ button {
 /* ---------- ヘッダー ---------- */
 
 .topbar {
+  position: relative;
+  z-index: 20;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1117,4 +1119,112 @@ button {
 .icon-text-button:hover {
   background: var(--hover);
   color: var(--ink);
+}
+
+/* ---------- アップデート ---------- */
+
+.update-control {
+  position: relative;
+  display: inline-flex;
+}
+
+.update-button {
+  position: relative;
+}
+
+.update-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.update-button.is-checking .icon {
+  animation: update-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes update-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.update-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 320px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+}
+
+.update-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.update-current {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.update-status {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-popover .download-row {
+  margin: 0;
+}
+
+.settings-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.settings-check input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .update-button.is-checking .icon {
+    animation: none;
+  }
 }

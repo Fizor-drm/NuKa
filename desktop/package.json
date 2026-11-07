@@ -1,7 +1,7 @@
 {
   "name": "nuka",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "NuKa: 手元の llama.cpp で訳す翻訳デスクトップアプリ (Powered by PLaMo 3 Translate)",
   "scripts": {

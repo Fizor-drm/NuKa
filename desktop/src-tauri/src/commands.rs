@@ -268,6 +268,39 @@ pub fn set_models_dir(state: State<'_, AppState>, path: String) -> Result<Settin
 }
 
 // ---------------------------------------------------------------------------
+// アップデート
+// ---------------------------------------------------------------------------
+
+/// GitHub の最新リリースを確認する。失敗も `error` フィールドで返す。
+#[tauri::command]
+pub async fn check_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::updater::UpdateCheck, String> {
+    let updates = state.updates.clone();
+    Ok(crate::updater::check(&app, &updates).await)
+}
+
+/// 確認済みの更新インストーラーをダウンロードする。
+#[tauri::command]
+pub async fn download_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let updates = state.updates.clone();
+    let downloads = state.downloads.clone();
+    crate::updater::download(&app, &updates, &downloads).await
+}
+
+#[tauri::command]
+pub fn cancel_update_download(state: State<'_, AppState>) {
+    let _ = crate::updater::cancel(&state.downloads);
+}
+
+/// ダウンロード済みのインストーラーを起動し、このアプリを終了する。
+#[tauri::command]
+pub fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    crate::updater::install(&app, &state.updates)
+}
+
+// ---------------------------------------------------------------------------
 // ジョブの実行
 // ---------------------------------------------------------------------------
 
