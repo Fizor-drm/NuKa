@@ -120,7 +120,7 @@ export interface UpdateAsset {
   name: string;
   size: number;
   url: string;
-  digest?: string;
+  digest: string;
 }
 
 export interface UpdateCheck {
@@ -137,7 +137,6 @@ export interface UpdateProgressPayload {
 }
 
 export interface UpdateDonePayload {
-  path: string;
   version: string;
 }
 

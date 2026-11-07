@@ -297,7 +297,8 @@ pub fn cancel_update_download(state: State<'_, AppState>) {
 /// ダウンロード済みのインストーラーを起動し、このアプリを終了する。
 #[tauri::command]
 pub fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    crate::updater::install(&app, &state.updates)
+    let engine = state.engine.clone();
+    crate::updater::install(&app, &state.updates, &engine)
 }
 
 // ---------------------------------------------------------------------------

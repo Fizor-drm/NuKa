@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -46,9 +46,8 @@ pub struct UpdateAsset {
     pub name: String,
     pub size: u64,
     pub url: String,
-    /// `sha256:<hex>`。GitHub が返さない場合は省略される。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
+    /// 正規化済みの SHA-256 (64 文字 hex)。検証必須。
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -109,7 +108,6 @@ struct ProgressEvent {
 
 #[derive(Clone, Serialize)]
 struct DoneEvent {
-    path: String,
     version: String,
 }
 
@@ -124,11 +122,10 @@ fn emit_progress(app: &AppHandle, downloaded: u64, total: u64) {
     }
 }
 
-fn emit_done(app: &AppHandle, path: &str, version: &str) {
+fn emit_done(app: &AppHandle, version: &str) {
     if let Err(error) = app.emit(
         "update:done",
         DoneEvent {
-            path: path.to_string(),
             version: version.to_string(),
         },
     ) {
@@ -196,6 +193,8 @@ fn is_newer(latest: &str, current: &str) -> Option<bool> {
     Some(latest > current)
 }
 
+/// `sha256:<hex>` だけを受け付け、比較用の 64 文字小文字 hex に正規化する。
+/// ここで 1 回だけ正規化し、以後は正規化済みの値だけを扱う。
 fn normalize_digest(digest: Option<&str>) -> Option<String> {
     let digest = digest?.trim();
     let hex = digest.strip_prefix("sha256:")?;
@@ -206,7 +205,38 @@ fn normalize_digest(digest: Option<&str>) -> Option<String> {
     }
 }
 
-/// 更新に使える asset か。URL は GitHub のリリース配布元 prefix だけ許可する。
+/// asset 名として安全か。ディレクトリ区切りや `..`、ドライブ指定を拒否する。
+fn is_safe_asset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains("..")
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+}
+
+/// ダウンロード先 URL が GitHub のリリース配布元として正しいか。
+fn is_trusted_asset_url(url: &str) -> bool {
+    if !url.starts_with(DOWNLOAD_PREFIX) || url.contains("..") {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return false;
+    }
+    let path = parsed.path();
+    path.starts_with("/Fizor-drm/NuKa/releases/download/") && !path.contains("..")
+}
+
+/// 更新に使える asset か。名前・URL・digest をすべて検証する。
 fn select_asset(assets: &[GitHubAsset]) -> Result<UpdateAsset, String> {
     let candidates: Vec<&GitHubAsset> = assets
         .iter()
@@ -215,19 +245,26 @@ fn select_asset(assets: &[GitHubAsset]) -> Result<UpdateAsset, String> {
     if candidates.is_empty() {
         return Err("更新ファイル (NuKa_*_x64-setup.exe) が見つかりませんでした。".to_string());
     }
-    let asset = candidates[0];
+    let Some(asset) = candidates
+        .into_iter()
+        .find(|asset| is_safe_asset_name(&asset.name))
+    else {
+        return Err("更新ファイル名が想定と違います。".to_string());
+    };
 
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
         return Err("更新ファイルのサイズが想定の範囲外です。".to_string());
     }
-    if !asset.browser_download_url.starts_with(DOWNLOAD_PREFIX) {
+    if !is_trusted_asset_url(&asset.browser_download_url) {
         return Err("更新ファイルの取得先が想定と違います。".to_string());
     }
+    let digest = normalize_digest(asset.digest.as_deref())
+        .ok_or_else(|| "更新ファイルの検証情報が取得できませんでした。".to_string())?;
     Ok(UpdateAsset {
         name: asset.name.clone(),
         size: asset.size,
         url: asset.browser_download_url.clone(),
-        digest: normalize_digest(asset.digest.as_deref()),
+        digest,
     })
 }
 
@@ -382,16 +419,21 @@ fn remove_if_exists(path: &Path) {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("SHA-256 の対象を開けません ({}): {error}", path.display()))?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        eprintln!("SHA-256 の対象を開けません ({}): {error}", path.display());
+        "SHA-256 を計算できませんでした。".to_string()
+    })?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|error| format!("SHA-256 を計算できません: {error}"))?;
+    std::io::copy(&mut file, &mut hasher).map_err(|error| {
+        eprintln!("SHA-256 を計算できません ({}): {error}", path.display());
+        "SHA-256 を計算できませんでした。".to_string()
+    })?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// ダウンロードしたファイルを検証する。digest があれば SHA-256、無ければサイズ。
-fn verify_download(path: &Path, expected_size: u64, digest: Option<&str>) -> Result<(), String> {
+/// ダウンロードしたファイルを検証する。SHA-256 は必須で、正規化済みの 64 文字 hex を受ける。
+/// ここで再正規化はしない (二重適用で検証が素通りする事故を防ぐ)。
+fn verify_download(path: &Path, expected_size: u64, digest: &str) -> Result<(), String> {
     let size = fs::metadata(path)
         .map_err(|error| format!("更新ファイルを確認できません: {error}"))?
         .len();
@@ -400,42 +442,55 @@ fn verify_download(path: &Path, expected_size: u64, digest: Option<&str>) -> Res
             "更新ファイルのサイズが一致しません ({size} / {expected_size} バイト)。"
         ));
     }
-    let Some(expected) = normalize_digest(digest) else {
-        return Ok(());
-    };
+    let expected = digest.trim().to_ascii_lowercase();
+    if expected.len() != 64
+        || !expected
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("更新ファイルの検証情報が不正です。".to_string());
+    }
     let actual = sha256_file(path)?;
     if actual != expected {
+        eprintln!("更新ファイルの SHA-256 が一致しません (期待 {expected} / 実際 {actual})");
         return Err("更新ファイルの SHA-256 が一致しません。".to_string());
     }
     Ok(())
 }
 
 fn download_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .https_only(true)
+    let builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT);
+    // テストではローカル HTTP のスタブに接続するため、テスト時だけ https 強制を外す。
+    #[cfg(not(test))]
+    let builder = builder.https_only(true);
+    builder
         .build()
         .map_err(|error| format!("ダウンロード用クライアントを作れません: {error}"))
 }
 
-async fn download_asset(
-    app: &AppHandle,
-    offer: &UpdateOffer,
+/// 実ファイルのダウンロードと検証。保存先を引数で受けるので、テストからも同じ経路を通せる。
+async fn download_to_directory(
+    asset: &UpdateAsset,
+    directory: &Path,
     cancel: &AtomicBool,
+    mut on_progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, String> {
-    let asset = &offer.asset;
-    // 念のため保持している URL も再検証する。
-    if !asset.url.starts_with(DOWNLOAD_PREFIX) {
-        return Err("更新ファイルの取得先が想定と違います。".to_string());
-    }
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
         return Err("更新ファイルのサイズが想定の範囲外です。".to_string());
     }
-
-    let directory = cache_dir(app)?;
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("保存先を作れません ({}): {error}", directory.display()))?;
+    if !is_safe_asset_name(&asset.name) {
+        return Err("更新ファイル名が想定と違います。".to_string());
+    }
+    if asset.digest.len() != 64
+        || !asset
+            .digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("更新ファイルの検証情報が不正です。".to_string());
+    }
     let dest = directory.join(&asset.name);
     let part = part_path(&dest);
     remove_if_exists(&part);
@@ -462,11 +517,11 @@ async fn download_asset(
 
     let mut file = tokio::fs::File::create(&part)
         .await
-        .map_err(|error| format!("保存先を作れません ({}): {error}", part.display()))?;
+        .map_err(|error| format!("保存先を作れません: {error}"))?;
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
     let mut last_emit = Instant::now();
-    emit_progress(app, 0, asset.size);
+    on_progress(0, asset.size);
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -501,7 +556,7 @@ async fn download_asset(
             return Err("更新ファイルが想定より大きいため中止しました。".to_string());
         }
         if last_emit.elapsed() >= PROGRESS_INTERVAL {
-            emit_progress(app, written, asset.size);
+            on_progress(written, asset.size);
             last_emit = Instant::now();
         }
     }
@@ -511,12 +566,13 @@ async fn download_asset(
         return Err(format!("ダウンロードを書き込めません: {error}"));
     }
     drop(file);
-    emit_progress(app, written, asset.size);
+    on_progress(written, asset.size);
 
-    if let Err(message) = verify_download(&part, asset.size, asset.digest.as_deref()) {
+    if let Err(message) = verify_download(&part, asset.size, &asset.digest) {
         remove_if_exists(&part);
         return Err(message);
     }
+    eprintln!("更新ファイルの SHA-256 を確認しました");
     if cancel.load(Ordering::SeqCst) {
         remove_if_exists(&part);
         return Err("ダウンロードを中止しました。".to_string());
@@ -526,6 +582,24 @@ async fn download_asset(
         format!("更新ファイルを配置できません: {error}")
     })?;
     Ok(dest)
+}
+
+async fn download_asset(
+    app: &AppHandle,
+    offer: &UpdateOffer,
+    cancel: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let asset = &offer.asset;
+    // 保持している URL も再検証する。
+    if !is_trusted_asset_url(&asset.url) {
+        return Err("更新ファイルの取得先が想定と違います。".to_string());
+    }
+    let directory = cache_dir(app)?;
+    fs::create_dir_all(&directory).map_err(|error| format!("保存先を作れません: {error}"))?;
+    download_to_directory(asset, &directory, cancel, |downloaded, total| {
+        emit_progress(app, downloaded, total);
+    })
+    .await
 }
 
 /// 更新インストーラーをダウンロードして保持する。成功/失敗はイベントで流す。
@@ -548,10 +622,10 @@ pub async fn download(
     match result {
         Ok(path) => {
             *state.lock_downloaded() = Some(DownloadedUpdate {
-                path: path.clone(),
+                path,
                 version: offer.version.clone(),
             });
-            emit_done(app, &path.to_string_lossy(), &offer.version);
+            emit_done(app, &offer.version);
             Ok(())
         }
         Err(message) => {
@@ -576,32 +650,63 @@ pub fn cancel(downloads: &DownloadManager) -> bool {
 // ---------------------------------------------------------------------------
 
 /// ダウンロード済みのインストーラーを切り離して起動し、少し待ってアプリを終了する。
-pub fn install(app: &AppHandle, state: &UpdateState) -> Result<(), String> {
+pub fn install(
+    app: &AppHandle,
+    state: &UpdateState,
+    engine: &crate::engine::Engine,
+) -> Result<(), String> {
+    // take() で消費し、二重起動を防ぐ。起動に失敗したときだけ戻す。
     let downloaded = {
-        let guard = state.lock_downloaded();
+        let mut guard = state.lock_downloaded();
         guard
-            .as_ref()
-            .cloned()
+            .take()
             .ok_or_else(|| "更新ファイルがありません。先にダウンロードしてください。".to_string())?
     };
-    let directory = cache_dir(app)?;
+    let restore = |message: String| -> Result<(), String> {
+        *state.lock_downloaded() = Some(downloaded.clone());
+        Err(message)
+    };
+
+    let directory = match cache_dir(app) {
+        Ok(directory) => directory,
+        Err(error) => return restore(error),
+    };
     if downloaded.path.parent() != Some(directory.as_path()) {
-        return Err("更新ファイルの保存先が想定と違います。".to_string());
+        return restore("更新ファイルの保存先が想定と違います。".to_string());
     }
-    if !downloaded.path.is_file() {
-        return Err("更新ファイルが見つかりません。再ダウンロードしてください。".to_string());
+    let metadata = match fs::symlink_metadata(&downloaded.path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return restore(format!("更新ファイルを確認できません: {error}"));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return restore("更新ファイルがシンボリックリンクのため中止しました。".to_string());
+    }
+    if !metadata.is_file() {
+        return restore("更新ファイルが見つかりません。再ダウンロードしてください。".to_string());
     }
 
+    // インストーラーとファイルロックが競合しないよう、先にエンジンを止める。
+    engine.kill_now();
+
     let mut command = Command::new(&downloaded.path);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
-    let child = command
-        .spawn()
-        .map_err(|error| format!("インストーラーを起動できません: {error}"))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return restore(format!("インストーラーを起動できません: {error}"));
+        }
+    };
     let pid = child.id();
     eprintln!(
         "更新インストーラー ({}) を起動しました (pid {pid})。NuKa を終了します。",
@@ -620,6 +725,7 @@ pub fn install(app: &AppHandle, state: &UpdateState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn asset(name: &str, size: u64, url: &str, digest: Option<&str>) -> GitHubAsset {
         GitHubAsset {
@@ -632,6 +738,46 @@ mod tests {
 
     const GOOD_URL: &str =
         "https://github.com/Fizor-drm/NuKa/releases/download/v1.0.0/NuKa_1.0.0_x64-setup.exe";
+    const TEST_DIGEST: &str = "28b283711529ba5d2c919ba2277376da95d0df95a8d0b340c4eec35c1c64a161";
+    const TEST_DIGEST_FIELD: &str =
+        "sha256:28b283711529ba5d2c919ba2277376da95d0df95a8d0b340c4eec35c1c64a161";
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("nuka-updater-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("一時ディレクトリを作れる");
+        directory
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// 決められた本文を返す小さな HTTP サーバ (テスト専用)。
+    async fn spawn_stub(body: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("stub を bind できる");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = [0u8; 4096];
+            let _ = socket.read(&mut head).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        });
+        port
+    }
 
     #[test]
     fn versions_parse_and_compare() {
@@ -683,8 +829,8 @@ mod tests {
         assert_eq!(selected.name, "NuKa_1.0.0_x64-setup.exe");
         assert_eq!(selected.size, 3_194_862);
         assert_eq!(
-            selected.digest.as_deref(),
-            Some("28b283711529ba5d2c919ba2277376da95d0df95a8d0b340c4eec35c1c64a161")
+            selected.digest,
+            "28b283711529ba5d2c919ba2277376da95d0df95a8d0b340c4eec35c1c64a161"
         );
 
         // 現在の方が新しければ更新なし
@@ -712,19 +858,21 @@ mod tests {
 
     #[test]
     fn asset_selection_rejects_untrusted_urls_and_wrong_names() {
+        let digest = Some(TEST_DIGEST_FIELD);
         let assets = vec![
-            asset("NuKa_1.0.0_x64-setup.exe", 10, GOOD_URL, None),
-            asset("NuKa_1.0.0_x64.msi", 10, GOOD_URL, None),
-            asset("notes.txt", 10, GOOD_URL, None),
+            asset("NuKa_1.0.0_x64-setup.exe", 10, GOOD_URL, digest),
+            asset("NuKa_1.0.0_x64.msi", 10, GOOD_URL, digest),
+            asset("notes.txt", 10, GOOD_URL, digest),
         ];
         let selected = select_asset(&assets).expect("選べる");
         assert_eq!(selected.name, "NuKa_1.0.0_x64-setup.exe");
+        assert_eq!(selected.digest, TEST_DIGEST);
 
         let evil = vec![asset(
             "NuKa_1.0.0_x64-setup.exe",
             10,
             "https://example.com/NuKa_1.0.0_x64-setup.exe",
-            None,
+            digest,
         )];
         let error = select_asset(&evil).expect_err("URL が違えば拒否");
         assert!(error.contains("取得先"));
@@ -733,11 +881,55 @@ mod tests {
             "NuKa_1.0.0_x64-setup.exe",
             MAX_UPDATE_BYTES + 1,
             GOOD_URL,
-            None,
+            digest,
         )];
         assert!(select_asset(&too_large).is_err());
 
         assert!(select_asset(&[]).is_err());
+    }
+
+    #[test]
+    fn asset_selection_requires_a_valid_sha256_digest() {
+        for digest in [
+            None,
+            Some("sha256:xyz"),
+            Some("sha512:28b283711529ba5d2c919ba2277376da95d0df95a8d0b340c4eec35c1c64a161"),
+            Some("md5:28b283711529ba5d2c919ba2277376da95d0df95a8d0b340c4eec35c1c64a161"),
+            Some(""),
+        ] {
+            let assets = vec![asset("NuKa_1.0.0_x64-setup.exe", 10, GOOD_URL, digest)];
+            let error = select_asset(&assets).expect_err("digest 不備は拒否");
+            assert!(error.contains("検証情報"), "{digest:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn asset_names_and_urls_reject_traversal() {
+        for name in [
+            "NuKa_../evil_x64-setup.exe",
+            "NuKa_/evil_x64-setup.exe",
+            "NuKa_\\evil_x64-setup.exe",
+            "NuKa_C:\\evil_x64-setup.exe",
+        ] {
+            let assets = vec![asset(name, 10, GOOD_URL, Some(TEST_DIGEST_FIELD))];
+            let error = select_asset(&assets).expect_err("危険な名前は拒否");
+            assert!(error.contains("ファイル名"), "{name}: {error}");
+        }
+
+        let evil_url = "https://github.com/Fizor-drm/NuKa/releases/download/v1.0.0/../evil/NuKa_1.0.0_x64-setup.exe";
+        assert!(!is_trusted_asset_url(evil_url));
+        assert!(!is_trusted_asset_url(
+            "https://evil.example/NuKa_1.0.0_x64-setup.exe"
+        ));
+        assert!(is_trusted_asset_url(GOOD_URL));
+        let assets = vec![asset(
+            "NuKa_1.0.0_x64-setup.exe",
+            10,
+            evil_url,
+            Some(TEST_DIGEST_FIELD),
+        )];
+        let error = select_asset(&assets).expect_err(".. を含む URL は拒否");
+        assert!(error.contains("取得先"), "{error}");
     }
 
     #[test]
@@ -756,26 +948,95 @@ mod tests {
 
     #[test]
     fn verify_download_checks_size_and_digest() {
-        let directory = std::env::temp_dir().join(format!("nuka-updater-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
+        let directory = temp_dir("verify");
         let path = directory.join("installer.exe");
         fs::write(&path, b"abc").unwrap();
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
+        assert!(verify_download(&path, 3, digest).is_ok());
+        // 大文字 hex も比較できる
+        assert!(verify_download(&path, 3, &digest.to_ascii_uppercase()).is_ok());
+        assert!(verify_download(&path, 4, digest).is_err());
         assert!(verify_download(
             &path,
             3,
-            Some("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
-        )
-        .is_ok());
-        assert!(verify_download(&path, 3, None).is_ok());
-        assert!(verify_download(&path, 4, None).is_err());
-        assert!(verify_download(
-            &path,
-            3,
-            Some("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+            "0000000000000000000000000000000000000000000000000000000000000000"
         )
         .is_err());
+        // 正規化済み hex だけを受ける (sha256: 付きを渡したら不正として拒否)
+        assert!(verify_download(&path, 3, &format!("sha256:{digest}")).is_err());
+        assert!(verify_download(&path, 3, "not-a-digest").is_err());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn tauri_and_package_versions_match_cargo_version() {
+        let tauri: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        assert_eq!(
+            tauri["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "tauri.conf.json の version が Cargo.toml と一致しません"
+        );
+        let package: serde_json::Value =
+            serde_json::from_str(include_str!("../../package.json")).expect("package.json");
+        assert_eq!(
+            package["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "package.json の version が Cargo.toml と一致しません"
+        );
+    }
+
+    /// select_asset で選んだ digest が、実際のダウンロード経路 (download_to_directory) で
+    /// SHA-256 検証に使われることを、スタブ HTTP 経由で確認する。
+    #[tokio::test]
+    async fn download_path_verifies_sha256_end_to_end() {
+        let directory = temp_dir("download-e2e");
+        let body = b"NuKa test installer bytes".to_vec();
+        let digest = hex_sha256(&body);
+
+        // 1) GitHub の asset から digest を正規化して取り出す
+        let release_asset = asset(
+            "NuKa_1.0.0_x64-setup.exe",
+            body.len() as u64,
+            GOOD_URL,
+            Some(&format!("sha256:{digest}")),
+        );
+        let selected = select_asset(&[release_asset]).expect("選択できる");
+        assert_eq!(selected.digest, digest);
+
+        // 2) 同じ digest のまま、配布物だけスタブに差し替えてダウンロード
+        let port = spawn_stub(body.clone()).await;
+        let download = UpdateAsset {
+            url: format!("http://127.0.0.1:{port}/NuKa_1.0.0_x64-setup.exe"),
+            ..selected
+        };
+        let cancel = AtomicBool::new(false);
+        let path = download_to_directory(&download, &directory, &cancel, |_, _| {})
+            .await
+            .expect("正しいファイルは通る");
+        assert_eq!(fs::read(&path).unwrap(), body);
+
+        // 3) 1 バイトでも変われば拒否される
+        let mut tampered = body.clone();
+        tampered[0] ^= 0xff;
+        fs::write(&path, &tampered).unwrap();
+        let error =
+            verify_download(&path, download.size, &download.digest).expect_err("改ざんは拒否");
+        assert!(error.contains("SHA-256"));
+
+        // 4) 改ざんされた配信をダウンロードすると失敗し、成果物を残さない
+        let port = spawn_stub(tampered).await;
+        let bad = UpdateAsset {
+            url: format!("http://127.0.0.1:{port}/NuKa_1.0.0_x64-setup.exe"),
+            ..download.clone()
+        };
+        let error = download_to_directory(&bad, &directory, &cancel, |_, _| {})
+            .await
+            .expect_err("digest 不一致は失敗");
+        assert!(error.contains("SHA-256"));
+        assert!(!directory.join(&download.name).exists());
+        assert!(!part_path(&directory.join(&download.name)).exists());
         let _ = fs::remove_dir_all(&directory);
     }
 

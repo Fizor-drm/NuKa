@@ -43,6 +43,7 @@ whatlang = "0.18"
 regex = "1"
 thiserror = "2"
 zip = "2"
+url = "2"
 
 # 子プロセス (llama-server) を Job Object で OS に後始末させるため (Windows のみ)。
 [target.'cfg(windows)'.dependencies]
