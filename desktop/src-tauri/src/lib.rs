@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod commands;
 pub mod detect;
 pub mod engine;
+pub mod floating;
 pub mod installer;
 pub mod message;
 pub mod prompt;
@@ -18,6 +19,7 @@ use tauri::Manager;
 
 use crate::commands::JobManager;
 use crate::engine::Engine;
+use crate::floating::FloatingState;
 use crate::installer::DownloadManager;
 use crate::settings::SettingsStore;
 use crate::updater::UpdateState;
@@ -29,12 +31,22 @@ pub struct AppState {
     pub jobs: JobManager,
     pub downloads: DownloadManager,
     pub updates: UpdateState,
+    pub floating: FloatingState,
 }
 
 pub fn run() {
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        floating::on_hotkey(app);
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             let settings = match SettingsStore::for_app(app.handle()) {
                 Ok(store) => store,
@@ -59,13 +71,26 @@ pub fn run() {
                 jobs: JobManager::new(),
                 downloads: DownloadManager::new(),
                 updates: UpdateState::new(),
+                floating: FloatingState::new(),
             });
+
+            // 非表示のフローティングウィンドウを用意し、ホットキーを登録する。
+            // 登録はプラグインの都合で別スレッドに逃がしてある (setup を止めない)。
+            if let Err(error) = floating::setup(app.handle()) {
+                eprintln!(
+                    "フローティングウィンドウを初期化できません: {}",
+                    error.fallback
+                );
+            }
 
             // 起動と同時に llama-server を起こす。準備できるまで UI には starting が見える。
             tauri::async_runtime::spawn(async move {
                 engine.start(&initial).await;
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            floating::handle_window_event(window, event);
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_engine_status,
@@ -75,6 +100,9 @@ pub fn run() {
             commands::detect_language,
             commands::translate,
             commands::cancel_translation,
+            commands::set_floating_settings,
+            commands::hide_floating,
+            commands::set_main_target_lang,
             commands::get_catalog,
             commands::get_setup_state,
             commands::install_runtime,

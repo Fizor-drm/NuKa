@@ -60,6 +60,28 @@ pub struct InstalledModel {
     pub installed_at: u64,
 }
 
+/// フローティング翻訳ウィンドウ (Phase 1) の設定。
+///
+/// `#[serde(default)]` を付けてあるので、古い settings.json にこの項目が無くても
+/// 既定 (有効 / Ctrl+Shift+T) で読み込める。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatingWindowSettings {
+    /// グローバルショートカットでフローティングウィンドウを出すか。
+    pub enabled: bool,
+    /// ホットキー。Ctrl / Alt / Shift + 英数字 1 文字。
+    pub hotkey: String,
+}
+
+impl Default for FloatingWindowSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hotkey: crate::floating::DEFAULT_HOTKEY.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -88,6 +110,8 @@ pub struct Settings {
     pub installed_models: Vec<InstalledModel>,
     /// 使用するモデルのファイル名 (installed_models の file)。
     pub active_model: Option<String>,
+    /// フローティング翻訳ウィンドウ。
+    pub floating_window: FloatingWindowSettings,
 }
 
 impl Default for Settings {
@@ -105,6 +129,7 @@ impl Default for Settings {
             installed_runtime: None,
             installed_models: Vec::new(),
             active_model: None,
+            floating_window: FloatingWindowSettings::default(),
         }
     }
 }
@@ -260,6 +285,10 @@ fn sanitize(settings: &mut Settings) {
         runtime.server_path = normalize_optional(runtime.server_path)?;
         Some(runtime)
     });
+    // 手編集で壊れたホットキーは既定へ戻す。空文字も既定にする。
+    settings.floating_window.hotkey =
+        crate::floating::normalize_hotkey(&settings.floating_window.hotkey)
+            .unwrap_or_else(|| FloatingWindowSettings::default().hotkey);
     settings
         .installed_models
         .retain(|model| !model.file.trim().is_empty() && !model.path.trim().is_empty());
@@ -631,6 +660,64 @@ mod tests {
         let disk = SettingsStore::new(path).get();
         assert_eq!(memory, disk);
         assert!(memory.gpu_layers < 16);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn floating_window_defaults_match_the_contract() {
+        let settings = Settings::default();
+        assert!(settings.floating_window.enabled);
+        assert_eq!(
+            settings.floating_window.hotkey,
+            crate::floating::DEFAULT_HOTKEY
+        );
+    }
+
+    #[test]
+    fn floating_window_round_trips() {
+        let directory = temp_dir("floating-roundtrip");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let updated = store
+            .update(|settings| {
+                settings.floating_window.enabled = false;
+                settings.floating_window.hotkey = "Ctrl+Alt+K".to_string();
+                Ok(())
+            })
+            .expect("フローティング設定を保存できる");
+        assert!(!updated.floating_window.enabled);
+        assert_eq!(updated.floating_window.hotkey, "Ctrl+Alt+K");
+        assert_eq!(SettingsStore::new(path).get(), updated);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn invalid_floating_hotkey_falls_back_to_the_default_on_load() {
+        let directory = temp_dir("floating-invalid");
+        let path = directory.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"floating_window":{"enabled":false,"hotkey":"Ctrl+Shift+F13"}}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert!(!settings.floating_window.enabled);
+        assert_eq!(
+            settings.floating_window.hotkey,
+            crate::floating::DEFAULT_HOTKEY
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn settings_without_floating_window_stay_compatible() {
+        // 1.2.0 以前の settings.json (項目そのものが無い) を読む想定。
+        let directory = temp_dir("floating-missing");
+        let path = directory.join("settings.json");
+        fs::write(&path, r#"{"theme":"dark","gpu_layers":12}"#).unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert_eq!(settings.theme, Theme::Dark);
+        assert_eq!(settings.floating_window, FloatingWindowSettings::default());
         let _ = fs::remove_dir_all(&directory);
     }
 }

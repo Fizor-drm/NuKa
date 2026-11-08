@@ -38,6 +38,18 @@ export interface Settings {
   installed_runtime: InstalledRuntime | null;
   installed_models: InstalledModel[];
   active_model: string | null;
+  floating_window: FloatingWindowSettings;
+}
+
+/** フローティング翻訳ウィンドウ (Phase 1) の設定。 */
+export interface FloatingWindowSettings {
+  enabled: boolean;
+  hotkey: string;
+}
+
+export interface FloatingSettingsPatch {
+  enabled?: boolean;
+  hotkey?: string;
 }
 
 export interface SettingsPatch {
@@ -183,6 +195,17 @@ export interface ErrorPayload {
   message: string;
 }
 
+/** 新しい翻訳に jobId を差し替えられた (この job の done/error は来ない)。 */
+export interface SupersededPayload {
+  jobId: number;
+}
+
+/** ホットキー発火時に全ウィンドウへ届く。`text: null` は選択なし。 */
+export interface FloatingCapturePayload {
+  text: string | null;
+  target_lang: string;
+}
+
 export const ipc = {
   getEngineStatus: (): Promise<EngineStatus> => invoke<EngineStatus>("get_engine_status"),
   restartEngine: (): Promise<void> => invoke<void>("restart_engine"),
@@ -195,6 +218,11 @@ export const ipc = {
     invoke<number>("translate", { req: request }),
   cancelTranslation: (jobId: number): Promise<void> =>
     invoke<void>("cancel_translation", { jobId }),
+  setFloatingSettings: (patch: FloatingSettingsPatch): Promise<Settings> =>
+    invoke<Settings>("set_floating_settings", { patch }),
+  hideFloating: (): Promise<void> => invoke<void>("hide_floating"),
+  setMainTargetLang: (code: string): Promise<void> =>
+    invoke<void>("set_main_target_lang", { code }),
   getCatalog: (): Promise<CatalogEntry[]> => invoke<CatalogEntry[]>("get_catalog"),
   getSetupState: (): Promise<SetupState> => invoke<SetupState>("get_setup_state"),
   installRuntime: (): Promise<void> => invoke<void>("install_runtime"),
@@ -235,6 +263,14 @@ export function onTranslationDone(handler: (payload: DonePayload) => void): void
 
 export function onTranslationError(handler: (payload: ErrorPayload) => void): void {
   subscribe("translation:error", handler);
+}
+
+export function onTranslationSuperseded(handler: (payload: SupersededPayload) => void): void {
+  subscribe("translation:superseded", handler);
+}
+
+export function onFloatingCapture(handler: (payload: FloatingCapturePayload) => void): void {
+  subscribe("floating:capture", handler);
 }
 
 export function onDownloadProgress(handler: (payload: DownloadProgressPayload) => void): void {

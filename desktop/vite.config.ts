@@ -17,5 +17,13 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: false,
+    rollupOptions: {
+      // メイン画面 (index.html) とフローティングウィンドウ (floating.html) の
+      // 2 ページをビルドする。Tauri の WebviewWindow は floating.html を開く。
+      input: {
+        main: "index.html",
+        floating: "floating.html",
+      },
+    },
   },
 });

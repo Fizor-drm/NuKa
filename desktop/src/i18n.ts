@@ -109,6 +109,14 @@ const ja: Dict = {
   "output.engineStartFailed": "エンジンを起動できませんでした。",
   "output.translationFailed": "翻訳できませんでした。",
 
+  "floating.noSelection": "テキストが選択されていません",
+  "floating.copy": "コピー",
+  "floating.copied": "コピーしました",
+  "floating.copyFailed": "コピーできませんでした",
+  "floating.translating": "翻訳しています…",
+  "floating.close": "閉じる",
+  "floating.targetLangAria": "訳先の言語",
+
   "glossary.title": "用語集",
   "glossary.hint": "登録した用語はこの訳語で固定します。",
   "glossary.add": "行を追加",
@@ -132,6 +140,18 @@ const ja: Dict = {
   "settings.updateHeading": "アップデート",
   "settings.modelsHeading": "モデル",
   "settings.licenseHeading": "ライセンス",
+  "settings.floating.heading": "フローティングウィンドウ",
+  "settings.floating.enable": "グローバルショートカットで翻訳ウィンドウを表示する",
+  "settings.floating.hotkeyLabel": "ホットキー",
+  "settings.floating.hotkeyRecord": "キーを押して記録",
+  "settings.floating.hotkeyRecording": "キーを押してください… (Esc でキャンセル)",
+  "settings.floating.usage": "テキストを選択して {hotkey} を押すと、翻訳ウィンドウが表示されます。",
+  "settings.floating.hotkeyInvalid": "Ctrl・Alt・Shift + 英数字の組み合わせで指定してください。",
+  "settings.floating.hotkeyConflict":
+    "このホットキーはほかのアプリが使用中のため登録できませんでした。設定は保存されましたが、このキーはまだ有効ではありません。",
+  "settings.floating.adminNote":
+    "管理者権限で実行されているアプリの上では、選択テキストを取得できません。",
+  "settings.floating.saveFailed": "設定を保存できませんでした: {detail}",
 
   "runtime.checking": "確認しています…",
   "runtime.notInstalled": "未導入。ランタイムをインストールすると翻訳を始められます。",
@@ -391,6 +411,14 @@ const en: Dict = {
   "output.engineStartFailed": "Could not start the engine.",
   "output.translationFailed": "Translation failed.",
 
+  "floating.noSelection": "No text is selected",
+  "floating.copy": "Copy",
+  "floating.copied": "Copied",
+  "floating.copyFailed": "Could not copy",
+  "floating.translating": "Translating…",
+  "floating.close": "Close",
+  "floating.targetLangAria": "Target language",
+
   "glossary.title": "Glossary",
   "glossary.hint": "Registered terms are always translated this way.",
   "glossary.add": "Add row",
@@ -414,6 +442,19 @@ const en: Dict = {
   "settings.updateHeading": "Updates",
   "settings.modelsHeading": "Models",
   "settings.licenseHeading": "License",
+  "settings.floating.heading": "Floating window",
+  "settings.floating.enable": "Show the translation window with a global shortcut",
+  "settings.floating.hotkeyLabel": "Shortcut",
+  "settings.floating.hotkeyRecord": "Press keys to record",
+  "settings.floating.hotkeyRecording": "Press a key combination… (Esc to cancel)",
+  "settings.floating.usage":
+    "Select text and press {hotkey} to open the translation window.",
+  "settings.floating.hotkeyInvalid":
+    "Use Ctrl, Alt, or Shift together with a letter or digit.",
+  "settings.floating.hotkeyConflict":
+    "Another app already uses this shortcut, so it could not be registered. The setting was saved, but the shortcut is not active yet.",
+  "settings.floating.adminNote": "Text cannot be captured from apps running as administrator.",
+  "settings.floating.saveFailed": "Could not save settings: {detail}",
 
   "runtime.checking": "Checking…",
   "runtime.notInstalled": "Not installed. Install the runtime to start translating.",
@@ -669,6 +710,14 @@ const zh: Dict = {
   "output.engineStartFailed": "无法启动引擎。",
   "output.translationFailed": "翻译失败。",
 
+  "floating.noSelection": "未选择文本",
+  "floating.copy": "复制",
+  "floating.copied": "已复制",
+  "floating.copyFailed": "复制失败",
+  "floating.translating": "正在翻译…",
+  "floating.close": "关闭",
+  "floating.targetLangAria": "目标语言",
+
   "glossary.title": "术语表",
   "glossary.hint": "已登记的术语将固定使用该译法。",
   "glossary.add": "添加一行",
@@ -692,6 +741,17 @@ const zh: Dict = {
   "settings.updateHeading": "更新",
   "settings.modelsHeading": "模型",
   "settings.licenseHeading": "许可证",
+  "settings.floating.heading": "浮动窗口",
+  "settings.floating.enable": "使用全局快捷键显示翻译窗口",
+  "settings.floating.hotkeyLabel": "快捷键",
+  "settings.floating.hotkeyRecord": "按下按键进行记录",
+  "settings.floating.hotkeyRecording": "请按下组合键…（Esc 取消）",
+  "settings.floating.usage": "选中文本后按 {hotkey}，即可显示翻译窗口。",
+  "settings.floating.hotkeyInvalid": "请使用 Ctrl、Alt 或 Shift 与字母或数字的组合。",
+  "settings.floating.hotkeyConflict":
+    "该快捷键已被其他应用占用，无法注册。设置已保存，但此快捷键尚未生效。",
+  "settings.floating.adminNote": "无法从以管理员权限运行的应用中获取所选文本。",
+  "settings.floating.saveFailed": "无法保存设置：{detail}",
 
   "runtime.checking": "正在检查…",
   "runtime.notInstalled": "未安装。安装运行时后即可开始翻译。",

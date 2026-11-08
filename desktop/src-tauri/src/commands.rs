@@ -26,6 +26,8 @@ use tokio::time::timeout;
 
 use crate::detect::{self, DetectedLanguage};
 use crate::engine::{Engine, EnginePhase, EngineStatus, SERVER_ALIAS};
+use crate::floating;
+use crate::message::LocalizedText;
 use crate::prompt::{
     self, GlossaryPair, HistoryPair, PromptError, PromptOptions, CHUNK_LIMIT, STOP_TOKENS,
 };
@@ -87,6 +89,14 @@ struct ErrorEvent {
     message: String,
 }
 
+/// 新しい翻訳に jobId を差し替えられたことを知らせる。
+/// 古いウィンドウは自ジョブなら翻訳中表示を止める (done も error も来ないため)。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SupersededEvent {
+    job_id: u32,
+}
+
 /// 進行中のジョブ。新しい translate が来たら古いジョブのフラグを立てて捨てる。
 #[derive(Clone, Default)]
 pub struct JobManager {
@@ -102,6 +112,8 @@ struct JobManagerInner {
 struct JobControl {
     id: u32,
     cancel: Arc<AtomicBool>,
+    /// どのウィンドウから依頼されたジョブか ("main" / "floating")。
+    origin: String,
 }
 
 impl JobManager {
@@ -110,21 +122,27 @@ impl JobManager {
     }
 
     /// 新しいジョブを始める。進行中のジョブは捨てる。
-    fn begin(&self) -> (u32, Arc<AtomicBool>) {
-        if let Some(previous) = self.lock().take() {
-            previous.cancel.store(true, Ordering::SeqCst);
-        }
+    ///
+    /// 戻り値は (新しい jobId, 中止フラグ, 差し替えた前の jobId)。
+    fn begin(&self, origin: &str) -> (u32, Arc<AtomicBool>, Option<u32>) {
+        let mut current = self.lock();
+        let previous = current.take();
+        let previous_id = previous.as_ref().map(|control| {
+            control.cancel.store(true, Ordering::SeqCst);
+            control.id
+        });
         let id = self
             .inner
             .next_id
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
         let cancel = Arc::new(AtomicBool::new(false));
-        *self.lock() = Some(JobControl {
+        *current = Some(JobControl {
             id,
             cancel: cancel.clone(),
+            origin: origin.to_string(),
         });
-        (id, cancel)
+        (id, cancel, previous_id)
     }
 
     fn cancel(&self, job_id: u32) {
@@ -139,6 +157,22 @@ impl JobManager {
         let mut current = self.lock();
         if current.as_ref().is_some_and(|control| control.id == job_id) {
             *current = None;
+        }
+    }
+
+    /// 進行中のジョブの jobId。無ければ `None`。
+    pub fn current_job_id(&self) -> Option<u32> {
+        self.lock().as_ref().map(|control| control.id)
+    }
+
+    /// 指定したウィンドウ由来のジョブだけを止める。
+    ///
+    /// フローティングウィンドウを閉じるときに、メイン画面の翻訳を巻き込まないため。
+    pub fn cancel_current_for_origin(&self, origin: &str) {
+        if let Some(control) = self.lock().as_ref() {
+            if control.origin == origin {
+                control.cancel.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -188,8 +222,21 @@ pub fn detect_language(text: String) -> Option<DetectedLanguage> {
 /// 引数は 1 つの `req` オブジェクトなので、フロントは
 /// `invoke("translate", { req: { text, target_lang, ... } })` で呼ぶ。
 #[tauri::command]
-pub fn translate(app: AppHandle, state: State<'_, AppState>, req: TranslateRequest) -> u32 {
-    let (job_id, cancel) = state.jobs.begin();
+pub fn translate(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    webview: tauri::WebviewWindow,
+    req: TranslateRequest,
+) -> u32 {
+    let (job_id, cancel, superseded) = state.jobs.begin(webview.label());
+    if let Some(superseded) = superseded {
+        if let Err(error) = app.emit(
+            "translation:superseded",
+            SupersededEvent { job_id: superseded },
+        ) {
+            eprintln!("translation:superseded を送れません: {error}");
+        }
+    }
     let engine = state.engine.clone();
     let jobs = state.jobs.clone();
     tauri::async_runtime::spawn(async move {
@@ -201,6 +248,90 @@ pub fn translate(app: AppHandle, state: State<'_, AppState>, req: TranslateReque
 #[tauri::command]
 pub fn cancel_translation(state: State<'_, AppState>, job_id: u32) {
     state.jobs.cancel(job_id);
+}
+
+// ---------------------------------------------------------------------------
+// フローティングウィンドウ (Phase 1)
+// ---------------------------------------------------------------------------
+
+/// `set_floating_settings` が受ける差分。省略したフィールドは今の値を保つ。
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FloatingSettingsPatch {
+    pub enabled: Option<bool>,
+    pub hotkey: Option<String>,
+}
+
+/// フローティングウィンドウの設定を保存する。
+///
+/// ホットキーはパース検証してから保存する。登録に失敗したとき (ほかのアプリと
+/// 競合) は新キーの登録を旧キーへ戻したうえで `settings.floating.hotkeyConflict`
+/// を返す。設定値そのものは保存済みなので、呼び出し側はエラーを表示しつつ
+/// `get_settings` の値 (変更後) を画面へ反映すること。
+#[tauri::command]
+pub async fn set_floating_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    patch: FloatingSettingsPatch,
+) -> Result<Settings, LocalizedText> {
+    let normalized = match patch.hotkey.as_deref() {
+        Some(value) => Some(
+            floating::normalize_hotkey(value)
+                .ok_or_else(|| floating::hotkey_invalid_error(value))?,
+        ),
+        None => None,
+    };
+
+    let saved = state
+        .settings
+        .update(|settings| {
+            if let Some(enabled) = patch.enabled {
+                settings.floating_window.enabled = enabled;
+            }
+            if let Some(hotkey) = &normalized {
+                settings.floating_window.hotkey = hotkey.clone();
+            }
+            Ok(())
+        })
+        .map_err(|error| {
+            let message = format!("設定を保存できませんでした: {error}");
+            LocalizedText::new("settings.floating.saveFailed", message.clone())
+                .param("detail", message)
+        })?;
+
+    // ショートカットの登録はプラグインがメインスレッドの処理完了を待つ。
+    // メインスレッドで動くコマンドから直接呼ぶと固まるので、ブロッキング
+    // スレッドへ逃がす。
+    let app_handle = app.clone();
+    let floating_state = state.floating.clone();
+    let registration = tauri::async_runtime::spawn_blocking(move || {
+        floating::apply_hotkey(&app_handle, &floating_state)
+    })
+    .await;
+
+    match registration {
+        Ok(Ok(())) => Ok(saved),
+        Ok(Err(error)) => Err(error),
+        Err(error) => {
+            let message = format!("ホットキーを登録できません: {error}");
+            Err(LocalizedText::new("error.raw", message.clone()).param("detail", message))
+        }
+    }
+}
+
+/// フローティングウィンドウを隠し、進行中のフローティング翻訳を止める。
+///
+/// `origin` は呼び出し元の識別子 ("close-button" / "escape" / "auto-hide")。
+/// デバッグログで hide の経路を特定するためだけに使い、未知の値は unknown 扱い。
+#[tauri::command]
+pub fn hide_floating(app: AppHandle, origin: Option<String>) {
+    floating::hide(&app, origin.as_deref().unwrap_or("unknown"));
+}
+
+/// メイン画面の訳先言語をフローティングウィンドウへ知らせる。
+/// フローティングの初期訳先に使うだけで、保存はしない。
+#[tauri::command]
+pub fn set_main_target_lang(state: State<'_, AppState>, code: String) {
+    state.floating.set_target_lang(&code);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,9 +1069,11 @@ mod tests {
     #[test]
     fn job_manager_supersedes_the_previous_job() {
         let jobs = JobManager::new();
-        let (first, first_cancel) = jobs.begin();
-        let (second, second_cancel) = jobs.begin();
+        let (first, first_cancel, none) = jobs.begin("main");
+        assert_eq!(none, None);
+        let (second, second_cancel, superseded) = jobs.begin("floating");
         assert_ne!(first, second);
+        assert_eq!(superseded, Some(first));
         assert!(first_cancel.load(Ordering::SeqCst));
         assert!(!second_cancel.load(Ordering::SeqCst));
 
@@ -957,8 +1090,25 @@ mod tests {
     #[test]
     fn job_ids_start_at_one() {
         let jobs = JobManager::new();
-        let (id, _) = jobs.begin();
+        let (id, _, _) = jobs.begin("main");
         assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn jobs_can_be_cancelled_by_origin_without_touching_the_other_window() {
+        let jobs = JobManager::new();
+        let (id, cancel, _) = jobs.begin("main");
+        assert_eq!(jobs.current_job_id(), Some(id));
+
+        // フローティングを閉じてもメインの翻訳は止まらない。
+        jobs.cancel_current_for_origin("floating");
+        assert!(!cancel.load(Ordering::SeqCst));
+
+        jobs.cancel_current_for_origin("main");
+        assert!(cancel.load(Ordering::SeqCst));
+
+        jobs.finish(id);
+        assert_eq!(jobs.current_job_id(), None);
     }
 
     /// OpenAI 互換の SSE を、指定した断片のまま返す小さなサーバ。

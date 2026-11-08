@@ -122,7 +122,7 @@ export class OutputPane {
 }
 
 /** クリップボードへ書く。権限や API が無いときは textarea + execCommand に落とす。 */
-async function writeClipboard(text: string): Promise<boolean> {
+export async function writeClipboard(text: string): Promise<boolean> {
   try {
     const clipboard = navigator.clipboard;
     if (clipboard !== undefined && typeof clipboard.writeText === "function") {

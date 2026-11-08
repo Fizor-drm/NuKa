@@ -1319,3 +1319,235 @@ html:lang(zh-Hans) {
     animation: none;
   }
 }
+
+/* ---------- フローティングウィンドウ ---------- */
+
+.floating-body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.floating {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.floating-bar {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 8px;
+  background: var(--canvas);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.floating-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.floating-drag {
+  flex: 1;
+  align-self: stretch;
+  min-width: 8px;
+}
+
+.floating-lang {
+  position: relative;
+  min-width: 0;
+}
+
+.floating-lang-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 150px;
+  padding: 3px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--ink);
+  font-size: 12px;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.floating-lang-button:hover,
+.floating-lang-button[aria-expanded="true"] {
+  background: var(--hover);
+  border-color: var(--muted);
+}
+
+.floating-lang-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.floating-lang-chevron {
+  flex: none;
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.floating-lang-button[aria-expanded="true"] .floating-lang-chevron {
+  transform: rotate(180deg);
+}
+
+.floating-lang-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  left: auto;
+  z-index: 60;
+  width: 220px;
+  max-width: calc(100vw - 20px);
+  max-height: 235px;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  outline: none;
+}
+
+.floating-lang-popover[hidden] {
+  display: none;
+}
+
+.floating-lang-option {
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.floating-lang-option[data-active="true"]:not([aria-selected="true"]) {
+  background: var(--hover);
+}
+
+.floating-lang-option[aria-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-on-soft);
+}
+
+.floating-lang-option:hover:not([aria-selected="true"]) {
+  background: var(--hover);
+}
+
+.floating-copy,
+.floating-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.floating-close {
+  width: 24px;
+  padding: 0;
+}
+
+.floating-copy:hover,
+.floating-close:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.floating-copy[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.45;
+}
+
+.floating-copy[aria-disabled="true"]:hover {
+  background: transparent;
+}
+
+.floating-copy span[data-state="ok"] {
+  color: var(--ok);
+}
+
+.floating-copy span[data-state="error"] {
+  color: var(--err);
+}
+
+.floating-content {
+  min-height: 0;
+  padding: 12px 14px;
+  overflow-y: auto;
+  user-select: text;
+}
+
+.floating-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.floating-message[data-state="error"] {
+  color: var(--err);
+}
+
+.floating-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 設定: フローティングウィンドウ ---------- */
+
+.hotkey-button {
+  min-width: 160px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hotkey-button[data-recording="true"] {
+  border-color: var(--accent);
+  color: var(--accent-on-soft);
+}
+
+.settings-error {
+  margin: 0;
+  color: var(--err);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

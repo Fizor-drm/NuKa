@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,10 +47,18 @@ zip = "2"
 url = "2"
 
 # 子プロセス (llama-server) を Job Object で OS に後始末させるため (Windows のみ)。
+# フローティングウィンドウの選択テキスト取得 (SendInput / GetAsyncKeyState)、
+# カーソル位置とモニタ作業領域 (GetCursorPos / GetMonitorInfoW)、クリップボード
+# (DataExchange / Memory) も Windows API を使う。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_DataExchange",
     "Win32_System_JobObjects",
+    "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }

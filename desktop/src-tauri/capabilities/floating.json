@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "floating",
+  "description": "フローティング翻訳ウィンドウの権限。イベント購読とコマンド呼び出し (core:default) のみを許可する。dialog と opener は付与しない (このウィンドウはファイル選択も外部リンクも開かない)。",
+  "windows": ["floating"],
+  "permissions": ["core:default"]
+}

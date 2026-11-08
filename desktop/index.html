@@ -595,6 +595,13 @@
                 </svg>
                 <span data-i18n="settings.languageHeading">言語</span>
               </button>
+              <button type="button" class="settings-nav-item" data-section="floating">
+                <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <rect x="3" y="5" width="18" height="14" rx="2" />
+                  <path d="M3 9h18" />
+                </svg>
+                <span data-i18n="settings.floating.heading">フローティングウィンドウ</span>
+              </button>
               <button type="button" class="settings-nav-item" data-section="update">
                 <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
                   <path d="M12 3v12" />
@@ -688,6 +695,45 @@
                     简体中文
                   </label>
                 </div>
+              </section>
+
+              <section
+                class="settings-section settings-card"
+                data-panel="floating"
+                aria-labelledby="floating-heading"
+                hidden
+              >
+                <div class="settings-section-head">
+                  <h2
+                    class="settings-heading"
+                    id="floating-heading"
+                    data-i18n="settings.floating.heading"
+                  >
+                    フローティングウィンドウ
+                  </h2>
+                </div>
+                <label class="settings-check">
+                  <input type="checkbox" id="floating-enabled" />
+                  <span data-i18n="settings.floating.enable">
+                    グローバルショートカットで翻訳ウィンドウを表示する
+                  </span>
+                </label>
+                <div class="settings-field">
+                  <span class="settings-label" data-i18n="settings.floating.hotkeyLabel">
+                    ホットキー
+                  </span>
+                  <button type="button" class="secondary-button hotkey-button" id="floating-hotkey">
+                    Ctrl+Shift+T
+                  </button>
+                  <span class="settings-muted" data-i18n="settings.floating.hotkeyRecord">
+                    キーを押して記録
+                  </span>
+                </div>
+                <p class="settings-note" id="floating-hotkey-usage"></p>
+                <p class="settings-error" id="floating-hotkey-error" role="status" hidden></p>
+                <p class="settings-muted" data-i18n="settings.floating.adminNote">
+                  管理者権限で実行されているアプリの上では、選択テキストを取得できません。
+                </p>
               </section>
 
               <section

@@ -28,6 +28,7 @@ import {
   onTranslationDone,
   onTranslationError,
   onTranslationProgress,
+  onTranslationSuperseded,
   onUpdateDone,
   onUpdateError,
   onUpdateProgress,
@@ -35,6 +36,7 @@ import {
   type DetectedLanguage,
   type DownloadKind,
   type EngineStatus,
+  type FloatingSettingsPatch,
   type GlossaryPair,
   type InstalledModel,
   type SettingsPatch,
@@ -125,6 +127,11 @@ interface AppState {
   autoUpdateCheck: boolean;
   uiLanguage: UiLanguage;
   update: UpdateUiState;
+  floatingEnabled: boolean;
+  floatingHotkey: string;
+  floatingRecording: boolean;
+  floatingRecordingWasEnabled: boolean;
+  floatingError: string | null;
 }
 
 const state: AppState = {
@@ -150,6 +157,11 @@ const state: AppState = {
   autoUpdateCheck: true,
   uiLanguage: "ja",
   update: { phase: "idle", check: null, progress: null, message: "" },
+  floatingEnabled: true,
+  floatingHotkey: "Ctrl+Shift+T",
+  floatingRecording: false,
+  floatingRecordingWasEnabled: false,
+  floatingError: null,
 };
 
 function byId<T extends HTMLElement>(id: string): T {
@@ -225,9 +237,21 @@ const updateCancelEl = byId<HTMLButtonElement>("update-cancel");
 const autoUpdateCheckEl = byId<HTMLInputElement>("auto-update-check");
 const updateControlEl = updateToggleEl.parentElement;
 const settingsVersionEl = byId<HTMLSpanElement>("settings-version");
-type SettingsSection = "runtime" | "language" | "update" | "models";
 
-const SETTINGS_SECTIONS: readonly SettingsSection[] = ["runtime", "language", "update", "models"];
+const floatingEnabledEl = byId<HTMLInputElement>("floating-enabled");
+const floatingHotkeyEl = byId<HTMLButtonElement>("floating-hotkey");
+const floatingUsageEl = byId<HTMLParagraphElement>("floating-hotkey-usage");
+const floatingErrorEl = byId<HTMLParagraphElement>("floating-hotkey-error");
+
+type SettingsSection = "runtime" | "language" | "floating" | "update" | "models";
+
+const SETTINGS_SECTIONS: readonly SettingsSection[] = [
+  "runtime",
+  "language",
+  "floating",
+  "update",
+  "models",
+];
 
 const settingsNavEl = byId<HTMLElement>("settings-nav");
 const settingsNavItems = Array.from(
@@ -332,6 +356,11 @@ let waiter: InvokeWaiter | null = null;
 let staleJobId: number | null = null;
 let pendingTranslate = false;
 let appStatusTimer: number | undefined;
+/** invoke 返却前に見た superseded の jobId (取りこぼし防止)。 */
+const supersededJobs = new Set<number>();
+/** 記録開始時にホットキーを外す処理。完了まではキー入力を受け付けない。 */
+let hotkeySuspendTask: Promise<unknown> | null = null;
+let hotkeySuspendPending = false;
 
 function getSourceText(): string {
   return sourceInputEl.value;
@@ -597,6 +626,27 @@ function applyJobEvent(event: JobEvent): void {
   }
 }
 
+/** 自ジョブが新しい翻訳に差し替えられた。done も error も来ないので表示を止める。 */
+function handleTranslationSuperseded(jobId: number): void {
+  if (state.jobId === jobId) {
+    // 累積済みの訳文は残し、翻訳中表示だけ止める。
+    state.translating = false;
+    state.progress = null;
+    state.jobId = null;
+    renderAll();
+    return;
+  }
+  if (waiter !== null) {
+    supersededJobs.add(jobId);
+    if (supersededJobs.size > 32) {
+      const oldest = supersededJobs.values().next().value;
+      if (oldest !== undefined) {
+        supersededJobs.delete(oldest);
+      }
+    }
+  }
+}
+
 async function requestTranslate(): Promise<void> {
   const text = getSourceText();
   if (text.trim() === "") {
@@ -637,6 +687,14 @@ async function requestTranslate(): Promise<void> {
     }
     waiter = null;
     state.jobId = jobId;
+    if (supersededJobs.delete(jobId)) {
+      // invoke の返却前に別ウィンドウの翻訳へ差し替えられていた。
+      state.translating = false;
+      state.progress = null;
+      state.jobId = null;
+      renderAll();
+      return;
+    }
     const buffered = myWaiter.buffer.splice(0);
     for (const event of buffered) {
       if (event.jobId === jobId) {
@@ -743,6 +801,7 @@ function handleSourceLanguage(code: string): void {
 
 function handleTargetLanguage(code: string): void {
   state.targetLang = code;
+  reportMainTargetLang();
   renderFormChips();
   renderLanguageBar();
   maybeRetranslate();
@@ -922,12 +981,174 @@ async function loadSettings(): Promise<void> {
     setUiLanguage(state.uiLanguage);
     applyTranslations();
     state.modelsDirSetting = settings.models_dir;
+    state.floatingEnabled = settings.floating_window.enabled;
+    state.floatingHotkey = settings.floating_window.hotkey;
   } catch {
     // 設定が読めなくても既定値で動かす
   }
   applyTheme(state.theme);
   renderThemeButton(themeToggleEl, state.theme);
   renderAutoToggle();
+  reportMainTargetLang();
+}
+
+// ---------------------------------------------------------------------------
+// フローティングウィンドウ (Phase 1)
+// ---------------------------------------------------------------------------
+
+/** メイン画面の訳先言語を Rust に知らせる (フローティングの初期訳先)。 */
+function reportMainTargetLang(): void {
+  void ipc.setMainTargetLang(state.targetLang).catch(() => undefined);
+}
+
+function renderFloatingSettings(): void {
+  floatingEnabledEl.checked = state.floatingEnabled || state.floatingRecording;
+  floatingEnabledEl.disabled = state.floatingRecording;
+  floatingHotkeyEl.textContent = state.floatingRecording
+    ? t("settings.floating.hotkeyRecording")
+    : state.floatingHotkey;
+  floatingHotkeyEl.dataset["recording"] = String(state.floatingRecording);
+  floatingHotkeyEl.setAttribute("aria-pressed", String(state.floatingRecording));
+  floatingHotkeyEl.setAttribute("aria-label", t("settings.floating.hotkeyLabel"));
+  floatingHotkeyEl.title = state.floatingRecording
+    ? t("settings.floating.hotkeyRecording")
+    : t("settings.floating.hotkeyRecord");
+  floatingUsageEl.textContent = t("settings.floating.usage", {
+    hotkey: state.floatingHotkey,
+  });
+  floatingErrorEl.hidden = state.floatingError === null;
+  floatingErrorEl.textContent = state.floatingError ?? "";
+}
+
+/** 設定を保存し直し、失敗したら真の値を取り直す。 */
+async function applyFloatingSettings(patch: FloatingSettingsPatch): Promise<boolean> {
+  try {
+    const settings = await ipc.setFloatingSettings(patch);
+    state.floatingEnabled = settings.floating_window.enabled;
+    state.floatingHotkey = settings.floating_window.hotkey;
+    state.floatingError = null;
+    return true;
+  } catch (error) {
+    state.floatingError = describeError(error);
+    // 保存は成功して登録だけ失敗したケース (ホットキー競合) があるため、
+    // 画面の値を保存済みの設定へ合わせ直す。
+    await syncFloatingSettings();
+    return false;
+  }
+}
+
+async function syncFloatingSettings(): Promise<void> {
+  try {
+    const settings = await ipc.getSettings();
+    state.floatingEnabled = settings.floating_window.enabled;
+    state.floatingHotkey = settings.floating_window.hotkey;
+  } catch {
+    // 取得できなければ現在の表示を保つ。
+  }
+}
+
+async function handleFloatingToggle(): Promise<void> {
+  if (state.floatingRecording) {
+    return;
+  }
+  const desired = floatingEnabledEl.checked;
+  state.floatingEnabled = desired;
+  floatingEnabledEl.disabled = true;
+  await applyFloatingSettings({ enabled: desired });
+  floatingEnabledEl.disabled = false;
+  renderFloatingSettings();
+}
+
+/**
+ * ホットキーの記録を始める。
+ *
+ * 記録中は設定を一時的に「無効」にして OS からホットキーを外す。そうしないと、
+ * いま登録されている組み合わせを押しても RegisterHotKey に横取りされて keydown が
+ * 届かず、同じキーを記録し直せない。終了時 (Esc・保存・フォーカス移動) に元へ戻す。
+ */
+function startHotkeyRecording(): void {
+  if (state.floatingRecording) {
+    return;
+  }
+  state.floatingRecording = true;
+  state.floatingRecordingWasEnabled = state.floatingEnabled;
+  state.floatingError = null;
+  renderFloatingSettings();
+  floatingHotkeyEl.focus();
+  if (state.floatingRecordingWasEnabled) {
+    hotkeySuspendPending = true;
+    hotkeySuspendTask = applyFloatingSettings({ enabled: false }).then(() => {
+      hotkeySuspendPending = false;
+      hotkeySuspendTask = null;
+      if (state.floatingRecording) {
+        renderFloatingSettings();
+      }
+    });
+  }
+}
+
+async function stopHotkeyRecording(restoreEnabled: boolean): Promise<void> {
+  if (!state.floatingRecording) {
+    return;
+  }
+  state.floatingRecording = false;
+  hotkeySuspendPending = false;
+  // 記録開始時の「無効化」がまだ終わっていない場合は、先に完了を待つ。
+  // 待たずに有効化すると、あとから無効化が適用されてホットキーが消える。
+  if (hotkeySuspendTask !== null) {
+    await hotkeySuspendTask;
+  }
+  if (restoreEnabled && state.floatingRecordingWasEnabled) {
+    await applyFloatingSettings({ enabled: true });
+  }
+  renderFloatingSettings();
+}
+
+/** keydown から "Ctrl+Shift+T" を作る。対象外なら null。 */
+function comboFromEvent(event: KeyboardEvent): string | null {
+  if (event.metaKey) {
+    // Win キー併用は設定画面の案内 (Ctrl/Alt/Shift + 英数字) に含めない。
+    return null;
+  }
+  if (!event.ctrlKey && !event.altKey && !event.shiftKey) {
+    return null;
+  }
+  if (event.key.length !== 1 || !/^[a-zA-Z0-9]$/.test(event.key)) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (event.ctrlKey) {
+    parts.push("Ctrl");
+  }
+  if (event.altKey) {
+    parts.push("Alt");
+  }
+  if (event.shiftKey) {
+    parts.push("Shift");
+  }
+  parts.push(event.key.toUpperCase());
+  return parts.join("+");
+}
+
+async function saveRecordedHotkey(combo: string): Promise<void> {
+  const restoreEnabled = state.floatingRecordingWasEnabled;
+  state.floatingRecording = false;
+  hotkeySuspendPending = false;
+  state.floatingHotkey = combo;
+  state.floatingError = null;
+  renderFloatingSettings();
+
+  // 記録開始時の無効化がまだ終わっていない場合は先に待つ。
+  if (hotkeySuspendTask !== null) {
+    await hotkeySuspendTask;
+  }
+  // 記録開始時に無効化していたなら、ホットキー保存後に有効へ戻す。
+  // この再有効化で登録を試みるので、競合はここでエラーになる。
+  await applyFloatingSettings({ hotkey: combo });
+  if (restoreEnabled && !state.floatingEnabled) {
+    await applyFloatingSettings({ enabled: true });
+  }
+  renderFloatingSettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1393,7 @@ function renderSettings(): void {
   for (const input of uiLanguageInputs) {
     input.checked = input.value === state.uiLanguage;
   }
+  renderFloatingSettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,6 +1794,9 @@ function bindTranslationEvents(): void {
   onTranslationError((payload) => {
     handleJobEvent({ kind: "error", jobId: payload.jobId, message: payload.message });
   });
+  onTranslationSuperseded((payload) => {
+    handleTranslationSuperseded(payload.jobId);
+  });
 }
 
 function bindDownloadEvents(): void {
@@ -1708,6 +1933,62 @@ function bindUi(): void {
 
   autoUpdateCheckEl.addEventListener("change", () => {
     void handleAutoUpdateCheckChange();
+  });
+
+  floatingEnabledEl.addEventListener("change", () => {
+    void handleFloatingToggle();
+  });
+
+  floatingHotkeyEl.addEventListener("click", () => {
+    if (!state.floatingRecording) {
+      startHotkeyRecording();
+    }
+  });
+
+  floatingHotkeyEl.addEventListener("keydown", (event) => {
+    if (!state.floatingRecording) {
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      void stopHotkeyRecording(true);
+      return;
+    }
+    if (event.key === "Tab") {
+      // フォーカス移動は妨げない。blur 側で記録を終える。
+      return;
+    }
+    if (hotkeySuspendPending) {
+      // 現在のホットキーを OS から外し終えるまで、押下は記録しない。
+      event.preventDefault();
+      return;
+    }
+    if (
+      event.key === "Control" ||
+      event.key === "Shift" ||
+      event.key === "Alt" ||
+      event.key === "Meta" ||
+      event.key === "CapsLock"
+    ) {
+      event.preventDefault();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const combo = comboFromEvent(event);
+    if (combo === null) {
+      state.floatingError = t("settings.floating.hotkeyInvalid");
+      renderFloatingSettings();
+      return;
+    }
+    void saveRecordedHotkey(combo);
+  });
+
+  floatingHotkeyEl.addEventListener("blur", () => {
+    if (state.floatingRecording) {
+      void stopHotkeyRecording(true);
+    }
   });
 
   for (const item of settingsNavItems) {
