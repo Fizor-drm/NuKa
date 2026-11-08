@@ -1113,9 +1113,26 @@ function comboFromEvent(event: KeyboardEvent): string | null {
   if (!event.ctrlKey && !event.altKey && !event.shiftKey) {
     return null;
   }
-  if (event.key.length !== 1 || !/^[a-zA-Z0-9]$/.test(event.key)) {
+
+  let key: string | null = null;
+  if (event.key.length === 1 && /^[a-zA-Z0-9]$/.test(event.key)) {
+    key = event.key.toUpperCase();
+  } else {
+    // Shift + 数字では event.key が "!" などの記号になる。物理キー (Digit0-9)
+    // から数字を復元し、バックエンドの parse_hotkey が受け付ける形にする。
+    const digitKey = /^Digit([0-9])$/.exec(event.code)?.[1];
+    if (digitKey !== undefined) {
+      key = digitKey;
+    } else if (event.keyCode >= 48 && event.keyCode <= 57) {
+      // 合成入力 (agent-desktop の SendInput など) では event.code が DigitN に
+      // ならないことがある。VK (0x30-0x39) は正しく届くので数字を復元する。
+      key = String(event.keyCode - 48);
+    }
+  }
+  if (key === null) {
     return null;
   }
+
   const parts: string[] = [];
   if (event.ctrlKey) {
     parts.push("Ctrl");
@@ -1126,7 +1143,7 @@ function comboFromEvent(event: KeyboardEvent): string | null {
   if (event.shiftKey) {
     parts.push("Shift");
   }
-  parts.push(event.key.toUpperCase());
+  parts.push(key);
   return parts.join("+");
 }
 
