@@ -293,9 +293,8 @@ pub async fn set_floating_settings(
             Ok(())
         })
         .map_err(|error| {
-            let message = format!("設定を保存できませんでした: {error}");
-            LocalizedText::new("settings.floating.saveFailed", message.clone())
-                .param("detail", message)
+            let fallback = format!("設定を保存できませんでした: {error}");
+            LocalizedText::new("settings.floating.saveFailed", fallback).param("detail", error)
         })?;
 
     // ショートカットの登録はプラグインがメインスレッドの処理完了を待つ。

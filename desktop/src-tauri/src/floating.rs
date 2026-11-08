@@ -572,6 +572,9 @@ pub fn setup(app: &AppHandle) -> Result<(), LocalizedText> {
 ///
 /// この関数はプラグインがメインスレッドを待つため、**メインスレッド以外**から呼ぶこと。
 pub fn apply_hotkey(app: &AppHandle, state: &FloatingState) -> Result<(), LocalizedText> {
+    // 登録ロックを先に取る。設定の読み取りと登録の順序が入れ替わると、
+    // 並行する set_floating_settings の後に古い設定で登録してしまう。
+    let mut registered = state.lock_registered();
     let Some(app_state) = app.try_state::<AppState>() else {
         return Ok(());
     };
@@ -582,7 +585,6 @@ pub fn apply_hotkey(app: &AppHandle, state: &FloatingState) -> Result<(), Locali
         None
     };
 
-    let mut registered = state.lock_registered();
     let previous = *registered;
     if let Some(previous) = previous {
         if let Err(error) = app.global_shortcut().unregister(previous) {
@@ -785,20 +787,75 @@ fn hide_with_reason(app: &AppHandle, reason: &str) {
     );
 }
 
+/// `handle_window_event` の判定をユニットテストできるようにしたイベント種別。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowEventKind {
+    CloseRequested,
+    Destroyed,
+    Focused(bool),
+    Other,
+}
+
+/// ウィンドウイベントに対して取るべき動作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAction {
+    /// floating の明示的な close (Alt+F4 など) を止めて hide する。
+    PreventFloatingClose,
+    /// floating のフォーカス変化を処理する。
+    HandleFloatingFocus(bool),
+    /// メイン破棄時に隠れた floating を destroy する。
+    DestroyFloating,
+    Ignore,
+}
+
+fn decide_window_action(label: &str, kind: WindowEventKind) -> WindowAction {
+    match (label, kind) {
+        (FLOATING_LABEL, WindowEventKind::CloseRequested) => WindowAction::PreventFloatingClose,
+        (FLOATING_LABEL, WindowEventKind::Focused(focused)) => {
+            WindowAction::HandleFloatingFocus(focused)
+        }
+        (MAIN_LABEL, WindowEventKind::Destroyed) => WindowAction::DestroyFloating,
+        _ => WindowAction::Ignore,
+    }
+}
+
 /// ウィンドウイベント。lib.rs の `on_window_event` から呼ぶ。
 pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
-    match event {
-        WindowEvent::Focused(focused) if window.label() == FLOATING_LABEL => {
-            handle_floating_focus(window.app_handle(), *focused);
-        }
-        // 非表示のフローティングが残っていると「最後のウィンドウを閉じた」にならず、
-        // アプリが終了できない。メインが破棄されたら一緒に閉じる。
-        WindowEvent::Destroyed if window.label() == MAIN_LABEL => {
-            if let Some(floating) = window.app_handle().get_webview_window(FLOATING_LABEL) {
-                let _ = floating.close();
+    let kind = match event {
+        WindowEvent::CloseRequested { .. } => WindowEventKind::CloseRequested,
+        WindowEvent::Destroyed => WindowEventKind::Destroyed,
+        WindowEvent::Focused(focused) => WindowEventKind::Focused(*focused),
+        _ => WindowEventKind::Other,
+    };
+
+    match decide_window_action(window.label(), kind) {
+        WindowAction::PreventFloatingClose => {
+            // Alt+F4 などで floating を破棄されると、以降 hotkey が無反応になる
+            // (get_webview_window が None になる)。close を止めて hide する。
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
             }
+            hide(window.app_handle(), "window-close");
         }
-        _ => {}
+        WindowAction::HandleFloatingFocus(focused) => {
+            handle_floating_focus(window.app_handle(), focused);
+        }
+        WindowAction::DestroyFloating => {
+            // メインが破棄されたら、隠れた floating を破棄してアプリを終了できる
+            // ようにする。prevent_close があるため close() では止められるので
+            // destroy() を使う。destroy() は proxy 経由でイベントループへ送られる
+            // (main スレッドで直接実行されない) ため、ここから呼んでも安全。
+            if let Some(floating) = window.app_handle().get_webview_window(FLOATING_LABEL) {
+                if let Err(error) = floating.destroy() {
+                    eprintln!("フローティングウィンドウを破棄できません: {error}");
+                }
+            }
+            // destroy() だけでは Tauri が ExitRequested を出さず、イベントループと
+            // プロセスが残る。RequestExit (proxy 経由) で明示的に終了を要求し、
+            // lib.rs の ExitRequested ハンドラで llama-server も止める。
+            window.app_handle().exit(0);
+        }
+        WindowAction::Ignore => {}
     }
 }
 
@@ -871,6 +928,23 @@ fn schedule_blur_hide(app: &AppHandle, epoch: u64, delay: Duration) {
 // 選択テキストの取得フロー
 // ---------------------------------------------------------------------------
 
+/// Ctrl+C でクリップボードが更新されたかと、読み取った内容から選択テキストを
+/// 採用するかを決める。
+///
+/// クリップボードに既に入っているのと同じ文字列を選択した場合、テキスト比較では
+/// 「変化なし」と誤判定する。呼び出し側は GetClipboardSequenceNumber の変化で
+/// コピーの成否を判定し、その結果を `copied` に渡す。
+fn decide_selected(copied: bool, captured: Option<&str>) -> Option<String> {
+    if !copied {
+        return None;
+    }
+    let text = captured?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
     let Some(window) = app.get_webview_window(FLOATING_LABEL) else {
         return;
@@ -882,16 +956,14 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
     // 前景アプリの選択テキストを取るため、クリップボードを退避してから Ctrl+C を送る。
     let backup = read_clipboard_text();
     wait_for_modifiers_release(MODIFIER_WAIT_LIMIT);
+    // 既に同じテキストがクリップボードにあっても、Ctrl+C でコピーが起きたかを
+    // シーケンス番号の変化で判定する (テキスト比較では noSelection と誤判定する)。
+    let sequence_before = clipboard_sequence_number();
     send_copy_shortcut();
     std::thread::sleep(CLIPBOARD_SETTLE);
+    let sequence_after = clipboard_sequence_number();
     let captured = read_clipboard_text();
-
-    let selected = match captured {
-        Some(text) if !text.trim().is_empty() && backup.as_deref() != Some(text.as_str()) => {
-            Some(text)
-        }
-        _ => None,
-    };
+    let selected = decide_selected(sequence_after != sequence_before, captured.as_deref());
 
     // 退避がテキストだったときだけ戻す。画像などは復元しない (README に明記)。
     if let Some(text) = backup.as_deref().filter(|text| !text.is_empty()) {
@@ -951,7 +1023,7 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
     let visible_after_show = window.is_visible().unwrap_or(false);
     let focused_after_show = window.is_focused().unwrap_or(false);
     debug_log!(
-        "capture: text={text_debug} visible={visible_after_show} focused={focused_after_show} pos={position_log} show_epoch={display_epoch} since_hotkey={:?} shown_in={:?}",
+        "capture: text={text_debug} clipboard_seq={sequence_before}->{sequence_after} visible={visible_after_show} focused={focused_after_show} pos={position_log} show_epoch={display_epoch} since_hotkey={:?} shown_in={:?}",
         trigger_started.elapsed(),
         show_started.elapsed()
     );
@@ -964,6 +1036,20 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
 // ---------------------------------------------------------------------------
 // Windows API (unsafe はこの範囲だけ)
 // ---------------------------------------------------------------------------
+
+/// クリップボードの更新回数。Ctrl+C で内容が変わったかの判定に使う。
+#[cfg(windows)]
+fn clipboard_sequence_number() -> u32 {
+    use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+
+    // SAFETY: クリップボードの更新回数を読むだけ。
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+#[cfg(not(windows))]
+fn clipboard_sequence_number() -> u32 {
+    0
+}
 
 /// クリップボードを開く。他プロセスが掴んでいることがあるので少しリトライする。
 #[cfg(windows)]
@@ -1481,6 +1567,50 @@ mod tests {
         for value in ["", "   ", "auto hide", "あ", long.as_str()] {
             assert_eq!(sanitize_origin(value), "unknown", "{value:?}");
         }
+    }
+
+    #[test]
+    fn selection_requires_a_successful_copy_and_non_empty_text() {
+        assert_eq!(
+            decide_selected(true, Some("hello")),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            decide_selected(true, Some("  hello  ")),
+            Some("  hello  ".to_string())
+        );
+        assert_eq!(decide_selected(true, Some("   ")), None);
+        assert_eq!(decide_selected(true, None), None);
+        // シーケンスが変わっていなければ、同じ文字列でも選択なし扱い。
+        assert_eq!(decide_selected(false, Some("hello")), None);
+        assert_eq!(decide_selected(false, None), None);
+    }
+
+    #[test]
+    fn window_actions_cover_close_focus_and_main_destroyed() {
+        use WindowAction::{DestroyFloating, HandleFloatingFocus, Ignore, PreventFloatingClose};
+        use WindowEventKind::{CloseRequested, Destroyed, Focused, Other};
+
+        assert_eq!(
+            decide_window_action(FLOATING_LABEL, CloseRequested),
+            PreventFloatingClose
+        );
+        assert_eq!(
+            decide_window_action(FLOATING_LABEL, Focused(true)),
+            HandleFloatingFocus(true)
+        );
+        assert_eq!(
+            decide_window_action(FLOATING_LABEL, Focused(false)),
+            HandleFloatingFocus(false)
+        );
+        assert_eq!(decide_window_action(FLOATING_LABEL, Destroyed), Ignore);
+        assert_eq!(decide_window_action(FLOATING_LABEL, Other), Ignore);
+
+        assert_eq!(decide_window_action(MAIN_LABEL, Destroyed), DestroyFloating);
+        assert_eq!(decide_window_action(MAIN_LABEL, CloseRequested), Ignore);
+        assert_eq!(decide_window_action(MAIN_LABEL, Focused(false)), Ignore);
+        assert_eq!(decide_window_action("other", Destroyed), Ignore);
+        assert_eq!(decide_window_action("other", CloseRequested), Ignore);
     }
 
     #[test]
