@@ -1332,6 +1332,10 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option
     // `engine_role` の status を見て「エンジンを起動しています」を出してから
     // 翻訳に入る。常時起動が ON ならここは何もしない (モデル読み込み待ちなし)。
     // 選択なし (noSelection) のときは起動しない (無駄に VRAM を使わない)。
+    //
+    // ここはまだ `window.show()` / `state.floating.set_shown(true)` の前。
+    // 起動完了後の後追い同期は「ポリシー/モデルが変わったとき」だけ走るので、
+    // この時点で floating_shown=false でも、起動したエンジンは止められない。
     if selected.is_some() {
         crate::ensure_engine_started(app, EngineRole::Floating);
     }

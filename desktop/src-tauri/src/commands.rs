@@ -566,11 +566,19 @@ fn decide_job_engine(
     JobEngineAction::Start
 }
 
-/// 予約済みの起動を非同期で実行し、完了後に常駐ポリシーを再評価する。
+/// 予約済みの起動を非同期で実行し、必要なら完了後に常駐ポリシーを再評価する。
 ///
 /// 起動に失敗した (子を掴んでいない) ときは再評価しない。再評価すると、起動失敗
-/// のたびに同じ起動を繰り返してしまう。起動が成功した場合は、待っている間に
-/// 設定が変わっていても最新ポリシーで起こし直す (M1: 起動完了 sync)。
+/// のたびに同じ起動を繰り返してしまう。
+///
+/// **後追い同期は「起動中に常駐ポリシーかモデルが変わった」ときだけ**走らせる。
+/// ホットキー経路は [`crate::ensure_engine_started`] を `window.show()` /
+/// `set_shown(true)` より前に呼ぶ (floating.rs の `capture_and_show`)。attach 直後に
+/// 無条件で同期すると、その時点では `floating_shown=false`・ジョブ無し・非保持先で
+/// Stop と判定され、ロード中のエンジンを止めて次の translate で二重ロードになる。
+/// イベントループ開始前の setup ではメインウィンドウは config (tauri.conf.json の
+/// `main`、`visible` 既定 true) の作成が setup より先に行われるが、可視性に依存
+/// しない判定にしておく。
 fn spawn_reserved_with_sync(
     app: &AppHandle,
     engine: &Engine,
@@ -581,18 +589,53 @@ fn spawn_reserved_with_sync(
     let engine = engine.clone();
     tauri::async_runtime::spawn(async move {
         engine.spawn_reserved(reserved, &settings).await;
-        if resync_after_start(engine.has_process()) {
+        if !resync_after_start(engine.has_process()) {
+            return;
+        }
+        let Some(state) = app_handle.try_state::<AppState>() else {
+            return;
+        };
+        let latest = {
+            let control = state.engine_control.lock();
+            control.effective_settings(state.settings.get())
+        };
+        let search_root = crate::engine::exe_directory();
+        if start_needs_follow_up_sync(engine.role(), &settings, &latest, &search_root) {
             sync_engines_now(&app_handle);
         }
     });
 }
 
-/// 起動完了後に常駐ポリシーを再評価するか (M1)。
+/// 起動完了後に常駐ポリシーの再評価を依頼するか (M1)。
 ///
 /// 起動に失敗した (子を掴んでいない) ときに再評価すると、同じ起動を繰り返して
-/// しまうため行わない。成功時だけ、待っている間に変わった設定を反映する。
+/// しまうため行わない。成功時だけ、ポリシー/モデルの変化を確認する。
 fn resync_after_start(has_process: bool) -> bool {
     has_process
+}
+
+/// 起動に使った設定と現在の実効設定で、後追い同期が必要か。
+///
+/// 次のどちらかが変わったときだけ true:
+/// - 常駐ポリシー ([`crate::engine::resident_target`] の保持先・解決モデル・理由)
+/// - このエンジンの役割が読むモデル ([`crate::engine::resolved_model_path`])
+///
+/// ホットキー・起動時・復元・ジョブ復旧の「明示的な事前起動」は、たとえ
+/// フローティングウィンドウがまだ表示されていなくても、来るべきジョブのために
+/// 保持する。無関係な設定 (ホットキー等) の変化でも同期しない。
+fn start_needs_follow_up_sync(
+    role: EngineRole,
+    started: &Settings,
+    latest: &Settings,
+    search_root: &Path,
+) -> bool {
+    if crate::engine::resident_target(started, search_root)
+        != crate::engine::resident_target(latest, search_root)
+    {
+        return true;
+    }
+    crate::engine::resolved_model_path(role, started, search_root)
+        != crate::engine::resolved_model_path(role, latest, search_root)
 }
 
 /// 起動を予約して spawn を依頼する。呼び出し側は制御ロックを保持していること。
@@ -2263,10 +2306,95 @@ mod tests {
 
     #[test]
     fn a_completed_start_requests_a_follow_up_sync() {
-        // M1: 起動が成功したときだけ完了後の再同期を予約する。
+        // M1: 起動が成功したときだけ完了後の再評価を検討する。
         // 失敗時に予約すると、同じ起動を繰り返してしまう。
         assert!(resync_after_start(true));
         assert!(!resync_after_start(false));
+
+        // ポリシーもモデルも変わっていなければ、後追い同期は走らせない
+        // (ホットキー/起動時の事前起動を直後に止めない: Major)。
+        let unchanged = Settings::default();
+        assert!(!start_needs_follow_up_sync(
+            EngineRole::Main,
+            &unchanged,
+            &unchanged,
+            Path::new(".")
+        ));
+
+        // 実ファイルのモデルで、モデル変更/常駐変更を検出する。
+        let base =
+            std::env::temp_dir().join(format!("nuka-start-follow-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp dir");
+        let wide = base.join("14b.gguf");
+        std::fs::write(&wide, b"m").expect("wide model");
+        let small = base.join("0.8b.gguf");
+        std::fs::write(&small, b"m").expect("small model");
+        let installed = |file: &str, path: &std::path::Path| crate::settings::InstalledModel {
+            file: file.to_string(),
+            repo: "pfnet/test".to_string(),
+            bytes: 1,
+            path: path.to_string_lossy().into_owned(),
+            installed_at: 0,
+        };
+        let started = Settings {
+            active_model: Some("14b.gguf".to_string()),
+            installed_models: vec![installed("14b.gguf", &wide), installed("0.8b.gguf", &small)],
+            ..Default::default()
+        };
+        assert!(!start_needs_follow_up_sync(
+            EngineRole::Main,
+            &started,
+            &started,
+            &base
+        ));
+        // 無関係な設定 (ホットキー) の変更では同期しない。
+        let mut hotkey_changed = started.clone();
+        hotkey_changed.floating_window.hotkey = "Ctrl+Alt+X".to_string();
+        assert!(!start_needs_follow_up_sync(
+            EngineRole::Main,
+            &started,
+            &hotkey_changed,
+            &base
+        ));
+        // 起動中にアクティブモデルが変わった: 再同期する。
+        let mut model_changed = started.clone();
+        model_changed.active_model = Some("0.8b.gguf".to_string());
+        assert!(start_needs_follow_up_sync(
+            EngineRole::Main,
+            &started,
+            &model_changed,
+            &base
+        ));
+        // 起動中に常駐ポリシーが変わった (専用モデル ON→OFF): 再同期する。
+        let mut resident_on = started.clone();
+        resident_on.floating_window.model = Some("0.8b.gguf".to_string());
+        let mut resident_off = resident_on.clone();
+        resident_off.background.resident_engine = false;
+        assert!(start_needs_follow_up_sync(
+            EngineRole::Floating,
+            &resident_on,
+            &resident_off,
+            &base
+        ));
+        // 常駐 OFF 同士でも専用モデルが変われば再同期する。
+        let mut dedicated_changed = resident_off.clone();
+        dedicated_changed.floating_window.model = Some("14b.gguf".to_string());
+        assert!(start_needs_follow_up_sync(
+            EngineRole::Floating,
+            &resident_off,
+            &dedicated_changed,
+            &base
+        ));
+        // 変化なし (常駐 ON のまま) は同期しない。
+        let same = resident_on.clone();
+        assert!(!start_needs_follow_up_sync(
+            EngineRole::Floating,
+            &resident_on,
+            &same,
+            &base
+        ));
+        let _ = std::fs::remove_dir_all(&base);
 
         // その再同期も、起動完了までにジョブが始まっていれば適用しない。
         let mut sync = SyncEpoch::default();
