@@ -311,7 +311,7 @@ const uiLanguageInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="ui-language"]'),
 );
 
-const APP_VERSION = "1.3.4";
+const APP_VERSION = "1.3.5";
 const RELEASES_PAGE_URL = "https://github.com/Fizor-drm/NuKa/releases/latest";
 
 const LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-en";
