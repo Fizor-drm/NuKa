@@ -570,6 +570,17 @@ pub fn place_window(
     (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
 }
 
+/// ウィンドウサイズを作業領域に収める。
+///
+/// 別モニタで大きくしたウィンドウは、より小さいモニタの作業領域を超えることが
+/// ある。位置だけをクランプすると右下のはみ出し分 (リサイズつまみ) が画面外に
+/// なり操作できなくなるため、配置前にサイズ自体をクランプする。
+pub fn clamp_size_to_work_area(width: i32, height: i32, work: WorkArea) -> (i32, i32) {
+    let work_width = (work.right - work.left).max(1);
+    let work_height = (work.bottom - work.top).max(1);
+    (width.clamp(1, work_width), height.clamp(1, work_height))
+}
+
 // ---------------------------------------------------------------------------
 // ウィンドウの生成とホットキーの登録
 // ---------------------------------------------------------------------------
@@ -1381,10 +1392,9 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option
     };
 
     // リサイズ可能なので、位置計算には現在のウィンドウの実サイズ (物理ピクセル) を使う。
-    // 定数のままだと、大きくしたウィンドウが作業領域の右端・下端ではみ出して
-    // つまみが画面外に出る。取得できないときだけ既定サイズへフォールバックする。
+    // 取得できないときだけ既定サイズへフォールバックする。
     let scale = window.scale_factor().unwrap_or(1.0);
-    let (width, height) = match window.outer_size() {
+    let (mut width, mut height) = match window.outer_size() {
         Ok(size) => (size.width as i32, size.height as i32),
         Err(error) => {
             debug_log!("outer_size unavailable, falling back to default size: {error}");
@@ -1394,8 +1404,30 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option
             )
         }
     };
+    let work_area = cursor.and_then(monitor_work_area);
     let mut position_log = "not-set".to_string();
-    if let (Some((x, y)), Some(work)) = (cursor, cursor.and_then(monitor_work_area)) {
+    if let (Some((x, y)), Some(work)) = (cursor, work_area) {
+        // 対象モニタの作業領域に収まるサイズへクランプする。別モニタで大きくした
+        // ウィンドウをより小さいモニタ上で出すと、outer_size が作業領域を超え、
+        // 位置だけのクランプでは右下のつまみが画面外に出る。
+        // ただし place_window は位置を返すだけでウィンドウを縮めないため、
+        // 収まらないときは実サイズも作業領域に合わせる (収まるときはリサイズ後の
+        // ユーザーのサイズをそのまま保つ)。
+        let (fitted_width, fitted_height) = clamp_size_to_work_area(width, height, work);
+        if (fitted_width, fitted_height) != (width, height) {
+            if let Err(error) = window.set_size(tauri::PhysicalSize::new(
+                fitted_width as u32,
+                fitted_height as u32,
+            )) {
+                eprintln!("フローティングウィンドウを作業領域に収められません: {error}");
+            } else {
+                debug_log!(
+                    "window shrunk to fit work area: {width}x{height} -> {fitted_width}x{fitted_height}"
+                );
+            }
+            width = fitted_width;
+            height = fitted_height;
+        }
         let (left, top) = place_window(x, y, width, height, work);
         position_log = format!("{left},{top} {width}x{height}");
         if let Err(error) = window.set_position(tauri::Position::Physical(
@@ -1956,6 +1988,27 @@ mod tests {
     fn window_is_clamped_when_the_work_area_is_smaller_than_it() {
         let position = place_window(150, 100, 420, 300, work_area(0, 0, 300, 200));
         assert_eq!(position, (0, 0));
+    }
+
+    #[test]
+    fn oversized_window_size_is_clamped_to_the_work_area() {
+        let work = work_area(0, 0, 800, 600);
+        // 作業領域より大きいサイズは縦横とも作業領域まで縮める。
+        assert_eq!(clamp_size_to_work_area(1200, 900, work), (800, 600));
+        // 収まるサイズは変えない (リサイズ後のサイズを保つ)。
+        assert_eq!(clamp_size_to_work_area(420, 240, work), (420, 240));
+        // 負座標のモニタでも幅・高さで判定する。
+        assert_eq!(
+            clamp_size_to_work_area(2000, 1200, work_area(-1920, 0, 0, 1080)),
+            (1920, 1080)
+        );
+        // 不正なサイズでも 1px 以上を返す (place_window の width.max(1) と整合)。
+        assert_eq!(clamp_size_to_work_area(0, -10, work), (1, 1));
+        // 作業領域が極端に小さくても 1px を返し、パニックしない。
+        assert_eq!(
+            clamp_size_to_work_area(1200, 900, work_area(0, 0, 0, 0)),
+            (1, 1)
+        );
     }
 
     #[test]
