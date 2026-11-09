@@ -930,6 +930,59 @@ pub(crate) fn can_resolve(role: EngineRole, settings: &Settings, app: &AppHandle
     resolve_paths(settings, app, role).is_ok()
 }
 
+/// その役割が実際に使うモデルのパス (未解決なら `None`)。
+///
+/// 設定値ではなく**解決結果**を返す。専用モデルが実ファイル欠落などでアクティブ
+/// モデルへフォールバックしている場合も、フォールバック先のパスが返る。
+pub(crate) fn resolved_model_path(
+    role: EngineRole,
+    settings: &Settings,
+    search_root: &Path,
+) -> Option<PathBuf> {
+    resolve_model_path_for(settings, search_root, role.model_override(settings)).ok()
+}
+
+/// メイン用とフローティング用が同じモデルを解決するか。
+///
+/// 同じ GGUF を 2 プロセスで VRAM に載せても意味がないため、この場合は 1 つの
+/// エンジンを共有する。両方が解決できたときだけ比較し、どちらかが未解決なら
+/// 「共有しない」に倒す (どちらも起動できないので役割どおりに任せる)。
+pub(crate) fn models_shared(settings: &Settings, search_root: &Path) -> bool {
+    let main = resolved_model_path(EngineRole::Main, settings, search_root);
+    let floating = resolved_model_path(EngineRole::Floating, settings, search_root);
+    match (main, floating) {
+        (Some(main), Some(floating)) => main == floating,
+        _ => false,
+    }
+}
+
+/// 要求された役割の翻訳を処理するエンジンの役割。
+///
+/// 解決モデルがメイン用と同一なら、フローティング翻訳もメイン用エンジンで
+/// 処理する (二重ロード防止)。専用モデルが別ファイルならフローティング用。
+/// ルーティングの判断はこの関数 1 か所に集約し、呼び出し側で設定を見比べない。
+pub(crate) fn serving_role(
+    requested: EngineRole,
+    settings: &Settings,
+    search_root: &Path,
+) -> EngineRole {
+    match requested {
+        EngineRole::Main => EngineRole::Main,
+        // 同一モデルならメイン用エンジンへ相乗りする。
+        EngineRole::Floating if models_shared(settings, search_root) => EngineRole::Main,
+        EngineRole::Floating => EngineRole::Floating,
+    }
+}
+
+/// フローティング用の独立エンジンを起動・維持すべきか。
+///
+/// 常時起動の条件 (`Settings::floating_engine_resident`) を満たし、かつ解決モデルが
+/// メイン用と異なるときだけ true。同一モデルならメイン用と共有するので、2 つ目の
+/// エンジンは起動しない (専用モデルにアクティブモデルを選んだ場合も同じ)。
+pub(crate) fn should_run_floating_engine(settings: &Settings, search_root: &Path) -> bool {
+    settings.floating_engine_resident() && !models_shared(settings, search_root)
+}
+
 /// `start` から親を最大 `depth` 階層たどり、`relative` が実在する場所を返す。
 pub(crate) fn find_in_ancestors(start: &Path, relative: &Path, depth: usize) -> Option<PathBuf> {
     let mut current = Some(start);
@@ -1539,6 +1592,147 @@ mod tests {
             .get("paths")
             .is_some_and(|paths| paths.contains("unknown.gguf")));
         let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn identical_resolved_models_share_the_main_engine() {
+        let base = temp_dir("shared-model");
+        let active = base.join("active.gguf");
+        fs::write(&active, b"m").unwrap();
+        let mut settings = Settings {
+            active_model: Some("active.gguf".to_string()),
+            installed_models: vec![InstalledModel {
+                file: "active.gguf".to_string(),
+                repo: "pfnet/test".to_string(),
+                bytes: 1,
+                path: active.to_string_lossy().into_owned(),
+                installed_at: 0,
+            }],
+            ..Default::default()
+        };
+
+        // 既定 (専用モデル未指定): 両役割ともアクティブモデルを解決する。
+        assert_eq!(
+            resolved_model_path(EngineRole::Main, &settings, &base),
+            Some(active.clone())
+        );
+        assert_eq!(
+            resolved_model_path(EngineRole::Floating, &settings, &base),
+            Some(active.clone())
+        );
+        assert!(models_shared(&settings, &base));
+        assert_eq!(
+            serving_role(EngineRole::Floating, &settings, &base),
+            EngineRole::Main
+        );
+        assert_eq!(
+            serving_role(EngineRole::Main, &settings, &base),
+            EngineRole::Main
+        );
+        assert!(!should_run_floating_engine(&settings, &base));
+
+        // 専用モデルに「アクティブモデルと同じファイル」を選んでも共有する (N-2)。
+        settings.floating_window.model = Some("active.gguf".to_string());
+        assert!(settings.floating_engine_resident());
+        assert!(models_shared(&settings, &base));
+        assert!(!should_run_floating_engine(&settings, &base));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_different_dedicated_model_uses_the_floating_engine() {
+        let base = temp_dir("different-model");
+        let active = base.join("active.gguf");
+        fs::write(&active, b"m").unwrap();
+        let small = base.join("small.gguf");
+        fs::write(&small, b"m").unwrap();
+        let mut settings = Settings {
+            active_model: Some("active.gguf".to_string()),
+            installed_models: vec![
+                InstalledModel {
+                    file: "active.gguf".to_string(),
+                    repo: "pfnet/test".to_string(),
+                    bytes: 1,
+                    path: active.to_string_lossy().into_owned(),
+                    installed_at: 0,
+                },
+                InstalledModel {
+                    file: "small.gguf".to_string(),
+                    repo: "pfnet/test".to_string(),
+                    bytes: 1,
+                    path: small.to_string_lossy().into_owned(),
+                    installed_at: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        settings.floating_window.model = Some("small.gguf".to_string());
+
+        assert!(!models_shared(&settings, &base));
+        assert_eq!(
+            serving_role(EngineRole::Floating, &settings, &base),
+            EngineRole::Floating
+        );
+        // 常時起動の既定 ON なら独立エンジンを維持する。
+        assert!(should_run_floating_engine(&settings, &base));
+        // 常時起動 OFF ならオンデマンド (独立エンジンは自動では起動しない)。
+        settings.background.resident_engine = false;
+        assert!(!should_run_floating_engine(&settings, &base));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_dedicated_model_falls_back_to_the_active_model_and_is_shared() {
+        let base = temp_dir("missing-dedicated");
+        let active = base.join("active.gguf");
+        fs::write(&active, b"m").unwrap();
+        let settings = Settings {
+            active_model: Some("active.gguf".to_string()),
+            installed_models: vec![InstalledModel {
+                file: "active.gguf".to_string(),
+                repo: "pfnet/test".to_string(),
+                bytes: 1,
+                path: active.to_string_lossy().into_owned(),
+                installed_at: 0,
+            }],
+            floating_window: crate::settings::FloatingWindowSettings {
+                model: Some("missing.gguf".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 未登録の専用モデルは既存チェーンへフォールバック → メインと同一パス。
+        assert_eq!(
+            resolved_model_path(EngineRole::Floating, &settings, &base),
+            Some(active)
+        );
+        assert!(models_shared(&settings, &base));
+        assert_eq!(
+            serving_role(EngineRole::Floating, &settings, &base),
+            EngineRole::Main
+        );
+        // 常時起動の条件は満たすが、同一モデルなので 2 本目は起動しない。
+        assert!(settings.floating_engine_resident());
+        assert!(!should_run_floating_engine(&settings, &base));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unresolved_models_are_not_shared() {
+        let base = temp_dir("unresolved-models");
+        let settings = Settings::default();
+        assert_eq!(
+            resolved_model_path(EngineRole::Main, &settings, &base),
+            None
+        );
+        assert!(!models_shared(&settings, &base));
+        // 解決できないときは役割どおり (起動時のエラーはエンジン側が出す)。
+        assert_eq!(
+            serving_role(EngineRole::Floating, &settings, &base),
+            EngineRole::Floating
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

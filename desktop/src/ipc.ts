@@ -241,6 +241,11 @@ export interface SupersededPayload {
 export interface FloatingCapturePayload {
   text: string | null;
   target_lang: string;
+  /**
+   * この翻訳を実際に処理するエンジンの役割。解決モデルがメイン用と同一なら
+   * "main" (共有)、専用モデルが別なら "floating"。
+   */
+  engine_role?: EngineRole;
 }
 
 export const ipc = {
