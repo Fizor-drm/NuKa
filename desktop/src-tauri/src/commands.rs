@@ -6,7 +6,7 @@
 //!   restart_engine() -> ()
 //!   get_settings() / set_settings(patch) -> Settings
 //!   detect_language(text) -> Option<{ code, confidence }>
-//!   translate(req: { text, source_lang?, target_lang, form?, glossary? }) -> jobId
+//!   translate(req: { text, source_lang?, target_lang, form?, glossary?, context? }) -> jobId
 //!     jobId のエンジンは呼び出し元ウィンドウのラベルで決まる
 //!     ("floating" → フローティング用、それ以外 → メイン用)。
 //!   cancel_translation(jobId) -> ()
@@ -68,6 +68,14 @@ pub struct TranslateRequest {
     pub form: Option<String>,
     #[serde(default)]
     pub glossary: Vec<GlossaryPair>,
+    /// 原文の背景 (どんな場面の文章か)。プロンプトの
+    /// `<|plamo:tag|>context` に載せる。
+    ///
+    /// メイン画面のセッション内だけで保持し、settings.json には保存しない
+    /// (永続化は別件。フローティングウィンドウも指定しない)。
+    /// 空文字・空白だけは「指定なし」として扱う。
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -276,6 +284,8 @@ pub fn set_settings(
     // 常時起動に関わる設定 (常駐 ON/OFF・トレイ常駐・モデル) が変わったら、
     // 常駐ポリシー (保持先・解決モデルパス) の変化をエンジンへ反映する。
     // 変わっていなければ何もしない (無関係な設定保存でエンジンを触らない)。
+    // 用語集 (glossary) は常駐ポリシー (resident_target) に無関係なので、
+    // 用語集だけの保存はここで必ず no-op になる。
     sync_resident_engine(&app, &before, &saved);
     Ok(saved)
 }
@@ -913,6 +923,8 @@ fn sync_resident_engine(app: &AppHandle, before: &Settings, after: &Settings) {
     // ホットキー記録中の一時的な enabled=false を通常の OFF と混同しない。
     let before = effective_settings(app, before.clone());
     let after = effective_settings(app, after.clone());
+    // 用語集・テーマ・表示言語などの、エンジンと無関係な設定保存では
+    // resident_target が等しくなり、ここで no-op になる。
     let was = crate::engine::resident_target(&before, &search_root);
     let now = crate::engine::resident_target(&after, &search_root);
     if was == now {
@@ -1543,6 +1555,30 @@ fn may_retry_job_start(
     !running || phase == EnginePhase::Error
 }
 
+/// `TranslateRequest` から `PromptOptions` を組み立てる。
+///
+/// 事前検証と本番の 2 回 `build_prompt` を呼ぶので、組み立てを 1 か所にまとめて
+/// 片方だけ context を落とす事故を防ぐ。`context` は空文字・空白だけなら
+/// `None` (プロンプトに `<|plamo:tag|>context` を出さない)。
+fn prompt_options<'a>(
+    req: &'a TranslateRequest,
+    text: &'a str,
+    history: &'a [HistoryPair],
+) -> PromptOptions<'a> {
+    PromptOptions {
+        text,
+        target_lang: &req.target_lang,
+        source_lang: req.source_lang.as_deref(),
+        context: req
+            .context
+            .as_deref()
+            .filter(|context| !context.trim().is_empty()),
+        glossary: &req.glossary,
+        form: req.form.as_deref(),
+        history,
+    }
+}
+
 async fn translate_job(
     app: &AppHandle,
     engine: &Engine,
@@ -1556,20 +1592,9 @@ async fn translate_job(
     let Some(first) = chunks.first() else {
         return Err(JobError::raw(PromptError::EmptyText.to_string()));
     };
-    let source_lang = req.source_lang.as_deref();
-    let form = req.form.as_deref();
 
     // 進捗を流す前に、訳先・文体・原文の不備を弾く。
-    prompt::build_prompt(&PromptOptions {
-        text: first,
-        target_lang: &req.target_lang,
-        source_lang,
-        context: None,
-        glossary: &req.glossary,
-        form,
-        history: &[],
-    })
-    .map_err(|error| error.to_string())?;
+    prompt::build_prompt(&prompt_options(req, first, &[])).map_err(|error| error.to_string())?;
 
     let Some(port) = port else {
         let status = engine.status();
@@ -1613,16 +1638,8 @@ async fn translate_job(
             return Ok(None);
         }
 
-        let built = prompt::build_prompt(&PromptOptions {
-            text: chunk,
-            target_lang: &req.target_lang,
-            source_lang,
-            context: None,
-            glossary: &req.glossary,
-            form,
-            history: &history,
-        })
-        .map_err(|error| error.to_string())?;
+        let built = prompt::build_prompt(&prompt_options(req, chunk, &history))
+            .map_err(|error| error.to_string())?;
 
         // 途中経過は「まだ送っていない差分」だけを流す。制御トークンが混ざっても
         // clean_translation の結果だけを送るので、画面に区切りは出ない。
@@ -2617,6 +2634,94 @@ mod tests {
         // 終了後に新しい ticket を作れても適用はしない。
         let after = control.sync.schedule();
         assert!(!control.may_apply(after, false));
+    }
+
+    #[test]
+    fn translate_request_context_reaches_the_prompt() {
+        // 翻訳は translate_job と同じ prompt_options を通る。UI の「文脈」が
+        // PromptOptions.context へ渡り、公式カードの順 (input より前) に出る。
+        let request = TranslateRequest {
+            text: "オーナーでフィルタリングすることもできます。".to_string(),
+            source_lang: Some("ja".to_string()),
+            target_lang: "en".to_string(),
+            form: None,
+            glossary: Vec::new(),
+            context: Some("プロジェクト管理ツールのヘルプページです。".to_string()),
+        };
+        let prompt = prompt::build_prompt(&prompt_options(&request, &request.text, &[]))
+            .expect("プロンプトを組み立てられる");
+        assert!(prompt.contains(
+            "<|plamo:tag|>context<|plamo:msg|>プロジェクト管理ツールのヘルプページです。"
+        ));
+        assert!(
+            prompt.find("<|plamo:tag|>context").unwrap()
+                < prompt.find("<|plamo:tag|>input").unwrap()
+        );
+
+        // 空文字・空白だけは「指定なし」(プロンプトに context を出さない)。
+        for blank in ["", "   ", "\n\t"] {
+            let mut blank_request = request.clone();
+            blank_request.context = Some(blank.to_string());
+            let prompt =
+                prompt::build_prompt(&prompt_options(&blank_request, &blank_request.text, &[]))
+                    .expect("空の文脈でも組み立てられる");
+            assert!(
+                !prompt.contains("<|plamo:tag|>context"),
+                "空の context は載せない: {blank:?}"
+            );
+        }
+
+        // 未指定 (旧フロントと同じ) も context 無しで組み立てられる。
+        let mut no_context = request.clone();
+        no_context.context = None;
+        let prompt = prompt::build_prompt(&prompt_options(&no_context, &no_context.text, &[]))
+            .expect("文脈なしでも組み立てられる");
+        assert!(!prompt.contains("<|plamo:tag|>context"));
+    }
+
+    #[test]
+    fn glossary_save_does_not_touch_the_resident_engine() {
+        // 用語集は常駐ポリシー (resident_target) に無関係。`set_settings` は
+        // sync_resident_engine で before/after の resident_target を比べ、等しければ
+        // 何もしない (エンジンを止めたり起こしたりしない)。
+        let base =
+            std::env::temp_dir().join(format!("nuka-glossary-resident-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("一時ディレクトリを作れる");
+        let small = base.join("0.8b.gguf");
+        std::fs::write(&small, b"m").expect("small model を置ける");
+        let settings = Settings {
+            floating_window: crate::settings::FloatingWindowSettings {
+                model: Some("0.8b.gguf".to_string()),
+                ..Default::default()
+            },
+            installed_models: vec![crate::settings::InstalledModel {
+                file: "0.8b.gguf".to_string(),
+                repo: "pfnet/test".to_string(),
+                bytes: 1,
+                path: small.to_string_lossy().into_owned(),
+                installed_at: 0,
+            }],
+            ..Default::default()
+        };
+        // 常駐 ON の状態で比べる (OFF 同士だと常に等しく、テストにならない)。
+        let was = crate::engine::resident_target(&settings, &base);
+        assert!(was.is_some());
+
+        let mut with_glossary = settings.clone();
+        with_glossary.glossary = vec![GlossaryPair {
+            source: "オーナー".to_string(),
+            target: "assignee".to_string(),
+        }];
+        // 用語集だけが違う保存: resident_target が同じ = エンジン同期は no-op。
+        assert_eq!(crate::engine::resident_target(&with_glossary, &base), was);
+        assert_eq!(crate::engine::resident_target(&settings, &base), was);
+
+        // 対照: 常駐ポリシーが変わる保存 (フローティング無効化) は resident_target が
+        // 変わる = sync_resident_engine が同期する。
+        let mut disabled = settings.clone();
+        disabled.floating_window.enabled = false;
+        assert_ne!(crate::engine::resident_target(&disabled, &base), was);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// OpenAI 互換の SSE を、指定した断片のまま返す小さなサーバ。

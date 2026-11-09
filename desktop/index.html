@@ -49,6 +49,18 @@
           </button>
           <button
             type="button"
+            class="toggle-button"
+            id="context-toggle"
+            aria-pressed="false"
+            aria-expanded="false"
+            aria-controls="context-panel"
+            data-i18n-title="header.contextTitle"
+            data-i18n="header.context"
+          >
+            文脈
+          </button>
+          <button
+            type="button"
             class="icon-button theme-button"
             id="theme-toggle"
             title="テーマ: ライト"
@@ -532,6 +544,39 @@
               <div class="glossary-rows" id="glossary-rows"></div>
               <p class="glossary-empty" id="glossary-empty" data-i18n="glossary.empty" hidden>
                 用語がまだ登録されていません。「行を追加」から登録できます。
+              </p>
+              <p class="glossary-limit" id="glossary-limit" data-i18n="glossary.limit" hidden>
+                用語集は 200 対までです。不要な行を削除すると追加できます。
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="context"
+          id="context-panel"
+          data-open="false"
+          aria-labelledby="context-title"
+          inert
+        >
+          <div class="context-clip">
+            <div class="context-inner">
+              <div class="context-head">
+                <h2 class="context-title" id="context-title" data-i18n="context.title">文脈</h2>
+                <p class="context-hint" data-i18n="context.hint">
+                  原文がどんな場面の文章かを書くと、訳語の選び方が安定します。
+                </p>
+              </div>
+              <textarea
+                id="context-text"
+                class="context-input"
+                rows="3"
+                data-i18n-aria-label="context.aria"
+                data-i18n-placeholder="context.placeholder"
+                spellcheck="false"
+              ></textarea>
+              <p class="context-note" data-i18n="context.note">
+                文脈はこのセッション内だけで使われ、保存されません。
               </p>
             </div>
           </div>

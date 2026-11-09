@@ -48,6 +48,11 @@ export interface Settings {
   active_model: string | null;
   floating_window: FloatingWindowSettings;
   background: BackgroundSettings;
+  /**
+   * 翻訳に使う用語集 (単一セット)。空行は保存されない。
+   * 1.3.5 以前の settings.json を読んだ場合も空配列で届く。
+   */
+  glossary: GlossaryPair[];
 }
 
 /** フローティング翻訳ウィンドウ (Phase 1) の設定。 */
@@ -94,6 +99,8 @@ export interface SettingsPatch {
   auto_update_check?: boolean;
   ui_language?: "ja" | "en" | "zh";
   background?: BackgroundSettingsPatch;
+  /** 用語集。省略すると今の値を保ち、空配列は「全部消す」。 */
+  glossary?: GlossaryPair[];
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +213,12 @@ export interface TranslateRequest {
   target_lang: string;
   form?: "plain" | "polite";
   glossary?: GlossaryPair[];
+  /**
+   * 原文の背景 (どんな場面の文章か)。プロンプトの context に載る。
+   * メイン画面のセッション内だけで保持し、保存はしない。
+   * 空文字・空白だけは「指定なし」として扱われる。
+   */
+  context?: string;
 }
 
 export interface ProgressPayload {
