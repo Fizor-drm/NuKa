@@ -797,10 +797,14 @@ fn should_restore_engine(state: &EnginePhase) -> bool {
 }
 
 /// ダウンロード済みのインストーラーを切り離して起動し、少し待ってアプリを終了する。
+///
+/// `floating_engine` は検証と spawn が成功したあと (終了前) に止める。検証で
+/// 失敗した場合はアプリを続けるので、常駐中のフローティング用を止めない (L-1)。
 pub fn install(
     app: &AppHandle,
     state: &UpdateState,
     engine: &Engine,
+    floating_engine: &Engine,
     settings: &SettingsStore,
 ) -> Result<(), LocalizedText> {
     // take() で消費し、二重起動を防ぐ。起動に失敗したときだけ戻す。
@@ -889,6 +893,9 @@ pub fn install(
         }
     };
     let pid = child.id();
+    // インストーラーの起動まで成功したので、終了前に常駐中のフローティング用も
+    // 止める (残プロセスを残さない)。検証・spawn の失敗時は止めない (L-1)。
+    floating_engine.kill_now();
     eprintln!(
         "更新インストーラー ({}) を起動しました (pid {pid})。NuKa を終了します。",
         downloaded.version

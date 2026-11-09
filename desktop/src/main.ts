@@ -7,6 +7,7 @@
  */
 
 import { GlossaryEditor } from "./glossary";
+import { icon } from "./icons";
 import {
   applyTranslations,
   getUiLanguage,
@@ -133,10 +134,14 @@ interface AppState {
   floatingRecording: boolean;
   floatingRecordingWasEnabled: boolean;
   floatingError: string | null;
+  /** フローティング用モデル (null は「アクティブモデルと同じ」)。 */
+  floatingModel: string | null;
+  /** フローティング用モデルの選択ポップオーバーが開いているか。 */
+  floatingModelOpen: boolean;
   /** メインを閉じてもトレイに常駐する (background.enabled)。 */
   backgroundEnabled: boolean;
-  /** バックグラウンドでもエンジンを止めない (background.keep_engine)。 */
-  backgroundKeepEngine: boolean;
+  /** フローティング用エンジンを常時起動しておく (background.resident_engine)。 */
+  backgroundResidentEngine: boolean;
   backgroundError: string | null;
 }
 
@@ -168,8 +173,10 @@ const state: AppState = {
   floatingRecording: false,
   floatingRecordingWasEnabled: false,
   floatingError: null,
+  floatingModel: null,
+  floatingModelOpen: false,
   backgroundEnabled: true,
-  backgroundKeepEngine: false,
+  backgroundResidentEngine: true,
   backgroundError: null,
 };
 
@@ -252,8 +259,15 @@ const floatingHotkeyEl = byId<HTMLButtonElement>("floating-hotkey");
 const floatingUsageEl = byId<HTMLParagraphElement>("floating-hotkey-usage");
 const floatingErrorEl = byId<HTMLParagraphElement>("floating-hotkey-error");
 
+const floatingModelButtonEl = byId<HTMLButtonElement>("floating-model-button");
+const floatingModelLabelEl = byId<HTMLSpanElement>("floating-model-label");
+const floatingModelPopoverEl = byId<HTMLDivElement>("floating-model-popover");
+const floatingModelListEl = byId<HTMLUListElement>("floating-model-list");
+const floatingModelEmptyEl = byId<HTMLParagraphElement>("floating-model-empty");
+
 const backgroundEnabledEl = byId<HTMLInputElement>("background-enabled");
-const backgroundKeepEngineEl = byId<HTMLInputElement>("background-keep-engine");
+const backgroundResidentEngineEl = byId<HTMLInputElement>("background-resident-engine");
+const backgroundResidentNoteEl = byId<HTMLParagraphElement>("background-resident-engine-note");
 const backgroundDisabledNoteEl = byId<HTMLParagraphElement>("background-disabled-note");
 const backgroundErrorEl = byId<HTMLParagraphElement>("background-error");
 
@@ -570,7 +584,20 @@ function showAppStatus(message: string): void {
 // エンジン
 // ---------------------------------------------------------------------------
 
+/**
+ * メイン画面用エンジンの status か。
+ *
+ * `engine:status` はフローティング用も含めて全ウィンドウへ流れる。role が無い
+ * payload は後方互換のためメイン扱いにする。
+ */
+function isMainEngineStatus(status: EngineStatus): boolean {
+  return status.role === undefined || status.role === "main";
+}
+
 function handleEngineStatus(status: EngineStatus): void {
+  if (!isMainEngineStatus(status)) {
+    return;
+  }
   const wasReady = state.engine.state === "ready";
   state.engine = status;
   renderEngine();
@@ -583,9 +610,9 @@ function handleEngineStatus(status: EngineStatus): void {
 
 async function refreshEngineStatus(): Promise<void> {
   try {
-    handleEngineStatus(await ipc.getEngineStatus());
+    handleEngineStatus(await ipc.getEngineStatus("main"));
   } catch (error) {
-    handleEngineStatus({ state: "error", detail: rawMessage(describeError(error)) });
+    handleEngineStatus({ role: "main", state: "error", detail: rawMessage(describeError(error)) });
   }
 }
 
@@ -1001,8 +1028,9 @@ async function loadSettings(): Promise<void> {
     state.modelsDirSetting = settings.models_dir;
     state.floatingEnabled = settings.floating_window.enabled;
     state.floatingHotkey = settings.floating_window.hotkey;
+    state.floatingModel = settings.floating_window.model;
     state.backgroundEnabled = settings.background.enabled;
-    state.backgroundKeepEngine = settings.background.keep_engine;
+    state.backgroundResidentEngine = settings.background.resident_engine;
   } catch {
     // 設定が読めなくても既定値で動かす
   }
@@ -1038,6 +1066,140 @@ function renderFloatingSettings(): void {
   });
   floatingErrorEl.hidden = state.floatingError === null;
   floatingErrorEl.textContent = state.floatingError ?? "";
+  renderFloatingModel();
+}
+
+// ---------------------------------------------------------------------------
+// フローティング用モデルの選択 (HTML 内ポップオーバー)
+// ---------------------------------------------------------------------------
+//
+// ネイティブの <select> は使わない (WebView2 が OS のポップアップを開き、
+// フォーカスイベントがウィンドウ管理と干渉する)。既存の言語リストと同じ
+// ボタン + listbox で作る。
+
+/** インストール済みモデルの表示名。カタログに無ければファイル名。 */
+function modelDisplayName(file: string): string {
+  const entry = state.catalog.find((item) => item.file === file);
+  return entry !== undefined ? `${entry.size.toUpperCase()} · ${entry.quant}` : file;
+}
+
+/** セレクタの選択肢。先頭は「アクティブモデルと同じ」(値は空文字)。 */
+function floatingModelOptions(): Array<{ value: string; label: string }> {
+  const installed = state.setup?.models ?? [];
+  return [
+    { value: "", label: t("settings.floating.modelSame") },
+    ...installed.map((model) => ({
+      value: model.file,
+      label: modelDisplayName(model.file),
+    })),
+  ];
+}
+
+function renderFloatingModel(): void {
+  const current = state.floatingModel ?? "";
+  const options = floatingModelOptions();
+  const selected = options.find((option) => option.value === current);
+  floatingModelLabelEl.textContent =
+    selected?.label ?? (current === "" ? t("settings.floating.modelSame") : modelDisplayName(current));
+  floatingModelButtonEl.setAttribute("aria-expanded", String(state.floatingModelOpen));
+
+  floatingModelListEl.replaceChildren();
+  options.forEach((option, index) => {
+    const item = document.createElement("li");
+    item.id = `floating-model-option-${index}`;
+    item.className = "lang-option";
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", String(option.value === current));
+    item.dataset["value"] = option.value;
+    item.tabIndex = -1;
+
+    const text = document.createElement("span");
+    text.className = "lang-option-text";
+    const label = document.createElement("span");
+    label.className = "lang-option-label";
+    label.textContent = option.label;
+    text.append(label);
+
+    const check = icon("check", 14);
+    check.classList.add("lang-option-check");
+    item.append(text, check);
+    // マウスクリックでも選べること (キーボードの Enter だけにしない)。
+    item.addEventListener("click", () => {
+      void chooseFloatingModel(option.value);
+    });
+    floatingModelListEl.append(item);
+  });
+  floatingModelEmptyEl.hidden = options.length > 1;
+  floatingModelPopoverEl.hidden = !state.floatingModelOpen;
+}
+
+function setFloatingModelOpen(open: boolean, focusTrigger: boolean): void {
+  if (state.floatingModelOpen === open) {
+    return;
+  }
+  state.floatingModelOpen = open;
+  renderFloatingModel();
+  if (open) {
+    const selected = floatingModelListEl.querySelector<HTMLElement>(
+      '[role="option"][aria-selected="true"]',
+    );
+    (selected ?? floatingModelListEl.querySelector<HTMLElement>('[role="option"]'))?.focus();
+  } else if (focusTrigger) {
+    floatingModelButtonEl.focus();
+  }
+}
+
+/** 選択肢の指定位置へフォーカスする (範囲外は端に丸める)。 */
+function focusFloatingModelOption(index: number): void {
+  const options = Array.from(
+    floatingModelListEl.querySelectorAll<HTMLElement>('[role="option"]'),
+  );
+  if (options.length === 0) {
+    return;
+  }
+  const clamped = Math.max(0, Math.min(index, options.length - 1));
+  options[clamped]?.focus();
+}
+
+/** 先頭または末尾の選択肢へフォーカスする (Home / End 用)。 */
+function focusFloatingModelEdge(last: boolean): void {
+  const options = Array.from(
+    floatingModelListEl.querySelectorAll<HTMLElement>('[role="option"]'),
+  );
+  if (options.length === 0) {
+    return;
+  }
+  options[last ? options.length - 1 : 0]?.focus();
+}
+
+function moveFloatingModelFocus(delta: number): void {
+  const options = Array.from(
+    floatingModelListEl.querySelectorAll<HTMLElement>('[role="option"]'),
+  );
+  if (options.length === 0) {
+    return;
+  }
+  const index = options.indexOf(document.activeElement as HTMLElement);
+  if (index < 0) {
+    focusFloatingModelOption(delta > 0 ? 0 : options.length - 1);
+    return;
+  }
+  focusFloatingModelOption((index + delta + options.length) % options.length);
+}
+
+async function chooseFloatingModel(value: string): Promise<void> {
+  setFloatingModelOpen(false, true);
+  if ((state.floatingModel ?? "") === value) {
+    return;
+  }
+  state.floatingModel = value === "" ? null : value;
+  renderFloatingSettings();
+  // 失敗しても保存自体は成功していることがある (ホットキー競合)。表示は
+  // applyFloatingSettings 内の syncFloatingSettings が真の値へ合わせ直す。
+  await applyFloatingSettings({ model: value });
+  renderFloatingSettings();
+  // 常時起動の注記はモデル選択に依存する。
+  renderBackgroundSettings();
 }
 
 /** 設定を保存し直し、失敗したら真の値を取り直す。 */
@@ -1046,6 +1208,7 @@ async function applyFloatingSettings(patch: FloatingSettingsPatch): Promise<bool
     const settings = await ipc.setFloatingSettings(patch);
     state.floatingEnabled = settings.floating_window.enabled;
     state.floatingHotkey = settings.floating_window.hotkey;
+    state.floatingModel = settings.floating_window.model;
     state.floatingError = null;
     return true;
   } catch (error) {
@@ -1062,6 +1225,7 @@ async function syncFloatingSettings(): Promise<void> {
     const settings = await ipc.getSettings();
     state.floatingEnabled = settings.floating_window.enabled;
     state.floatingHotkey = settings.floating_window.hotkey;
+    state.floatingModel = settings.floating_window.model;
   } catch {
     // 取得できなければ現在の表示を保つ。
   }
@@ -1097,7 +1261,8 @@ function startHotkeyRecording(): void {
   floatingHotkeyEl.focus();
   if (state.floatingRecordingWasEnabled) {
     hotkeySuspendPending = true;
-    hotkeySuspendTask = applyFloatingSettings({ enabled: false }).then(() => {
+    // 記録中だけ OS からホットキーを外す。常駐エンジンは止めない (suspend)。
+    hotkeySuspendTask = applyFloatingSettings({ enabled: false, suspend: true }).then(() => {
       hotkeySuspendPending = false;
       hotkeySuspendTask = null;
       if (state.floatingRecording) {
@@ -1194,9 +1359,17 @@ async function saveRecordedHotkey(combo: string): Promise<void> {
 
 function renderBackgroundSettings(): void {
   backgroundEnabledEl.checked = state.backgroundEnabled;
-  backgroundKeepEngineEl.checked = state.backgroundKeepEngine;
-  // 常駐しないなら「エンジンを維持する」は意味を持たない。
-  backgroundKeepEngineEl.disabled = !state.backgroundEnabled;
+  backgroundResidentEngineEl.checked = state.backgroundResidentEngine;
+  // 常駐しないなら「エンジンを常時起動する」は意味を持たない。
+  backgroundResidentEngineEl.disabled = !state.backgroundEnabled;
+  // 常時起動は「フローティング用モデル」を選んで初めて働く (二重ロード防止)。
+  const residentReady = state.floatingModel !== null;
+  backgroundResidentNoteEl.textContent = t(
+    residentReady
+      ? "settings.background.residentEngineNote"
+      : "settings.background.residentEngineNeedsModel",
+  );
+  backgroundResidentNoteEl.dataset["state"] = residentReady ? "ready" : "needs-model";
   backgroundDisabledNoteEl.hidden = state.backgroundEnabled;
   backgroundErrorEl.hidden = state.backgroundError === null;
   backgroundErrorEl.textContent = state.backgroundError ?? "";
@@ -1209,11 +1382,11 @@ async function saveBackgroundSettings(): Promise<void> {
     const settings = await ipc.setSettings({
       background: {
         enabled: state.backgroundEnabled,
-        keep_engine: state.backgroundKeepEngine,
+        resident_engine: state.backgroundResidentEngine,
       },
     });
     state.backgroundEnabled = settings.background.enabled;
-    state.backgroundKeepEngine = settings.background.keep_engine;
+    state.backgroundResidentEngine = settings.background.resident_engine;
   } catch (error) {
     state.backgroundError = t("settings.background.saveFailed", {
       detail: describeError(error),
@@ -1221,7 +1394,7 @@ async function saveBackgroundSettings(): Promise<void> {
     try {
       const settings = await ipc.getSettings();
       state.backgroundEnabled = settings.background.enabled;
-      state.backgroundKeepEngine = settings.background.keep_engine;
+      state.backgroundResidentEngine = settings.background.resident_engine;
     } catch {
       // 取得できなければ現在の表示を保つ。
     }
@@ -1233,8 +1406,8 @@ async function handleBackgroundEnabledChange(): Promise<void> {
   const desired = backgroundEnabledEl.checked;
   state.backgroundEnabled = desired;
   if (!desired) {
-    // 常駐を切ったら「エンジン維持」は効かないので見た目も合わせる。
-    backgroundKeepEngineEl.checked = state.backgroundKeepEngine;
+    // 常駐を切ったら「常時起動」は効かないので見た目も合わせる。
+    backgroundResidentEngineEl.checked = state.backgroundResidentEngine;
   }
   backgroundEnabledEl.disabled = true;
   renderBackgroundSettings();
@@ -1242,11 +1415,11 @@ async function handleBackgroundEnabledChange(): Promise<void> {
   backgroundEnabledEl.disabled = false;
 }
 
-async function handleBackgroundKeepEngineChange(): Promise<void> {
-  state.backgroundKeepEngine = backgroundKeepEngineEl.checked;
-  backgroundKeepEngineEl.disabled = true;
+async function handleBackgroundResidentEngineChange(): Promise<void> {
+  state.backgroundResidentEngine = backgroundResidentEngineEl.checked;
+  backgroundResidentEngineEl.disabled = true;
   await saveBackgroundSettings();
-  backgroundKeepEngineEl.disabled = false;
+  backgroundResidentEngineEl.disabled = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,8 +1927,14 @@ async function activateModel(entry: CatalogEntry): Promise<void> {
 
 async function removeModel(entry: CatalogEntry): Promise<void> {
   try {
-    await ipc.deleteModel(entry.file);
+    const settings = await ipc.deleteModel(entry.file);
+    // 削除したモデルがフローティング用に指定されていた場合、バックエンドが
+    // 「アクティブモデルと同じ」へ戻す。表示もその値へ合わせる。
+    state.floatingEnabled = settings.floating_window.enabled;
+    state.floatingHotkey = settings.floating_window.hotkey;
+    state.floatingModel = settings.floating_window.model;
     await refreshSetup();
+    renderSettings();
   } catch (error) {
     showAppStatus(t("status.modelDeleteFailed", { detail: describeError(error) }));
   }
@@ -2047,8 +2226,85 @@ function bindUi(): void {
     void handleBackgroundEnabledChange();
   });
 
-  backgroundKeepEngineEl.addEventListener("change", () => {
-    void handleBackgroundKeepEngineChange();
+  backgroundResidentEngineEl.addEventListener("change", () => {
+    void handleBackgroundResidentEngineChange();
+  });
+
+  floatingModelButtonEl.addEventListener("click", () => {
+    setFloatingModelOpen(!state.floatingModelOpen, true);
+  });
+
+  floatingModelButtonEl.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setFloatingModelOpen(true, false);
+    } else if (event.key === "Escape" && state.floatingModelOpen) {
+      event.preventDefault();
+      setFloatingModelOpen(false, true);
+    }
+  });
+
+  floatingModelListEl.addEventListener("keydown", (event) => {
+    if (!state.floatingModelOpen) {
+      return;
+    }
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        moveFloatingModelFocus(1);
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        moveFloatingModelFocus(-1);
+        break;
+      case "Home":
+        event.preventDefault();
+        focusFloatingModelEdge(false);
+        break;
+      case "End":
+        event.preventDefault();
+        focusFloatingModelEdge(true);
+        break;
+      case "Enter": {
+        event.preventDefault();
+        const option = document.activeElement;
+        if (option instanceof HTMLElement) {
+          const value = option.dataset["value"];
+          if (value !== undefined) {
+            void chooseFloatingModel(value);
+          }
+        }
+        break;
+      }
+      case "Escape":
+        event.preventDefault();
+        event.stopPropagation();
+        setFloatingModelOpen(false, true);
+        break;
+      case "Tab":
+        setFloatingModelOpen(false, false);
+        break;
+      default:
+        break;
+    }
+  });
+
+  // ポップオーバーの外をクリックしたら閉じる。
+  document.addEventListener("pointerdown", (event) => {
+    if (!state.floatingModelOpen) {
+      return;
+    }
+    const target = event.target;
+    if (!(target instanceof Node)) {
+      return;
+    }
+    if (
+      floatingModelPopoverEl.contains(target) ||
+      floatingModelButtonEl.contains(target)
+    ) {
+      return;
+    }
+    setFloatingModelOpen(false, false);
   });
 
   // トレイメニューの「設定」で設定ビューを開く。

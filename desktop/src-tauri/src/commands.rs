@@ -1,15 +1,19 @@
 //! フロントエンドとの IPC (Task B がこのコントラクトどおりに実装する)。
 //!
 //! コマンド:
-//!   get_engine_status() -> { state, detail? }
+//!   get_engine_status(role?) -> { role, state, detail? }
+//!     role は "main" / "floating"。省略時は main (フローティング画面は自分で指定する)。
 //!   restart_engine() -> ()
 //!   get_settings() / set_settings(patch) -> Settings
 //!   detect_language(text) -> Option<{ code, confidence }>
 //!   translate(req: { text, source_lang?, target_lang, form?, glossary? }) -> jobId
+//!     jobId のエンジンは呼び出し元ウィンドウのラベルで決まる
+//!     ("floating" → フローティング用、それ以外 → メイン用)。
 //!   cancel_translation(jobId) -> ()
 //!
 //! イベント:
-//!   engine:status { state, detail? }
+//!   engine:status { role, state, detail? }
+//!     role ごとに 2 インスタンスぶん流れる。UI は自役割のみ反映する。
 //!   translation:progress { jobId, done, total }
 //!   translation:chunk { jobId, delta }
 //!   translation:done { jobId, text, tokens? }
@@ -29,7 +33,7 @@ use tokio::time::timeout;
 
 use crate::detect::{self, DetectedLanguage};
 use crate::engine::{
-    Engine, EnginePhase, EngineReady, EngineStatus, ENGINE_READY_LIMIT, SERVER_ALIAS,
+    Engine, EnginePhase, EngineReady, EngineRole, EngineStatus, ENGINE_READY_LIMIT, SERVER_ALIAS,
 };
 use crate::floating;
 use crate::message::LocalizedText;
@@ -194,6 +198,16 @@ impl JobManager {
             .is_some_and(|control| control.origin != origin)
     }
 
+    /// `origin` 由来のジョブがまだ走っているか。
+    ///
+    /// 中止フラグの立ったジョブ (superseded / 画面を閉じた) は「走っていない」と
+    /// みなす。エンジンを止めてよいかの判定に使う。
+    pub fn has_running_job_from_origin(&self, origin: &str) -> bool {
+        self.lock().as_ref().is_some_and(|control| {
+            control.origin == origin && !control.cancel.load(Ordering::SeqCst)
+        })
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<JobControl>> {
         self.inner
             .current
@@ -206,12 +220,19 @@ impl JobManager {
 // コマンド
 // ---------------------------------------------------------------------------
 
+/// エンジンの状態を返す。
+///
+/// `role` は `"floating"` でフローティング用エンジン、省略・`"main"` でメイン用。
+/// フローティング画面は自分の役割を渡し、メイン画面の状態と混ざらないようにする。
 #[tauri::command]
-pub fn get_engine_status(state: State<'_, AppState>) -> EngineStatus {
-    state.engine.status()
+pub fn get_engine_status(state: State<'_, AppState>, role: Option<String>) -> EngineStatus {
+    let role = EngineRole::from_arg(role.as_deref());
+    state.engine_for(role).status()
 }
 
-/// エンジンを起動し直す。設定の変更を反映するときにも呼ぶ。
+/// メイン用エンジンを起動し直す。設定の変更を反映するときにも呼ぶ。
+///
+/// フローティング用は `set_floating_settings` がモデル変更時に再起動する。
 #[tauri::command]
 pub async fn restart_engine(state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.get();
@@ -232,13 +253,57 @@ pub fn set_settings(
     patch: SettingsPatch,
 ) -> Result<Settings, String> {
     let language_changed = patch.ui_language.is_some();
+    let before = state.settings.get();
     let saved = state.settings.apply(patch)?;
     // トレイメニューは WebView の辞書を通らないので、表示言語が変わったら
     // Rust 側で作り直す (失敗しても設定の保存は成功している)。
     if language_changed {
         crate::tray::refresh_labels(&app);
     }
+    // 常時起動に関わる設定 (常駐 ON/OFF・トレイ常駐・モデル) が変わったら、
+    // 単一 predicate `floating_engine_resident` の遷移だけをエンジンへ反映する。
+    sync_resident_engine(&app, &state, &before, &saved);
     Ok(saved)
+}
+
+/// 常時起動 predicate の遷移をフローティング用エンジンへ反映する。
+///
+/// - false → true: モデルが解決できる場合だけ起こす (翻訳中は何もしない)
+/// - true → false: フローティングの翻訳中でなければ止める
+///   (次のホットキーでオンデマンドに起動し直す)
+///
+/// 「専用モデル未指定なら常駐しない」の判定は `Settings::floating_engine_resident`
+/// の 1 か所だけ。起動・設定変更・メイン非表示・フローティング終了の全経路が
+/// この predicate を使う。
+fn sync_resident_engine(app: &AppHandle, state: &AppState, before: &Settings, after: &Settings) {
+    let was = before.floating_engine_resident();
+    let now = after.floating_engine_resident();
+    if was == now {
+        return;
+    }
+    let engine = state.floating_engine.clone();
+    if now {
+        // すでに動いている・起動処理中なら何もしない (モデル変更の再起動は
+        // set_floating_settings / set_active_model が担当する)。
+        if engine.has_process() || engine.is_starting() {
+            return;
+        }
+        if !crate::engine::can_resolve(EngineRole::Floating, after, app) {
+            return;
+        }
+        let next = after.clone();
+        tauri::async_runtime::spawn(async move {
+            engine.ensure_started(&next).await;
+        });
+        return;
+    }
+    // 翻訳中に止めると途中で切れる。終わったあとの hide で解放される。
+    if !state
+        .jobs
+        .has_running_job_from_origin(floating::FLOATING_LABEL)
+    {
+        engine.kill_now();
+    }
 }
 
 #[tauri::command]
@@ -250,6 +315,9 @@ pub fn detect_language(text: String) -> Option<DetectedLanguage> {
 ///
 /// 引数は 1 つの `req` オブジェクトなので、フロントは
 /// `invoke("translate", { req: { text, target_lang, ... } })` で呼ぶ。
+///
+/// どちらのエンジンで訳すかは呼び出し元のウィンドウで決める
+/// (`floating` → フローティング用、それ以外 → メイン用)。
 #[tauri::command]
 pub fn translate(
     app: AppHandle,
@@ -257,7 +325,9 @@ pub fn translate(
     webview: tauri::WebviewWindow,
     req: TranslateRequest,
 ) -> u32 {
-    let (job_id, cancel, superseded) = state.jobs.begin(webview.label());
+    let origin = webview.label().to_string();
+    let role = EngineRole::from_label(&origin);
+    let (job_id, cancel, superseded) = state.jobs.begin(&origin);
     if let Some(superseded) = superseded {
         if let Err(error) = app.emit(
             "translation:superseded",
@@ -266,7 +336,7 @@ pub fn translate(
             eprintln!("translation:superseded を送れません: {error}");
         }
     }
-    let engine = state.engine.clone();
+    let engine = state.engine_for(role).clone();
     let jobs = state.jobs.clone();
     let settings = state.settings.get();
     tauri::async_runtime::spawn(async move {
@@ -289,6 +359,14 @@ pub fn cancel_translation(state: State<'_, AppState>, job_id: u32) {
 pub struct FloatingSettingsPatch {
     pub enabled: Option<bool>,
     pub hotkey: Option<String>,
+    /// フローティング用モデル (`installed_models` の file)。
+    /// 空文字は「アクティブモデルと同じ」への変更として扱う。
+    pub model: Option<String>,
+    /// ホットキー記録のための一時的な無効化か。
+    ///
+    /// true のときは常駐エンジンの開始/停止をしない。記録のたびにモデルを
+    /// 読み込み直すのを避けるため (本物の有効/無効は false で送る)。
+    pub suspend: Option<bool>,
 }
 
 /// フローティングウィンドウの設定を保存する。
@@ -297,12 +375,17 @@ pub struct FloatingSettingsPatch {
 /// 競合) は新キーの登録を旧キーへ戻したうえで `settings.floating.hotkeyConflict`
 /// を返す。設定値そのものは保存済みなので、呼び出し側はエラーを表示しつつ
 /// `get_settings` の値 (変更後) を画面へ反映すること。
+///
+/// 専用モデルが変わったときは、稼働中のフローティング用を新しいモデルで
+/// 起こし直す (常駐の開始/停止は `floating_engine_resident` の遷移で決まる)。
+/// `suspend: true` はホットキー記録用の一時無効化で、常駐エンジンを触らない。
 #[tauri::command]
 pub async fn set_floating_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     patch: FloatingSettingsPatch,
 ) -> Result<Settings, LocalizedText> {
+    let suspended = patch.suspend.unwrap_or(false);
     let normalized = match patch.hotkey.as_deref() {
         Some(value) => Some(
             floating::normalize_hotkey(value)
@@ -310,7 +393,17 @@ pub async fn set_floating_settings(
         ),
         None => None,
     };
+    // `null` (未指定) は変更なし、空文字は「アクティブモデルと同じ」(None)。
+    let model_patch: Option<Option<String>> = patch.model.as_deref().map(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
+    let before = state.settings.get();
     let saved = state
         .settings
         .update(|settings| {
@@ -320,12 +413,43 @@ pub async fn set_floating_settings(
             if let Some(hotkey) = &normalized {
                 settings.floating_window.hotkey = hotkey.clone();
             }
+            if let Some(model) = &model_patch {
+                settings.floating_window.model = model.clone();
+            }
             Ok(())
         })
         .map_err(|error| {
             let fallback = format!("設定を保存できませんでした: {error}");
             LocalizedText::new("settings.floating.saveFailed", fallback).param("detail", error)
         })?;
+
+    // 専用モデルが実際に変わったときだけ、稼働中のエンジンを新しいモデルで
+    // 起こし直す (停止 → 起動)。常駐の開始/停止は predicate の遷移で決まる。
+    let model_changed =
+        model_patch.is_some() && saved.floating_window.model != before.floating_window.model;
+    if model_changed {
+        let engine = state.floating_engine.clone();
+        let running = engine.has_process() || engine.is_starting();
+        let idle = !state
+            .jobs
+            .has_running_job_from_origin(floating::FLOATING_LABEL);
+        if running && idle {
+            if saved.floating_window.model.is_some() {
+                let next = saved.clone();
+                tauri::async_runtime::spawn(async move {
+                    engine.start(&next).await;
+                });
+            } else {
+                // 専用モデルを外した。古いモデルを掴んだままにしない。
+                engine.kill_now();
+            }
+        }
+    }
+    // ホットキー記録中の一時無効化 (suspend) では常駐エンジンを触らない。
+    // 本物の有効/無効の切り替えだけ predicate の遷移として反映する (M-2)。
+    if !suspended {
+        sync_resident_engine(&app, &state, &before, &saved);
+    }
 
     // ショートカットの登録はプラグインがメインスレッドの処理完了を待つ。
     // メインスレッドで動くコマンドから直接呼ぶと固まるので、ブロッキング
@@ -386,8 +510,18 @@ pub async fn install_runtime(
     let settings = state.settings.clone();
     let downloads = state.downloads.clone();
     let engine = state.engine.clone();
-    crate::installer::install_runtime(&app, &settings, &downloads, &engine).await?;
-    Ok(())
+    let floating_engine = state.floating_engine.clone();
+    // 実行中の llama-server.exe は Windows でロックされるため、常駐中の
+    // フローティング用も先に止める (installer 側がメイン用を止める)。
+    // 起動処理の途中でも止めれば、あとで起こし直す対象として扱う (L-2)。
+    let restore_floating = floating_engine.has_process() || floating_engine.is_starting();
+    floating_engine.kill_now();
+    let result = crate::installer::install_runtime(&app, &settings, &downloads, &engine).await;
+    if restore_floating {
+        // 新しいランタイムで起こし直す。失敗しても既存の設定で起動を試みる。
+        floating_engine.start(&settings.get()).await;
+    }
+    result.map(|_| ())
 }
 
 /// カタログの 1 件を models_dir へダウンロードする。
@@ -407,12 +541,66 @@ pub fn cancel_download(state: State<'_, AppState>, id: String) {
     let _ = state.downloads.cancel(&id);
 }
 
-#[tauri::command]
+/// インストール済みモデルを削除する。
+///
+/// フローティング専用モデルを削除するときは、Windows のファイルロックを外すため
+/// フローティング用エンジンを止めてから削除し、成功したら `floating_window.model`
+/// をクリアする (M-4)。削除に失敗したときは、常駐設定が成立するなら起こし直す。
+///
+/// `#[tauri::command(async)]` は必須。この中で最大 3 秒 (`kill_and_wait`) 待つため、
+/// メインスレッド (イベントループ) で実行すると UI とトレイが固まる。`async fn` に
+/// すると `std::thread::sleep` が tokio ワーカーを塞ぐので、属性で別スレッド実行に
+/// する (監査 N-1)。
+#[tauri::command(async)]
 pub fn delete_model(
     state: State<'_, AppState>,
     file: String,
 ) -> Result<Settings, crate::message::LocalizedText> {
-    crate::installer::delete_model(&state.settings, &file)
+    let before = state.settings.get();
+    let is_floating_model = before.floating_window.model.as_deref() == Some(file.as_str());
+    // 実際に削除されうるものだけエンジンを止める (使用中モデル・未登録モデルは
+    // installer が先にエラーにするため、止める必要がない)。
+    let can_delete = before
+        .installed_models
+        .iter()
+        .any(|model| model.file == file)
+        && before.active_model.as_deref() != Some(file.as_str());
+    let floating_engine = state.floating_engine.clone();
+    let killed = is_floating_model && can_delete;
+    if killed {
+        // GGUF を開いているプロセスの終了を待ってから削除する。
+        floating_engine.kill_and_wait(std::time::Duration::from_secs(3));
+    }
+
+    let result = crate::installer::delete_model(&state.settings, &file);
+    match result {
+        Ok(_) if is_floating_model => {
+            // 削除したモデルを指したままにしない (次はアクティブモデルで解決)。
+            let saved = state
+                .settings
+                .update(|settings| {
+                    if settings.floating_window.model.as_deref() == Some(file.as_str()) {
+                        settings.floating_window.model = None;
+                    }
+                    Ok(())
+                })
+                .map_err(crate::message::LocalizedText::from)?;
+            // predicate は false になったので常駐はしない。
+            Ok(saved)
+        }
+        Ok(settings) => Ok(settings),
+        Err(error) => {
+            // 削除できなかった (ウイルス対策ソフト等のロック)。止めた分を戻す。
+            let current = state.settings.get();
+            if killed && current.floating_engine_resident() {
+                let next = current.clone();
+                tauri::async_runtime::spawn(async move {
+                    floating_engine.ensure_started(&next).await;
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 /// 使用するモデルを切り替え、エンジンを起こし直す。
@@ -421,9 +609,32 @@ pub async fn set_active_model(
     state: State<'_, AppState>,
     file: String,
 ) -> Result<Settings, crate::message::LocalizedText> {
+    let before = state.settings.get();
     let settings = crate::installer::set_active_model(&state.settings, &file)?;
     let engine = state.engine.clone();
     engine.start(&settings).await;
+    // フローティング用が実際に使うモデルのパスが変わったときだけ起こし直す
+    // (L-3)。専用モデル指定時はアクティブモデルを変えてもパスは変わらない。
+    let search_root = crate::engine::exe_directory();
+    let before_path = crate::engine::resolve_model_path_for(
+        &before,
+        &search_root,
+        EngineRole::Floating.model_override(&before),
+    )
+    .ok();
+    let after_path = crate::engine::resolve_model_path_for(
+        &settings,
+        &search_root,
+        EngineRole::Floating.model_override(&settings),
+    )
+    .ok();
+    if before_path != after_path {
+        let floating_engine = state.floating_engine.clone();
+        let running = floating_engine.has_process() || floating_engine.is_starting();
+        if running || settings.floating_engine_resident() {
+            floating_engine.start(&settings).await;
+        }
+    }
     Ok(settings)
 }
 
@@ -473,8 +684,10 @@ pub fn install_update(
     state: State<'_, AppState>,
 ) -> Result<(), crate::message::LocalizedText> {
     let engine = state.engine.clone();
+    let floating_engine = state.floating_engine.clone();
     let settings = state.settings.clone();
-    crate::updater::install(&app, &state.updates, &engine, &settings)
+    // 検証・spawn が成功したときだけ updater 側がフローティング用も止める (L-1)。
+    crate::updater::install(&app, &state.updates, &engine, &floating_engine, &settings)
 }
 
 // ---------------------------------------------------------------------------

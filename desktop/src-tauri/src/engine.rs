@@ -4,9 +4,15 @@
 //!   (パスに空白があってもクォート崩れが起きない)。
 //! - 127.0.0.1:0 で空きポートを取ってから、そのポートで起動する。
 //! - `/health` が 200 を返すまで 500ms 間隔で最大 300 秒待つ。
-//! - 進み具合は `engine:status` イベントで流す。
+//! - 進み具合は `engine:status` イベントで流す (ペイロードに `role` を含める)。
 //! - 異常終了したら error を流し、`restart_engine` で起こし直せる。
 //! - アプリ終了時 (RunEvent) と Drop で必ず kill する。
+//!
+//! # 2 インスタンス
+//!
+//! メイン画面用とフローティング用で `Engine` を 2 つ持つ。役割は [`EngineRole`]
+//! で区別し、使うモデル (メイン = `active_model` / フローティング = 専用モデル) と
+//! 起動・停止のタイミングが異なる。ポートはどちらも動的割当なので共存できる。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -66,17 +72,72 @@ pub enum EnginePhase {
     Error,
 }
 
+/// エンジンの役割。メイン画面用とフローティング用の 2 インスタンスを区別する。
+///
+/// どちらも同じ [`Engine`] 実装で、使うモデルとライフサイクルだけが違う。
+///
+/// - `Main`: 選択中のモデル (`active_model`)。オンデマンドで起動し、メイン画面を
+///   閉じたら止める (大型モデルの VRAM を解放する)。
+/// - `Floating`: フローティング専用モデル。`background.resident_engine` が ON なら
+///   アプリ起動中ずっと起動しておく (小型モデル前提)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineRole {
+    Main,
+    Floating,
+}
+
+impl EngineRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Floating => "floating",
+        }
+    }
+
+    /// WebView のラベルから役割を決める。`floating` 以外はメイン扱い。
+    pub fn from_label(label: &str) -> Self {
+        if label == crate::floating::FLOATING_LABEL {
+            Self::Floating
+        } else {
+            Self::Main
+        }
+    }
+
+    /// IPC の `role` 引数から役割を決める。未指定・未知はメイン扱い。
+    pub fn from_arg(role: Option<&str>) -> Self {
+        match role {
+            Some(value) if value == Self::Floating.as_str() => Self::Floating,
+            _ => Self::Main,
+        }
+    }
+
+    /// この役割が使う専用モデル (installed_models の file)。メインは常に `None`。
+    pub(crate) fn model_override(self, settings: &Settings) -> Option<&str> {
+        match self {
+            Self::Main => None,
+            Self::Floating => settings.floating_window.model.as_deref(),
+        }
+    }
+}
+
 /// `engine:status` イベントと `get_engine_status` の返り値。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EngineStatus {
+    /// どちらのエンジンの状態か。UI は自ウィンドウの役割の status だけを見る。
+    pub role: EngineRole,
     pub state: EnginePhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<LocalizedText>,
 }
 
 impl EngineStatus {
-    fn new(state: EnginePhase, detail: Option<LocalizedText>) -> Self {
-        Self { state, detail }
+    fn new(role: EngineRole, state: EnginePhase, detail: Option<LocalizedText>) -> Self {
+        Self {
+            role,
+            state,
+            detail,
+        }
     }
 }
 
@@ -94,6 +155,8 @@ pub enum EngineReady {
 #[derive(Clone)]
 pub struct Engine {
     app: AppHandle,
+    /// このインスタンスの役割。status の `role` と起動ログのファイル名に使う。
+    role: EngineRole,
     inner: Arc<Mutex<Inner>>,
     http: reqwest::Client,
 }
@@ -126,7 +189,7 @@ impl Drop for Inner {
 }
 
 impl Engine {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(app: AppHandle, role: EngineRole) -> Self {
         // llama-server はループバックにしか居ない。OS や環境変数のプロキシを読むと
         // 127.0.0.1 宛の /health までプロキシへ中継され、起動待ちが必ずタイムアウトする。
         // ここで失敗するのは設定不備だけなので、プロキシを読む既定クライアントには戻さない。
@@ -137,10 +200,11 @@ impl Engine {
             .expect("ループバック専用の HTTP クライアントを作れません");
         Self {
             app,
+            role,
             inner: Arc::new(Mutex::new(Inner {
                 generation: 0,
                 active_start: None,
-                status: EngineStatus::new(EnginePhase::Starting, None),
+                status: EngineStatus::new(role, EnginePhase::Starting, None),
                 port: None,
                 child: None,
                 job: None,
@@ -149,8 +213,31 @@ impl Engine {
         }
     }
 
+    /// このインスタンスの役割。
+    pub fn role(&self) -> EngineRole {
+        self.role
+    }
+
     pub fn status(&self) -> EngineStatus {
         self.lock().status.clone()
+    }
+
+    /// 子プロセスを保持しているか (起動処理中・稼働中・異常終了の未回収を含む)。
+    ///
+    /// 「いま動いているか」ではなく「プロセスを掴んでいるか」なので、モデル変更時の
+    /// 再起動要否の判定に使う。
+    pub fn has_process(&self) -> bool {
+        self.lock().child.is_some()
+    }
+
+    /// 起動処理の途中か (`begin_start` から spawn 完了まで)。
+    pub fn is_starting(&self) -> bool {
+        self.lock().active_start.is_some()
+    }
+
+    /// このインスタンスの status を作る (role の付け忘れを防ぐ)。
+    fn status_of(&self, state: EnginePhase, detail: Option<LocalizedText>) -> EngineStatus {
+        EngineStatus::new(self.role, state, detail)
     }
 
     /// 準備できていれば llama-server の待ち受けポート。
@@ -270,7 +357,7 @@ impl Engine {
         stop_child(child, job);
         self.set_status(
             generation,
-            EngineStatus::new(
+            self.status_of(
                 EnginePhase::Starting,
                 Some(text(
                     "engine.startingDetail",
@@ -283,7 +370,7 @@ impl Engine {
 
     /// 起動本体。呼ぶ前に `begin_start` で世代を取っておくこと。
     async fn spawn_engine(&self, generation: u64, settings: &Settings) {
-        let paths = match resolve_paths(settings, &self.app) {
+        let paths = match resolve_paths(settings, &self.app, self.role) {
             Ok(paths) => paths,
             Err(detail) => {
                 self.fail_start(generation, detail);
@@ -344,10 +431,7 @@ impl Engine {
     /// 起動に失敗したことを記録し、「起動処理中」を解除する。
     /// 解除しないと、次に使うときに再起動できなくなる。
     fn fail_start(&self, generation: u64, detail: LocalizedText) {
-        self.set_status(
-            generation,
-            EngineStatus::new(EnginePhase::Error, Some(detail)),
-        );
+        self.set_status(generation, self.status_of(EnginePhase::Error, Some(detail)));
         let mut inner = self.lock();
         if inner.active_start == Some(generation) {
             inner.active_start = None;
@@ -359,14 +443,44 @@ impl Engine {
     /// 進行中の起動処理があっても「止められた」として解除する。ここを消さないと、
     /// `starting` / `loading` のまま残って再起動できなくなる (監査 CR-1)。
     pub fn kill_now(&self) {
-        let (child, job) = {
-            let mut inner = self.lock();
-            inner.generation = inner.generation.wrapping_add(1);
-            inner.active_start = None;
-            inner.port = None;
-            (inner.child.take(), inner.job.take())
-        };
+        let (child, job) = self.take_child();
         stop_child(child, job);
+    }
+
+    /// 子プロセスを止め、終了 (ファイルロックの解放) を最大 `limit` 待つ。
+    ///
+    /// モデル削除のように、プロセスが掴んでいるファイルを触る前の後始末に使う。
+    /// UI を長時間止めないよう、待ち時間は呼び出し側が短く決める。
+    pub fn kill_and_wait(&self, limit: Duration) {
+        let (child, job) = self.take_child();
+        if let Some(mut child) = child {
+            if let Err(error) = child.start_kill() {
+                eprintln!("llama-server を止められません: {error}");
+            }
+            let deadline = Instant::now() + limit;
+            loop {
+                match child.try_wait() {
+                    // 終了した (または状態不明で待ちようがない)。ここで抜ける。
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {}
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // Job Object を閉じると、まだ残っている子は OS が終了させる。
+        drop(job);
+    }
+
+    /// 子プロセスと Job Object を取り出し、「停止済み」の状態に戻す。
+    fn take_child(&self) -> (Option<Child>, Option<JobObject>) {
+        let mut inner = self.lock();
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.active_start = None;
+        inner.port = None;
+        (inner.child.take(), inner.job.take())
     }
 
     async fn supervise(self, generation: u64, port: u16) {
@@ -391,7 +505,7 @@ impl Engine {
                     ),
                     _ => None,
                 };
-                progress_engine.set_status(generation, EngineStatus::new(phase, detail));
+                progress_engine.set_status(generation, progress_engine.status_of(phase, detail));
             },
             move || {
                 if !fatal_engine.is_current(generation) {
@@ -415,7 +529,7 @@ impl Engine {
                 }
                 self.set_status(
                     generation,
-                    EngineStatus::new(
+                    self.status_of(
                         EnginePhase::Error,
                         Some(
                             text(
@@ -435,10 +549,7 @@ impl Engine {
                 if !self.is_current(generation) {
                     return;
                 }
-                self.set_status(
-                    generation,
-                    EngineStatus::new(EnginePhase::Error, Some(detail)),
-                );
+                self.set_status(generation, self.status_of(EnginePhase::Error, Some(detail)));
                 self.kill_now();
             }
         }
@@ -452,10 +563,7 @@ impl Engine {
                 return;
             }
             if let Some(detail) = self.exited_detail(generation) {
-                self.set_status(
-                    generation,
-                    EngineStatus::new(EnginePhase::Error, Some(detail)),
-                );
+                self.set_status(generation, self.status_of(EnginePhase::Error, Some(detail)));
                 return;
             }
         }
@@ -508,7 +616,12 @@ impl Engine {
     fn log_path(&self) -> Option<PathBuf> {
         let directory = self.app.path().app_log_dir().ok()?;
         std::fs::create_dir_all(&directory).ok()?;
-        Some(directory.join("llama-server.log"))
+        // 2 インスタンスが同じファイルへ追記すると原因調査ができないので分ける。
+        let name = match self.role {
+            EngineRole::Main => "llama-server.log",
+            EngineRole::Floating => "llama-server-floating.log",
+        };
+        Some(directory.join(name))
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -625,7 +738,40 @@ pub(crate) fn resolve_model_path(
     settings: &Settings,
     search_root: &Path,
 ) -> Result<PathBuf, LocalizedText> {
+    resolve_model_path_for(settings, search_root, None)
+}
+
+/// モデルの場所を決める。`preferred` (フローティング専用モデル) があれば最優先し、
+/// 実在しない・未登録なら通常の解決チェーンへフォールバックする。
+///
+/// 専用モデルがアンインストールされても翻訳を止めないための設計。フォールバックした
+/// ことは `tried` に残し、起動失敗時のメッセージから分かるようにする。
+pub(crate) fn resolve_model_path_for(
+    settings: &Settings,
+    search_root: &Path,
+    preferred: Option<&str>,
+) -> Result<PathBuf, LocalizedText> {
     let mut tried: Vec<String> = Vec::new();
+
+    if let Some(file) = preferred {
+        match settings
+            .installed_models
+            .iter()
+            .find(|model| model.file == file)
+        {
+            Some(model) => {
+                let path = PathBuf::from(&model.path);
+                if path.is_file() {
+                    return Ok(path);
+                }
+                tried.push(format!(
+                    "フローティング用モデル {} (実ファイルなし)",
+                    path.display()
+                ));
+            }
+            None => tried.push(format!("フローティング用モデル {file} (未登録)")),
+        }
+    }
 
     if let Some(active) = settings.active_model.as_deref() {
         match settings
@@ -744,7 +890,8 @@ pub(crate) fn resolve_runtime_path(
 
 /// モデルとサーバの場所を決める。
 ///
-/// モデルは管理対象 → settings.json の model_path → 環境変数 → exe の位置からの探索。
+/// モデルは「役割の専用モデル (フローティングのみ)」→ 管理対象 → settings.json の
+/// model_path → 環境変数 → exe の位置からの探索。
 /// ランタイムは管理済み → settings.json の server_path → 既定の保存先 → 環境変数 → 探索。
 /// 探索はデバッグ実行では上位 6 階層まで、リリースでは隣と 1 つ上だけ。
 fn both_not_installed(model_error: &LocalizedText, runtime_error: &LocalizedText) -> LocalizedText {
@@ -756,11 +903,15 @@ fn both_not_installed(model_error: &LocalizedText, runtime_error: &LocalizedText
     .param("model_paths", paths(model_error))
     .param("runtime_paths", paths(runtime_error))
 }
-fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, LocalizedText> {
+fn resolve_paths(
+    settings: &Settings,
+    app: &AppHandle,
+    role: EngineRole,
+) -> Result<ServerPaths, LocalizedText> {
     let search_root = exe_directory();
     let default_server = default_runtime_server_path(app);
 
-    let model = resolve_model_path(settings, &search_root);
+    let model = resolve_model_path_for(settings, &search_root, role.model_override(settings));
     let server = resolve_runtime_path(settings, default_server.as_deref(), &search_root);
 
     match (model, server) {
@@ -770,6 +921,13 @@ fn resolve_paths(settings: &Settings, app: &AppHandle) -> Result<ServerPaths, Lo
         }
         (Err(error), _) | (_, Err(error)) => Err(error),
     }
+}
+
+/// その役割のエンジンを起動できるか (モデルとランタイムが解決できるか)。
+///
+/// 常時起動を始める前に、未導入の環境で無駄に error を出さないための判定。
+pub(crate) fn can_resolve(role: EngineRole, settings: &Settings, app: &AppHandle) -> bool {
+    resolve_paths(settings, app, role).is_ok()
 }
 
 /// `start` から親を最大 `depth` 階層たどり、`relative` が実在する場所を返す。
@@ -1214,24 +1372,173 @@ mod tests {
 
     #[test]
     fn status_matches_the_event_contract() {
-        let ready = serde_json::to_value(EngineStatus::new(EnginePhase::Ready, None)).unwrap();
-        assert_eq!(ready, serde_json::json!({ "state": "ready" }));
+        let ready = serde_json::to_value(EngineStatus::new(
+            EngineRole::Main,
+            EnginePhase::Ready,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            ready,
+            serde_json::json!({ "role": "main", "state": "ready" })
+        );
 
+        // UI は role で自分のエンジンだけを選ぶ。付け忘れると両ウィンドウが
+        // 他人の status を表示してしまうため、payload に必ず含める。
         let loading = serde_json::to_value(EngineStatus::new(
+            EngineRole::Floating,
             EnginePhase::Loading,
             Some(text("engine.loadingDetail", "モデルを読み込んでいます。")),
         ))
         .unwrap();
+        assert_eq!(loading["role"], "floating");
         assert_eq!(loading["state"], "loading");
         assert_eq!(loading["detail"]["key"], "engine.loadingDetail");
         assert_eq!(loading["detail"]["fallback"], "モデルを読み込んでいます。");
 
         let error = serde_json::to_value(EngineStatus::new(
+            EngineRole::Main,
             EnginePhase::Error,
             Some(text("error.raw", "見つかりません")),
         ))
         .unwrap();
         assert_eq!(error["state"], "error");
+    }
+
+    #[test]
+    fn roles_are_derived_from_window_labels_and_ipc_arguments() {
+        // translate のルーティングは WebView のラベルで決まる。
+        assert_eq!(
+            EngineRole::from_label(crate::floating::FLOATING_LABEL),
+            EngineRole::Floating
+        );
+        assert_eq!(
+            EngineRole::from_label(crate::floating::MAIN_LABEL),
+            EngineRole::Main
+        );
+        // 未知のラベルはメイン扱い (増えても翻訳を止めない)。
+        assert_eq!(EngineRole::from_label("settings"), EngineRole::Main);
+        assert_eq!(EngineRole::from_label(""), EngineRole::Main);
+
+        // get_engine_status の role 引数。省略・未知はメイン扱い。
+        assert_eq!(EngineRole::from_arg(Some("floating")), EngineRole::Floating);
+        assert_eq!(EngineRole::from_arg(Some("main")), EngineRole::Main);
+        assert_eq!(EngineRole::from_arg(None), EngineRole::Main);
+        assert_eq!(EngineRole::from_arg(Some("")), EngineRole::Main);
+
+        assert_eq!(EngineRole::Main.as_str(), "main");
+        assert_eq!(EngineRole::Floating.as_str(), "floating");
+    }
+
+    #[test]
+    fn floating_role_uses_its_own_model_and_falls_back_to_the_active_one() {
+        let base = temp_dir("floating-model");
+        let active = base.join("active.gguf");
+        fs::write(&active, b"m").unwrap();
+        let small = base.join("small.gguf");
+        fs::write(&small, b"m").unwrap();
+
+        let mut settings = Settings {
+            active_model: Some("active.gguf".to_string()),
+            installed_models: vec![
+                InstalledModel {
+                    file: "active.gguf".to_string(),
+                    repo: "pfnet/test".to_string(),
+                    bytes: 1,
+                    path: active.to_string_lossy().into_owned(),
+                    installed_at: 0,
+                },
+                InstalledModel {
+                    file: "small.gguf".to_string(),
+                    repo: "pfnet/test".to_string(),
+                    bytes: 1,
+                    path: small.to_string_lossy().into_owned(),
+                    installed_at: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // 専用モデルが未指定ならアクティブモデル (従来どおり)。
+        assert_eq!(EngineRole::Floating.model_override(&settings), None);
+        assert_eq!(
+            resolve_model_path_for(&settings, &base, None).unwrap(),
+            active
+        );
+
+        // 専用モデルがあればそちらを使う。
+        settings.floating_window.model = Some("small.gguf".to_string());
+        assert_eq!(
+            EngineRole::Floating.model_override(&settings),
+            Some("small.gguf")
+        );
+        assert_eq!(
+            resolve_model_path_for(
+                &settings,
+                &base,
+                EngineRole::Floating.model_override(&settings)
+            )
+            .unwrap(),
+            small
+        );
+
+        // 専用モデルの実ファイルが消えても翻訳を止めない (アクティブへフォールバック)。
+        settings.installed_models[1].path =
+            base.join("missing.gguf").to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_model_path_for(
+                &settings,
+                &base,
+                EngineRole::Floating.model_override(&settings)
+            )
+            .unwrap(),
+            active
+        );
+
+        // 未登録の ID でも同じくフォールバックする。
+        settings.floating_window.model = Some("unknown.gguf".to_string());
+        assert_eq!(
+            resolve_model_path_for(
+                &settings,
+                &base,
+                EngineRole::Floating.model_override(&settings)
+            )
+            .unwrap(),
+            active
+        );
+
+        // メインは専用モデルの設定に影響されない。
+        settings.floating_window.model = Some("small.gguf".to_string());
+        assert_eq!(EngineRole::Main.model_override(&settings), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn both_not_installed_reports_the_floating_override_in_its_paths() {
+        // 専用モデルも通常チェーンも解決できないときは、確認した場所に専用モデルの
+        // 情報を残す (どの設定が原因か分かるようにする)。
+        let empty = temp_dir("floating-model-missing");
+        let settings = Settings {
+            floating_window: crate::settings::FloatingWindowSettings {
+                model: Some("unknown.gguf".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = resolve_model_path_for(
+            &settings,
+            &empty,
+            EngineRole::Floating.model_override(&settings),
+        )
+        .unwrap_err();
+        assert!(error
+            .fallback
+            .contains("フローティング用モデル unknown.gguf"));
+        assert!(error
+            .params
+            .get("paths")
+            .is_some_and(|paths| paths.contains("unknown.gguf")));
+        let _ = fs::remove_dir_all(&empty);
     }
 
     #[test]

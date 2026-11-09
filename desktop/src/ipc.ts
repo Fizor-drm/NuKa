@@ -13,7 +13,15 @@ import type { LocalizedMessage } from "./i18n";
 
 export type EnginePhase = "starting" | "loading" | "ready" | "error";
 
+/**
+ * エンジンの役割。メイン画面用とフローティング用で 2 インスタンスある。
+ * `engine:status` と `get_engine_status` の両方に含まれる。
+ */
+export type EngineRole = "main" | "floating";
+
 export interface EngineStatus {
+  /** どちらのエンジンの状態か。省略時は main (後方互換)。 */
+  role?: EngineRole;
   state: EnginePhase;
   detail?: LocalizedMessage;
 }
@@ -46,24 +54,36 @@ export interface Settings {
 export interface FloatingWindowSettings {
   enabled: boolean;
   hotkey: string;
+  /**
+   * フローティング用エンジンが使うモデル (`installed_models` の file)。
+   * null は「アクティブモデルと同じ」。
+   */
+  model: string | null;
 }
 
 export interface FloatingSettingsPatch {
   enabled?: boolean;
   hotkey?: string;
+  /** 空文字は「アクティブモデルと同じ」へ戻す。 */
+  model?: string;
+  /**
+   * ホットキー記録のための一時的な無効化。true のときは常駐エンジンを
+   * 開始/停止しない (記録のたびにモデルを読み込み直さないため)。
+   */
+  suspend?: boolean;
 }
 
 /** バックグラウンド実行 (トレイ常駐) の設定。 */
 export interface BackgroundSettings {
   /** メイン画面を閉じてもトレイに常駐する (既定 true)。 */
   enabled: boolean;
-  /** バックグラウンドでもエンジンを止めない (既定 false = 止めて VRAM を解放)。 */
-  keep_engine: boolean;
+  /** フローティング用エンジンを常時起動しておく (既定 true)。 */
+  resident_engine: boolean;
 }
 
 export interface BackgroundSettingsPatch {
   enabled?: boolean;
-  keep_engine?: boolean;
+  resident_engine?: boolean;
 }
 
 export interface SettingsPatch {
@@ -224,7 +244,8 @@ export interface FloatingCapturePayload {
 }
 
 export const ipc = {
-  getEngineStatus: (): Promise<EngineStatus> => invoke<EngineStatus>("get_engine_status"),
+  getEngineStatus: (role: EngineRole = "main"): Promise<EngineStatus> =>
+    invoke<EngineStatus>("get_engine_status", { role }),
   restartEngine: (): Promise<void> => invoke<void>("restart_engine"),
   getSettings: (): Promise<Settings> => invoke<Settings>("get_settings"),
   setSettings: (patch: SettingsPatch): Promise<Settings> =>

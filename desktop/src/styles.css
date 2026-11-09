@@ -1058,6 +1058,51 @@ html:lang(zh-Hans) {
   font-weight: 600;
 }
 
+/* フローティング用モデルの選択 (ネイティブ select は使わない) */
+.model-picker {
+  position: relative;
+  min-width: 0;
+}
+
+.model-picker-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.model-picker-button:hover,
+.model-picker-button[aria-expanded="true"] {
+  background: var(--hover);
+  border-color: var(--muted);
+}
+
+.model-picker-button .lang-button-chevron {
+  flex: none;
+  transition: transform 120ms ease;
+}
+
+.model-picker-button[aria-expanded="true"] .lang-button-chevron {
+  transform: rotate(180deg);
+}
+
+.model-picker-popover {
+  left: 0;
+  right: auto;
+  width: 280px;
+  max-height: 320px;
+}
+
 .settings-radio {
   display: inline-flex;
   align-items: center;

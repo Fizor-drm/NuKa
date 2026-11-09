@@ -38,6 +38,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
+use crate::engine::EngineRole;
 use crate::message::LocalizedText;
 use crate::AppState;
 
@@ -837,34 +838,84 @@ fn hide_with_reason(app: &AppHandle, reason: &str) {
     reclaim_idle_engine(app);
 }
 
+/// フローティングを閉じたときに、どのエンジンを解放してよいか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reclaim {
+    /// どちらも止めない (通常の利用中・翻訳中)。
+    KeepAll,
+    /// メイン用だけ止める (フローティング用は常駐させる)。
+    StopMain,
+    /// フローティング用だけ止める (メイン用は表示中/翻訳中で残す)。
+    StopFloating,
+    /// 両方止める。
+    StopBoth,
+}
+
+/// 解放の判定。`resident` は `Settings::floating_engine_resident()` (専用モデルが
+/// 選ばれた常時起動) で、フローティング用を残すかどうかの唯一の条件。
+///
+/// - 常時起動 ON: フローティング用は残し、メイン用だけを「メインが隠れていて
+///   メイン由来の翻訳も無い」ときに止める
+/// - 常時起動 OFF: フローティング用も止める (翻訳中を除く)。メイン用は表示中/
+///   翻訳中なら残す
+fn decide_reclaim(
+    resident: bool,
+    main_visible: bool,
+    main_busy: bool,
+    floating_busy: bool,
+) -> Reclaim {
+    // 常時起動 OFF のときは、訳していないフローティング用を解放する (M-3)。
+    let stop_floating = !resident && !floating_busy;
+    let stop_main = !main_visible && !main_busy;
+    match (stop_floating, stop_main) {
+        (true, true) => Reclaim::StopBoth,
+        (false, true) => Reclaim::StopMain,
+        (true, false) => Reclaim::StopFloating,
+        (false, false) => Reclaim::KeepAll,
+    }
+}
+
 /// バックグラウンドで、訳すものが無くなったエンジンを止める。
 ///
-/// 「ウィンドウを閉じたら VRAM を解放する」というバックグラウンド実行の契約を、
-/// ホットキー経由の起動にも適用する。次のときは止めない。
+/// 「閉じたら VRAM を解放する」というバックグラウンド実行の契約を、ホットキー
+/// 経由の起動にも適用する。常時起動 (`Settings::floating_engine_resident`) が
+/// 有効なときはフローティング用を残し、メイン用だけを解放する。
 ///
-/// - メイン画面が見えている (通常の利用中)
-/// - `background.keep_engine` が ON (エンジン維持が設定されている)
-/// - メイン由来など、フローティング以外の翻訳がまだ動いている
+/// - メイン画面が見えている (通常の利用中) ときはメイン用を止めない
+/// - メイン由来の翻訳がまだ動いているときもメイン用を止めない
+/// - フローティングの翻訳中はフローティング用を止めない
 fn reclaim_idle_engine(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
     let settings = state.settings.get();
-    if !settings.background.enabled || settings.background.keep_engine {
-        return;
-    }
     let main_visible = app
         .get_webview_window(MAIN_LABEL)
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false);
-    if main_visible {
-        return;
+    let main_busy = state.jobs.has_job_from_other_origin(FLOATING_LABEL);
+    let floating_busy = state.jobs.has_running_job_from_origin(FLOATING_LABEL);
+    match decide_reclaim(
+        settings.floating_engine_resident(),
+        main_visible,
+        main_busy,
+        floating_busy,
+    ) {
+        Reclaim::KeepAll => {}
+        Reclaim::StopMain => {
+            state.engine.kill_now();
+            debug_log!("main engine stopped (floating hidden: メインは隠れているため解放)");
+        }
+        Reclaim::StopFloating => {
+            state.floating_engine.kill_now();
+            debug_log!("floating engine stopped (floating hidden: 常時起動なし)");
+        }
+        Reclaim::StopBoth => {
+            state.engine.kill_now();
+            state.floating_engine.kill_now();
+            debug_log!("engines stopped (floating hidden: 訳すものが無いため解放)");
+        }
     }
-    if state.jobs.has_job_from_other_origin(FLOATING_LABEL) {
-        return;
-    }
-    state.engine.kill_now();
-    debug_log!("engine stopped (floating hidden: 訳すものが無いため解放)");
 }
 
 /// `handle_window_event` の判定をユニットテストできるようにしたイベント種別。
@@ -922,8 +973,11 @@ pub(crate) fn background_enabled(app: &AppHandle) -> bool {
 /// - メインは破棄せず隠す (プロセスとトレイは残る)
 /// - フローティングが表示中なら一緒に隠す (決定済み)
 /// - メイン由来の翻訳を止める
-/// - `background.keep_engine` が false (既定) なら llama-server を止める。
-///   ここが「超軽量」の本体で、モデルの VRAM / メモリを解放する。
+/// - メイン用エンジンは常に止める (常時起動の設定に関わらず)。
+///   ここが「超軽量」の本体で、大型モデルの VRAM / メモリを解放する。
+/// - フローティング用は `Settings::floating_engine_resident` (専用モデルを選んだ
+///   常時起動) が成立しているときだけ維持する。それ以外は止める
+///   (次のホットキーでオンデマンドに起動し直す)。
 fn hide_main_to_tray(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_LABEL) {
         if let Err(error) = window.hide() {
@@ -938,11 +992,14 @@ fn hide_main_to_tray(app: &AppHandle) {
     }
     // 隠した画面の翻訳を裏で続けない。
     state.jobs.cancel_current_for_origin(MAIN_LABEL);
-    if !state.settings.get().background.keep_engine {
-        state.engine.kill_now();
-        debug_log!("engine stopped (background: VRAM を解放)");
+    let settings = state.settings.get();
+    state.engine.kill_now();
+    debug_log!("main engine stopped (background: VRAM を解放)");
+    if settings.floating_engine_resident() {
+        debug_log!("floating engine kept (floating_engine_resident)");
     } else {
-        debug_log!("engine kept (background.keep_engine)");
+        state.floating_engine.kill_now();
+        debug_log!("floating engine stopped (常時起動の条件を満たさない)");
     }
 }
 
@@ -1169,12 +1226,13 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option
         }
     }
 
-    // 訳すものがあったときだけ、止まっているエンジンを起こす。起動中は
-    // engine:status (starting / loading) が全ウィンドウへ流れ、floating は
-    // 「エンジンを起動しています」を出してから翻訳に入る。
+    // 訳すものがあったときだけ、止まっているフローティング用エンジンを起こす。
+    // 起動中は engine:status (starting / loading) が全ウィンドウへ流れ、floating は
+    // 「エンジンを起動しています」を出してから翻訳に入る。常時起動が ON なら
+    // ここは何もしない (モデル読み込み待ちなしで翻訳が始まる)。
     // 選択なし (noSelection) のときは起動しない (無駄に VRAM を使わない)。
     if selected.is_some() {
-        crate::ensure_engine_started(app);
+        crate::ensure_engine_started(app, EngineRole::Floating);
     }
 
     let Some(state) = app.try_state::<AppState>() else {
@@ -1953,5 +2011,26 @@ mod tests {
         assert!(state.is_shown());
         state.set_shown(false);
         assert!(!state.is_shown());
+    }
+
+    #[test]
+    fn reclaim_keeps_the_resident_engine_and_frees_the_main_one() {
+        use Reclaim::{KeepAll, StopBoth, StopFloating, StopMain};
+
+        // 常時起動 ON: メインが見えていれば両方残す。隠れていて暇ならメインだけ止める。
+        assert_eq!(decide_reclaim(true, true, false, false), KeepAll);
+        assert_eq!(decide_reclaim(true, true, true, false), KeepAll);
+        assert_eq!(decide_reclaim(true, false, false, false), StopMain);
+        // メインの翻訳中はメイン用を残す。
+        assert_eq!(decide_reclaim(true, false, true, false), KeepAll);
+
+        // 常時起動 OFF: メインが表示中でもフローティング用は止める (M-3)。
+        assert_eq!(decide_reclaim(false, true, false, false), StopFloating);
+        assert_eq!(decide_reclaim(false, false, true, false), StopFloating);
+        // メインが隠れていて暇なら両方止める (v1.3.2 と同じ)。
+        assert_eq!(decide_reclaim(false, false, false, false), StopBoth);
+        // フローティングの翻訳中はフローティング用を止めない。
+        assert_eq!(decide_reclaim(false, true, false, true), KeepAll);
+        assert_eq!(decide_reclaim(false, false, false, true), StopMain);
     }
 }
