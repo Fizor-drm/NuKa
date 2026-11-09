@@ -600,20 +600,26 @@ fn resync_after_start(has_process: bool) -> bool {
 /// 予約 (`reserve_start`) は既存の子の停止までを同期に行う。このため、
 /// ジョブ受け付けと「止める/起こし直す」の順序は制御ロックで確定する (H1)。
 /// 終了処理が始まっていたら予約しない (Medium 2)。
+///
+/// 戻り値は「この呼び出しで起動を予約したか」。spawn は別ワーカーで走るため、
+/// 予約できたかどうかを `engine.is_starting()` の再読みで判定してはならない
+/// (spawn が先に完了すると false になり、起動中なのに失敗と誤判定する: Minor)。
+/// 予約した時点で true を返す。
 fn reserve_and_spawn(
     app: &AppHandle,
     engine: &Engine,
     settings: &Settings,
     force: bool,
     control: &EngineControlInner,
-) {
+) -> bool {
     if !control.may_start() {
-        return;
+        return false;
     }
     let Some(reserved) = engine.reserve_start(settings, force) else {
-        return;
+        return false;
     };
     spawn_reserved_with_sync(app, engine, reserved, settings.clone());
+    true
 }
 
 /// ジョブが使うエンジンを、そのジョブの希望モデルに揃える (M2)。
@@ -639,8 +645,12 @@ fn prepare_engine_for_job(
     );
     match action {
         JobEngineAction::Use => {}
-        JobEngineAction::Start => reserve_and_spawn(app, engine, settings, false, control),
-        JobEngineAction::Restart => reserve_and_spawn(app, engine, settings, true, control),
+        JobEngineAction::Start => {
+            let _ = reserve_and_spawn(app, engine, settings, false, control);
+        }
+        JobEngineAction::Restart => {
+            let _ = reserve_and_spawn(app, engine, settings, true, control);
+        }
     }
 }
 
@@ -655,8 +665,12 @@ fn apply_engine_sync(
     match action {
         EngineSyncAction::Keep => {}
         EngineSyncAction::Stop => engine.kill_now(),
-        EngineSyncAction::Start => reserve_and_spawn(app, engine, settings, false, control),
-        EngineSyncAction::Restart => reserve_and_spawn(app, engine, settings, true, control),
+        EngineSyncAction::Start => {
+            let _ = reserve_and_spawn(app, engine, settings, false, control);
+        }
+        EngineSyncAction::Restart => {
+            let _ = reserve_and_spawn(app, engine, settings, true, control);
+        }
     }
 }
 
@@ -796,7 +810,7 @@ pub(crate) fn start_engine_with_sync(app: &AppHandle, role: EngineRole, force: b
     control.sync.invalidate();
     let settings = state.settings.get();
     let engine = state.engine_for(role).clone();
-    reserve_and_spawn(app, &engine, &settings, force, &control);
+    let _ = reserve_and_spawn(app, &engine, &settings, force, &control);
 }
 
 /// 要求された役割の翻訳に使うエンジンを起こす (トレイの再表示・ホットキー)。
@@ -815,7 +829,7 @@ pub(crate) fn start_engine_requested(app: &AppHandle, requested: EngineRole) {
     let settings = state.settings.get();
     let role = crate::engine::serving_role(requested, &settings, &crate::engine::exe_directory());
     let engine = state.engine_for(role).clone();
-    reserve_and_spawn(app, &engine, &settings, false, &control);
+    let _ = reserve_and_spawn(app, &engine, &settings, false, &control);
 }
 
 /// 常駐ポリシーの決定内容をログに残す (不具合調査用)。
@@ -1462,9 +1476,10 @@ fn retry_job_engine_start(
     {
         return false;
     }
-    reserve_and_spawn(app, engine, settings, false, &control);
-    // 予約できたか (reserve_start は同期に starting を立てる)。
-    engine.is_starting()
+    // 予約できた時点で true。spawn は別ワーカーで走るため、`is_starting()` を
+    // 再読みすると、spawn が先に完了した場合に「起動していない」と誤判定して
+    // readyTimeout でジョブを失敗させてしまう (Minor)。
+    reserve_and_spawn(app, engine, settings, false, &control)
 }
 
 /// 復旧起動を試みてよいか (純粋判定)。
