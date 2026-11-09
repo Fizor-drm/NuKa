@@ -141,8 +141,10 @@ pub fn run() {
             }
 
             // 起動と同時にメイン用 llama-server を起こす。準備できるまで UI には
-            // starting が見える (起動直後はメイン画面が表示される)。
-            // 起動完了後の再同期も含めた統一経路を通す (M1)。
+            // starting が見える。メインウィンドウは config (tauri.conf.json の
+            // `main`、`visible` 既定 true) から setup より先に作成されるため、
+            // ここで起こしたエンジンは表示中として保持される。起動完了後の
+            // 後追い同期はポリシー/モデルが変わったときだけ走る。
             commands::start_engine_with_sync(app.handle(), EngineRole::Main, false);
 
             // フローティング用は「専用モデルを選んで常時起動が有効」なときだけ
