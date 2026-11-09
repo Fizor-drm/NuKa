@@ -50,6 +50,12 @@ use crate::AppState;
 const MAX_TOKENS: u32 = 1024;
 /// プロンプトに載せる履歴の上限 (直近 3 対)。
 const HISTORY_LIMIT: usize = 3;
+/// 文脈 (`TranslateRequest.context`) として受け付ける最大文字数。
+///
+/// 文脈は原文の全チャンクに同じものが載るため、長すぎると 1 回のプロンプトが
+/// `context_tokens` (既定 8192) を超え、全チャンクが HTTP エラーで失敗する。
+/// UI の `#context-text` の `maxlength` と揃える (超えたぶんは黙って切る)。
+const MAX_CONTEXT_CHARS: usize = 1000;
 /// ストリームがこれだけ黙ったら諦める。
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// SSE の 1 行 (改行待ちのバッファ) に許す上限。
@@ -1558,8 +1564,11 @@ fn may_retry_job_start(
 /// `TranslateRequest` から `PromptOptions` を組み立てる。
 ///
 /// 事前検証と本番の 2 回 `build_prompt` を呼ぶので、組み立てを 1 か所にまとめて
-/// 片方だけ context を落とす事故を防ぐ。`context` は空文字・空白だけなら
-/// `None` (プロンプトに `<|plamo:tag|>context` を出さない)。
+/// 片方だけ context を落とす事故を防ぐ。
+///
+/// `context` は前後の空白を落とし、空なら `None` (プロンプトに
+/// `<|plamo:tag|>context` を出さない)。[`MAX_CONTEXT_CHARS`] を超えたぶんは
+/// 文字境界を壊さずに切り詰める (長い文脈で全チャンクのプロンプトが溢れるのを防ぐ)。
 fn prompt_options<'a>(
     req: &'a TranslateRequest,
     text: &'a str,
@@ -1572,10 +1581,23 @@ fn prompt_options<'a>(
         context: req
             .context
             .as_deref()
-            .filter(|context| !context.trim().is_empty()),
+            .map(str::trim)
+            .filter(|context| !context.is_empty())
+            .map(|context| truncate_chars(context, MAX_CONTEXT_CHARS)),
         glossary: &req.glossary,
         form: req.form.as_deref(),
         history,
+    }
+}
+
+/// `value` の先頭から `limit` 文字までを返す。
+///
+/// `char_indices().nth(limit)` が返す位置は常に UTF-8 の文字境界なので、
+/// その位置で切ればマルチバイト文字を壊さない。`limit` 文字以下ならそのまま。
+fn truncate_chars(value: &str, limit: usize) -> &str {
+    match value.char_indices().nth(limit) {
+        Some((index, _)) => &value[..index],
+        None => value,
     }
 }
 
@@ -2677,6 +2699,80 @@ mod tests {
         let prompt = prompt::build_prompt(&prompt_options(&no_context, &no_context.text, &[]))
             .expect("文脈なしでも組み立てられる");
         assert!(!prompt.contains("<|plamo:tag|>context"));
+    }
+
+    /// 文脈付きのリクエストを組み立てる (原文は固定)。
+    fn context_request(context: String) -> TranslateRequest {
+        TranslateRequest {
+            text: "hello".to_string(),
+            source_lang: None,
+            target_lang: "ja".to_string(),
+            form: None,
+            glossary: Vec::new(),
+            context: Some(context),
+        }
+    }
+
+    #[test]
+    fn truncate_chars_keeps_utf8_boundaries() {
+        assert_eq!(truncate_chars("", 5), "");
+        assert_eq!(truncate_chars("abc", 0), "");
+        assert_eq!(truncate_chars("abc", 2), "ab");
+        assert_eq!(truncate_chars("abc", 3), "abc");
+        assert_eq!(truncate_chars("abc", 10), "abc");
+        // マルチバイト (3 バイト / 4 バイト) の途中で切らない。
+        assert_eq!(truncate_chars("あいう", 2), "あい");
+        assert_eq!(truncate_chars("🙂🙂", 1), "🙂");
+        assert_eq!(truncate_chars("あ🙂い", 2), "あ🙂");
+    }
+
+    #[test]
+    fn long_context_is_truncated_to_the_documented_limit() {
+        // 文脈は原文の全チャンクに同じものが載る。長すぎる文脈で全チャンクの
+        // プロンプトが溢れないよう、上限で切る (UI の maxlength と同じ値)。
+        assert_eq!(MAX_CONTEXT_CHARS, 1000);
+
+        // ちょうど上限: 1 文字も落とさない。
+        let exact = "あ".repeat(MAX_CONTEXT_CHARS);
+        let exact_request = context_request(exact.clone());
+        let prompt =
+            prompt::build_prompt(&prompt_options(&exact_request, &exact_request.text, &[]))
+                .expect("上限ちょうどの文脈でも組み立てられる");
+        assert!(prompt.contains(&format!("<|plamo:tag|>context<|plamo:msg|>{exact}")));
+
+        // 上限 + 250: 先頭 1000 文字だけが載る。
+        let over = "い".repeat(MAX_CONTEXT_CHARS + 250);
+        let over_request = context_request(over.clone());
+        let prompt = prompt::build_prompt(&prompt_options(&over_request, &over_request.text, &[]))
+            .expect("上限を超えた文脈でも組み立てられる");
+        let expected = "い".repeat(MAX_CONTEXT_CHARS);
+        assert!(prompt.contains(&format!("<|plamo:tag|>context<|plamo:msg|>{expected}")));
+        assert!(!prompt.contains(&"い".repeat(MAX_CONTEXT_CHARS + 1)));
+
+        // マルチバイト文字の途中で切らない (文字境界で切る)。
+        let mixed = format!(
+            "{}🙂{}",
+            "あ".repeat(MAX_CONTEXT_CHARS - 1),
+            "い".repeat(10)
+        );
+        let mixed_request = context_request(mixed);
+        let prompt =
+            prompt::build_prompt(&prompt_options(&mixed_request, &mixed_request.text, &[]))
+                .expect("マルチバイトの文脈でも組み立てられる");
+        let expected = format!("{}🙂", "あ".repeat(MAX_CONTEXT_CHARS - 1));
+        assert!(prompt.contains(&format!("<|plamo:tag|>context<|plamo:msg|>{expected}")));
+        assert!(!prompt.contains("🙂い"));
+
+        // 切り詰める前後に前後の空白は落とす。
+        let padded_request = context_request(format!("   {}   ", "う".repeat(MAX_CONTEXT_CHARS)));
+        let prompt =
+            prompt::build_prompt(&prompt_options(&padded_request, &padded_request.text, &[]))
+                .expect("空白付きの文脈でも組み立てられる");
+        assert!(prompt.contains(&format!(
+            "<|plamo:tag|>context<|plamo:msg|>{}",
+            "う".repeat(MAX_CONTEXT_CHARS)
+        )));
+        assert!(!prompt.contains("context<|plamo:msg|> "));
     }
 
     #[test]
