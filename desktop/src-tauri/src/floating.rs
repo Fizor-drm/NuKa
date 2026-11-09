@@ -51,8 +51,22 @@ pub const MAIN_LABEL: &str = "main";
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Shift+T";
 /// ウィンドウ幅 (論理ピクセル)。位置計算は物理ピクセルに直してから行う。
 pub const WINDOW_WIDTH: f64 = 420.0;
-/// ウィンドウ高さ (論理ピクセル)。
-pub const WINDOW_HEIGHT: f64 = 300.0;
+/// 既定のウィンドウ高さ (論理ピクセル)。
+///
+/// 右下のつまみでリサイズできるようになったため、初期表示はコンテンツを
+/// 隠さない範囲で低めにしてある。capture 時の位置計算は実サイズ
+/// (`window.outer_size()`) を使い、取得できないときだけこの値にフォールバックする。
+pub const WINDOW_HEIGHT: f64 = 240.0;
+/// リサイズで縮められる最小のウィンドウ幅 (論理ピクセル)。
+///
+/// ヘッダーは「訳マーク + 言語ボタン (最大 150px) + コピー + 閉じる」を
+/// 1 行に並べるため、これ以上狭くするとボタンが潰れる (280px でほぼ一杯)。
+pub const MIN_WINDOW_WIDTH: f64 = 280.0;
+/// リサイズで縮められる最小のウィンドウ高さ (論理ピクセル)。
+///
+/// ヘッダーは 1 行 (パディング込みで約 40px) なので、160px あれば
+/// 本文のスクロール領域が約 120px 残り、操作に支障しない。
+pub const MIN_WINDOW_HEIGHT: f64 = 160.0;
 /// ホットキー発火イベント。全ウィンドウへ送る。
 pub const CAPTURE_EVENT: &str = "floating:capture";
 
@@ -571,7 +585,12 @@ pub fn setup(app: &AppHandle) -> Result<(), LocalizedText> {
         WebviewWindowBuilder::new(app, FLOATING_LABEL, WebviewUrl::App("floating.html".into()))
             .title("NuKa")
             .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
-            .resizable(false)
+            // 右下のつまみ (startResizeDragging) でリサイズするため、装飾なしでも
+            // リサイズ可能にしておく。Windows では tao が undecorated のとき
+            // WS_THICKFRAME を外すが、`startResizeDragging` は WM_NCLBUTTONDOWN を
+            // 直接 PostMessage するので OS 側のサイズ変更ループは動く。
+            .resizable(true)
+            .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
             .decorations(false)
             .always_on_top(true)
             .skip_taskbar(true)
@@ -1361,9 +1380,20 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option
         engine_role,
     };
 
+    // リサイズ可能なので、位置計算には現在のウィンドウの実サイズ (物理ピクセル) を使う。
+    // 定数のままだと、大きくしたウィンドウが作業領域の右端・下端ではみ出して
+    // つまみが画面外に出る。取得できないときだけ既定サイズへフォールバックする。
     let scale = window.scale_factor().unwrap_or(1.0);
-    let width = (WINDOW_WIDTH * scale).round() as i32;
-    let height = (WINDOW_HEIGHT * scale).round() as i32;
+    let (width, height) = match window.outer_size() {
+        Ok(size) => (size.width as i32, size.height as i32),
+        Err(error) => {
+            debug_log!("outer_size unavailable, falling back to default size: {error}");
+            (
+                (WINDOW_WIDTH * scale).round() as i32,
+                (WINDOW_HEIGHT * scale).round() as i32,
+            )
+        }
+    };
     let mut position_log = "not-set".to_string();
     if let (Some((x, y)), Some(work)) = (cursor, cursor.and_then(monitor_work_area)) {
         let (left, top) = place_window(x, y, width, height, work);
@@ -1887,6 +1917,20 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    #[test]
+    fn minimum_window_size_leaves_room_for_the_header_and_body() {
+        // レイアウト前提の不変条件なので、コンパイル時に検査する。
+        const {
+            // 既定サイズより小さい (起動直後からつまみで広げられる)。
+            assert!(MIN_WINDOW_WIDTH < WINDOW_WIDTH);
+            assert!(MIN_WINDOW_HEIGHT < WINDOW_HEIGHT);
+            // ヘッダーは 1 行 (約 40px)。これ以下に縮むと本文が隠れる。
+            assert!(MIN_WINDOW_HEIGHT > 40.0);
+            // 最小幅でもヘッダーのボタン列が 1 行に収まる (280px でほぼ一杯)。
+            assert!(MIN_WINDOW_WIDTH >= 280.0);
+        };
     }
 
     #[test]
