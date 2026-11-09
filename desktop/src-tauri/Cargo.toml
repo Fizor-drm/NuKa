@@ -14,10 +14,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: トレイ常駐 (バックグラウンド実行) に使う。メニューは Tauri 2 の
+# コア API (tauri::menu) なので、追加のプラグインは要らない。
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
+# 二重起動を防ぎ、2 個目の起動要求を既存プロセスへ渡す。
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [

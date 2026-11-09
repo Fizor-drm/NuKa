@@ -13,15 +13,17 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-import { applyTranslations, isUiLanguage, setUiLanguage, t } from "./i18n";
+import { applyTranslations, isUiLanguage, localize, setUiLanguage, t } from "./i18n";
 import {
   ipc,
+  onEngineStatus,
   onFloatingCapture,
   onTranslationChunk,
   onTranslationDone,
   onTranslationError,
   onTranslationProgress,
   onTranslationSuperseded,
+  type EnginePhase,
   type FloatingCapturePayload,
 } from "./ipc";
 import { LANGUAGES, languageByCode } from "./languages";
@@ -41,7 +43,7 @@ type JobEvent =
   | { kind: "progress"; jobId: number; done: number; total: number }
   | { kind: "chunk"; jobId: number; delta: string }
   | { kind: "done"; jobId: number; text: string }
-  | { kind: "error"; jobId: number; message: string };
+  | { kind: "error"; jobId: number; message: string; messageKey?: string };
 
 interface InvokeWaiter {
   readonly seq: number;
@@ -111,6 +113,17 @@ let copyLabelTimer: number | undefined;
 /** capture の世代。古い auto-hide タイマーを無効化する。 */
 let captureSeq = 0;
 const supersededJobs = new Set<number>();
+
+/** エンジンの状態。バックグラウンドから復帰した直後は starting から始まる。 */
+let enginePhase: EnginePhase = "starting";
+
+function setEnginePhase(phase: EnginePhase): void {
+  if (enginePhase === phase) {
+    return;
+  }
+  enginePhase = phase;
+  render();
+}
 
 function describeError(error: unknown): string {
   if (typeof error === "string") {
@@ -274,6 +287,11 @@ function render(): void {
   } else if (!hasText) {
     if (state.sourceText === null) {
       message = t("floating.noSelection");
+    } else if (state.translating && enginePhase === "starting") {
+      // バックグラウンドから復帰した直後。engine:status で進み具合が届く。
+      message = t("floating.engineStarting");
+    } else if (state.translating && enginePhase === "loading") {
+      message = t("floating.engineLoading");
     } else {
       message = t("floating.translating");
       const progress = state.progress;
@@ -318,6 +336,13 @@ async function refreshAppearance(): Promise<void> {
   } catch {
     // 設定が読めなくても翻訳は続ける。
   }
+  // エンジンはバックグラウンドで止められていることがある。状態を取り直す。
+  try {
+    const status = await ipc.getEngineStatus();
+    setEnginePhase(status.state);
+  } catch {
+    // エンジンの状態が読めなくても翻訳は続ける。
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +385,10 @@ function applyJobEvent(event: JobEvent): void {
       break;
     case "error":
       state.translating = false;
-      state.error = event.message;
+      state.error =
+        event.messageKey !== undefined
+          ? localize({ key: event.messageKey, fallback: event.message })
+          : event.message;
       state.progress = null;
       state.jobId = null;
       render();
@@ -380,6 +408,20 @@ function abortPending(): void {
     state.jobId = null;
     void ipc.cancelTranslation(previous).catch(() => undefined);
   }
+}
+
+/**
+ * 閉じたときに、進行中の capture を無効化する。
+ *
+ * `captureSeq` を進めることで、待機中 (テーマ取得など) の capture が後から
+ * 翻訳を始めないようにする。非表示のウィンドウで翻訳が走ると、エンジンだけが
+ * 起動して VRAM を保持してしまう。
+ */
+function cancelPendingCapture(): void {
+  captureSeq += 1;
+  state.translating = false;
+  state.progress = null;
+  abortPending();
 }
 
 async function translate(): Promise<void> {
@@ -482,6 +524,10 @@ async function handleCapture(payload: FloatingCapturePayload): Promise<void> {
 
   // テーマと表示言語はキャプチャのたびに取り直す。
   await refreshAppearance();
+  if (capture !== captureSeq) {
+    // 待っている間に閉じられた / 新しい capture が来た。翻訳は始めない。
+    return;
+  }
 
   if (state.sourceText === null) {
     window.clearTimeout(autoHideTimer);
@@ -492,11 +538,14 @@ async function handleCapture(payload: FloatingCapturePayload): Promise<void> {
       if (capture !== captureSeq || state.sourceText !== null) {
         return;
       }
+      cancelPendingCapture();
       void hideFloating("auto-hide").catch(() => undefined);
     }, NO_SELECTION_HIDE_DELAY);
     return;
   }
 
+  // エンジンが止まっていれば、Rust 側 (`ensure_ready`) が起動を待ってから訳す。
+  // 待っている間の表示は `engine:status` で「起動しています」に切り替わる。
   await translate();
 }
 
@@ -519,13 +568,18 @@ function closeWindow(origin: "close-button" | "escape"): void {
   window.clearTimeout(autoHideTimer);
   autoHideTimer = undefined;
   closeLanguageList(false);
-  abortPending();
+  // 閉じたあとに翻訳を始めない (待機中の capture を無効化する)。
+  cancelPendingCapture();
   void hideFloating(origin).catch(() => undefined);
 }
 
 function bindEvents(): void {
   onFloatingCapture((payload) => {
     void handleCapture(payload);
+  });
+  // バックグラウンドで止めたエンジンの起動状況は全ウィンドウに届く。
+  onEngineStatus((status) => {
+    setEnginePhase(status.state);
   });
   onTranslationProgress((payload) => {
     handleJobEvent({
@@ -542,7 +596,12 @@ function bindEvents(): void {
     handleJobEvent({ kind: "done", jobId: payload.jobId, text: payload.text });
   });
   onTranslationError((payload) => {
-    handleJobEvent({ kind: "error", jobId: payload.jobId, message: payload.message });
+    handleJobEvent({
+      kind: "error",
+      jobId: payload.jobId,
+      message: payload.message,
+      messageKey: payload.messageKey,
+    });
   });
   onTranslationSuperseded((payload) => {
     handleSuperseded(payload.jobId);

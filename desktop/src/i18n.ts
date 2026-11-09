@@ -114,6 +114,8 @@ const ja: Dict = {
   "floating.copied": "コピーしました",
   "floating.copyFailed": "コピーできませんでした",
   "floating.translating": "翻訳しています…",
+  "floating.engineStarting": "エンジンを起動しています…",
+  "floating.engineLoading": "モデルを読み込んでいます…",
   "floating.close": "閉じる",
   "floating.targetLangAria": "訳先の言語",
 
@@ -152,6 +154,16 @@ const ja: Dict = {
   "settings.floating.adminNote":
     "管理者権限で実行されているアプリの上では、選択テキストを取得できません。",
   "settings.floating.saveFailed": "設定を保存できませんでした: {detail}",
+
+  "settings.backgroundHeading": "バックグラウンド",
+  "settings.background.enable": "ウィンドウを閉じてもトレイに常駐する",
+  "settings.background.keepEngine": "バックグラウンドでもエンジンを動かしたままにする",
+  "settings.background.keepEngineNote":
+    "オフ (既定) にすると、閉じたときにモデルをメモリから解放します。次に使うときに自動で読み込み直します。",
+  "settings.background.quitNote": "アプリの終了は、トレイアイコンのメニュー「終了」から行います。",
+  "settings.background.disabledNote":
+    "常駐しない場合、メイン画面を閉じるとアプリが終了します。",
+  "settings.background.saveFailed": "設定を保存できませんでした: {detail}",
 
   "runtime.checking": "確認しています…",
   "runtime.notInstalled": "未導入。ランタイムをインストールすると翻訳を始められます。",
@@ -205,6 +217,8 @@ const ja: Dict = {
   "engine.loadingDetail": "モデルを読み込んでいます。",
   "engine.readyDetail": "127.0.0.1:{port} で待ち受けています。",
   "engine.portUnavailable": "空きポートを確保できません: {detail}",
+  "engine.readyTimeout":
+    "エンジンの準備ができませんでした。もう一度お試しください。",
   "engine.startTimeout": "llama-server が {seconds} 秒以内に準備できませんでした。",
   "engine.exited": "llama-server が終了しました。",
   "engine.exitedWithCode": "llama-server が終了しました (終了コード {code})。",
@@ -416,6 +430,8 @@ const en: Dict = {
   "floating.copied": "Copied",
   "floating.copyFailed": "Could not copy",
   "floating.translating": "Translating…",
+  "floating.engineStarting": "Starting the engine…",
+  "floating.engineLoading": "Loading the model…",
   "floating.close": "Close",
   "floating.targetLangAria": "Target language",
 
@@ -455,6 +471,16 @@ const en: Dict = {
     "Another app already uses this shortcut, so it could not be registered. The setting was saved, but the shortcut is not active yet.",
   "settings.floating.adminNote": "Text cannot be captured from apps running as administrator.",
   "settings.floating.saveFailed": "Could not save settings: {detail}",
+
+  "settings.backgroundHeading": "Background",
+  "settings.background.enable": "Keep NuKa running in the tray when the window is closed",
+  "settings.background.keepEngine": "Keep the engine running in the background",
+  "settings.background.keepEngineNote":
+    "Leave this off (default) to release the model from memory when the window closes. It reloads automatically the next time you translate.",
+  "settings.background.quitNote": "To quit NuKa, use “Quit” in the tray icon menu.",
+  "settings.background.disabledNote":
+    "When NuKa does not stay resident, closing the main window quits the app.",
+  "settings.background.saveFailed": "Could not save settings: {detail}",
 
   "runtime.checking": "Checking…",
   "runtime.notInstalled": "Not installed. Install the runtime to start translating.",
@@ -508,6 +534,7 @@ const en: Dict = {
   "engine.loadingDetail": "Loading the model.",
   "engine.readyDetail": "Listening on 127.0.0.1:{port}.",
   "engine.portUnavailable": "Could not reserve a free port: {detail}",
+  "engine.readyTimeout": "The engine could not become ready. Please try again.",
   "engine.startTimeout": "llama-server did not become ready within {seconds} seconds.",
   "engine.exited": "llama-server exited.",
   "engine.exitedWithCode": "llama-server exited (exit code {code}).",
@@ -715,6 +742,8 @@ const zh: Dict = {
   "floating.copied": "已复制",
   "floating.copyFailed": "复制失败",
   "floating.translating": "正在翻译…",
+  "floating.engineStarting": "正在启动引擎…",
+  "floating.engineLoading": "正在加载模型…",
   "floating.close": "关闭",
   "floating.targetLangAria": "目标语言",
 
@@ -752,6 +781,15 @@ const zh: Dict = {
     "该快捷键已被其他应用占用，无法注册。设置已保存，但此快捷键尚未生效。",
   "settings.floating.adminNote": "无法从以管理员权限运行的应用中获取所选文本。",
   "settings.floating.saveFailed": "无法保存设置：{detail}",
+
+  "settings.backgroundHeading": "后台运行",
+  "settings.background.enable": "关闭窗口后仍驻留在系统托盘",
+  "settings.background.keepEngine": "在后台保持引擎运行",
+  "settings.background.keepEngineNote":
+    "关闭（默认）时，关闭窗口会释放模型占用的内存，下次翻译时自动重新加载。",
+  "settings.background.quitNote": "退出应用请使用托盘图标菜单中的“退出”。",
+  "settings.background.disabledNote": "不驻留时，关闭主窗口即退出应用。",
+  "settings.background.saveFailed": "无法保存设置：{detail}",
 
   "runtime.checking": "正在检查…",
   "runtime.notInstalled": "未安装。安装运行时后即可开始翻译。",
@@ -804,6 +842,7 @@ const zh: Dict = {
   "engine.loadingDetail": "正在加载模型。",
   "engine.readyDetail": "正在 127.0.0.1:{port} 上监听。",
   "engine.portUnavailable": "无法获取空闲端口：{detail}",
+  "engine.readyTimeout": "引擎未能准备就绪。请再试一次。",
   "engine.startTimeout": "llama-server 未能在 {seconds} 秒内准备就绪。",
   "engine.exited": "llama-server 已退出。",
   "engine.exitedWithCode": "llama-server 已退出（退出码 {code}）。",

@@ -602,6 +602,13 @@
                 </svg>
                 <span data-i18n="settings.floating.heading">フローティングウィンドウ</span>
               </button>
+              <button type="button" class="settings-nav-item" data-section="background">
+                <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <rect x="3" y="4" width="18" height="12" rx="2" />
+                  <path d="M2 20h20" />
+                </svg>
+                <span data-i18n="settings.backgroundHeading">バックグラウンド</span>
+              </button>
               <button type="button" class="settings-nav-item" data-section="update">
                 <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
                   <path d="M12 3v12" />
@@ -734,6 +741,50 @@
                 <p class="settings-muted" data-i18n="settings.floating.adminNote">
                   管理者権限で実行されているアプリの上では、選択テキストを取得できません。
                 </p>
+              </section>
+
+              <section
+                class="settings-section settings-card"
+                data-panel="background"
+                aria-labelledby="background-heading"
+                hidden
+              >
+                <div class="settings-section-head">
+                  <h2
+                    class="settings-heading"
+                    id="background-heading"
+                    data-i18n="settings.backgroundHeading"
+                  >
+                    バックグラウンド
+                  </h2>
+                </div>
+                <label class="settings-check">
+                  <input type="checkbox" id="background-enabled" />
+                  <span data-i18n="settings.background.enable">
+                    ウィンドウを閉じてもトレイに常駐する
+                  </span>
+                </label>
+                <p class="settings-muted" data-i18n="settings.background.quitNote">
+                  アプリの終了は、トレイアイコンのメニュー「終了」から行います。
+                </p>
+                <p
+                  class="settings-muted"
+                  id="background-disabled-note"
+                  data-i18n="settings.background.disabledNote"
+                  hidden
+                >
+                  常駐しない場合、メイン画面を閉じるとアプリが終了します。
+                </p>
+                <label class="settings-check">
+                  <input type="checkbox" id="background-keep-engine" />
+                  <span data-i18n="settings.background.keepEngine">
+                    バックグラウンドでもエンジンを動かしたままにする
+                  </span>
+                </label>
+                <p class="settings-muted" data-i18n="settings.background.keepEngineNote">
+                  オフ (既定) にすると、閉じたときにモデルをメモリから解放します。次に使うときに自動で読み込み直します。
+                </p>
+                <p class="settings-error" id="background-error" role="status" hidden></p>
               </section>
 
               <section

@@ -894,6 +894,15 @@ pub fn install(
         downloaded.version
     );
 
+    // トレイ常駐中でも通知領域にアイコンを残さないよう、終了前にトレイを片付ける。
+    // トレイの隠しウィンドウはメインスレッドが持つので、必ずそこで破棄する。
+    {
+        let app_handle = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || crate::tray::destroy(&app_handle)) {
+            eprintln!("トレイを片付けられません: {error}");
+        }
+    }
+
     // 応答を返して UI のメッセージを描画させてから終了する。
     std::thread::spawn(move || {
         std::thread::sleep(INSTALLER_EXIT_DELAY);

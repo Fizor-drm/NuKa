@@ -13,6 +13,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -31,9 +32,17 @@ pub const MODEL_ENV: &str = "PLAMO_MODEL_PATH";
 pub const SERVER_ENV: &str = "PLAMO_LLAMA_SERVER";
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 pub const HEALTH_INTERVAL: Duration = Duration::from_millis(500);
+/// 翻訳が「準備完了」を待つ上限。
+///
+/// エンジン自身の起動待ち (`HEALTH_TIMEOUT`) と揃えて 1 か所で持つ。ここを短く
+/// 切ると、まだ正常にモデルを読み込んでいる最中に翻訳だけが諦めてしまう。
+/// (監査 M-2: UI 側にも別の上限を置かず、待つのはこの 1 か所だけにする)
+pub const ENGINE_READY_LIMIT: Duration = HEALTH_TIMEOUT;
 
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
+/// 準備完了を待つあいだ状態を見直す間隔。
+const ENGINE_WAIT_POLL: Duration = Duration::from_millis(200);
 /// 開発時は exe の位置から上位 6 階層までランタイムを探す。
 const DEBUG_SEARCH_DEPTH: usize = 6;
 /// リリースでは exe の隣と 1 つ上だけ。親ディレクトリに置かれた runtime を拾わない。
@@ -71,6 +80,17 @@ impl EngineStatus {
     }
 }
 
+/// 準備完了を待った結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineReady {
+    /// 準備完了。待ち受けポート。
+    Ready(u16),
+    /// 待機中に中止された (`cancel` が立った)。翻訳は始めない。
+    Cancelled,
+    /// 待っても準備できなかった (起動失敗・途中で停止・待機打ち切り)。
+    Unavailable,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     app: AppHandle,
@@ -81,6 +101,12 @@ pub struct Engine {
 struct Inner {
     /// start / kill のたびに増える。古い監視タスクはこれで自分を止める。
     generation: u64,
+    /// 進行中の `start` の世代。`None` なら起動処理は走っていない。
+    ///
+    /// 停止 (`kill_now`) と「起動処理中」を区別するために持つ。`kill_now` は
+    /// status を書き換えないため、停止直後に `starting` / `loading` が残る。
+    /// phase だけで起動要否を判断すると再起動できなくなる (監査 CR-1)。
+    active_start: Option<u64>,
     status: EngineStatus,
     port: Option<u16>,
     child: Option<Child>,
@@ -113,6 +139,7 @@ impl Engine {
             app,
             inner: Arc::new(Mutex::new(Inner {
                 generation: 0,
+                active_start: None,
                 status: EngineStatus::new(EnginePhase::Starting, None),
                 port: None,
                 child: None,
@@ -131,17 +158,116 @@ impl Engine {
         self.lock().port
     }
 
+    /// いまの起動・待機の判定に使う状態を 1 回のロックで読む。
+    fn state(&self) -> EngineState {
+        let inner = self.lock();
+        EngineState {
+            starting: inner.active_start.is_some(),
+            port: inner.port,
+            phase: inner.status.state,
+        }
+    }
+
+    /// 止まっていれば起動する。進行中の起動があれば何もしない。
+    ///
+    /// バックグラウンド化 (`kill_now`) で止めたエンジンを、ホットキーやトレイから
+    /// 使うときに呼ぶ。起動の完了は待たない (`ensure_ready` は待つ)。
+    pub async fn ensure_started(&self, settings: &Settings) {
+        // 速い経路: 稼働中・起動処理中なら何もしない。
+        // 実際の二重起動の防止は `begin_start` が 1 つのロックで行う。
+        if !self.state().needs_start() {
+            return;
+        }
+        let Some(generation) = self.begin_start(false) else {
+            return;
+        };
+        self.spawn_engine(generation, settings).await;
+    }
+
+    /// 止まっていれば起動し、準備完了まで待つ。
+    ///
+    /// `cancel` が立ったら待機を即座に打ち切る (監査 M-2)。
+    pub async fn ensure_ready(
+        &self,
+        settings: &Settings,
+        limit: Duration,
+        cancel: &AtomicBool,
+    ) -> EngineReady {
+        self.ensure_started(settings).await;
+        self.wait_until_ready(limit, cancel).await
+    }
+
+    /// 準備完了 (ready かつ待ち受けポートあり) になるまで待つ。
+    ///
+    /// - 起動失敗 (`error`) と「止められた」を知った時点で諦める
+    /// - `limit` を超えたら `Unavailable`
+    /// - `cancel` が立ったら `Cancelled` (待機中も中止できる)
+    pub async fn wait_until_ready(&self, limit: Duration, cancel: &AtomicBool) -> EngineReady {
+        let deadline = Instant::now() + limit;
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return EngineReady::Cancelled;
+            }
+            match self.state().wait_step() {
+                EngineWait::Ready(port) => return EngineReady::Ready(port),
+                EngineWait::Failed => return EngineReady::Unavailable,
+                EngineWait::Pending => {}
+            }
+            if Instant::now() >= deadline {
+                return EngineReady::Unavailable;
+            }
+            sleep(ENGINE_WAIT_POLL).await;
+        }
+    }
+
     pub fn http(&self) -> &reqwest::Client {
         &self.http
     }
 
     /// 起動して `/health` の監視を始める。結果は `engine:status` で流れる。
     ///
+    /// 既存の子プロセスは止めてから起動し直す (`restart_engine` 用)。
     /// tokio のプロセスドライバを使うので、ランタイムの中で呼ぶこと
     /// (`tauri::async_runtime::spawn` の中など)。
     pub async fn start(&self, settings: &Settings) {
-        self.kill_now();
-        let generation = self.next_generation();
+        let Some(generation) = self.begin_start(true) else {
+            return;
+        };
+        self.spawn_engine(generation, settings).await;
+    }
+
+    /// 起動の開始を宣言する。戻り値はこの起動の世代。
+    ///
+    /// `force` が false のとき、すでに稼働中か別の起動処理が走っていれば `None` を
+    /// 返して二重起動しない。`force` なら既存の子を止めてでも開始する。
+    ///
+    /// 判定は `EngineState::needs_start` に任せる (phase が `error` なら、ポートが
+    /// 残っていても子は死んでいるので置き換える: 監査 CR2-2)。
+    fn begin_start(&self, force: bool) -> Option<u64> {
+        let (child, job, generation) = {
+            let mut inner = self.lock();
+            if !force {
+                let state = EngineState {
+                    starting: inner.active_start.is_some(),
+                    port: inner.port,
+                    phase: inner.status.state,
+                };
+                if !state.needs_start() {
+                    return None;
+                }
+            }
+            let child = inner.child.take();
+            let job = inner.job.take();
+            inner.generation = inner.generation.wrapping_add(1);
+            let generation = inner.generation;
+            // 判定と同時に「起動処理中」を立てる。ここを分けると、並行した
+            // ensure_started が二重に llama-server を起こす。
+            inner.active_start = Some(generation);
+            inner.port = None;
+            (child, job, generation)
+        };
+        // 古い子の停止はロックの外で行う (待たせない)。
+        stop_child(child, job);
         self.set_status(
             generation,
             EngineStatus::new(
@@ -152,14 +278,15 @@ impl Engine {
                 )),
             ),
         );
+        Some(generation)
+    }
 
+    /// 起動本体。呼ぶ前に `begin_start` で世代を取っておくこと。
+    async fn spawn_engine(&self, generation: u64, settings: &Settings) {
         let paths = match resolve_paths(settings, &self.app) {
             Ok(paths) => paths,
             Err(detail) => {
-                self.set_status(
-                    generation,
-                    EngineStatus::new(EnginePhase::Error, Some(detail)),
-                );
+                self.fail_start(generation, detail);
                 return;
             }
         };
@@ -167,18 +294,13 @@ impl Engine {
         let port = match pick_free_port() {
             Ok(port) => port,
             Err(error) => {
-                self.set_status(
+                self.fail_start(
                     generation,
-                    EngineStatus::new(
-                        EnginePhase::Error,
-                        Some(
-                            text(
-                                "engine.portUnavailable",
-                                format!("空きポートを確保できません: {error}"),
-                            )
-                            .param("detail", error),
-                        ),
-                    ),
+                    text(
+                        "engine.portUnavailable",
+                        format!("空きポートを確保できません: {error}"),
+                    )
+                    .param("detail", error),
                 );
                 return;
             }
@@ -188,10 +310,7 @@ impl Engine {
         let child = match spawn_server(&paths, port, settings, log_path.as_deref()) {
             Ok(child) => child,
             Err(detail) => {
-                self.set_status(
-                    generation,
-                    EngineStatus::new(EnginePhase::Error, Some(detail)),
-                );
+                self.fail_start(generation, detail);
                 return;
             }
         };
@@ -212,6 +331,8 @@ impl Engine {
             inner.child = Some(child);
             inner.job = job;
             inner.port = Some(port);
+            // 起動処理はここで完了。以後の待機は supervise が見る。
+            inner.active_start = None;
         }
 
         let engine = self.clone();
@@ -220,22 +341,32 @@ impl Engine {
         });
     }
 
+    /// 起動に失敗したことを記録し、「起動処理中」を解除する。
+    /// 解除しないと、次に使うときに再起動できなくなる。
+    fn fail_start(&self, generation: u64, detail: LocalizedText) {
+        self.set_status(
+            generation,
+            EngineStatus::new(EnginePhase::Error, Some(detail)),
+        );
+        let mut inner = self.lock();
+        if inner.active_start == Some(generation) {
+            inner.active_start = None;
+        }
+    }
+
     /// 子プロセスを止める。状態はそのまま (次の start が starting にする)。
+    ///
+    /// 進行中の起動処理があっても「止められた」として解除する。ここを消さないと、
+    /// `starting` / `loading` のまま残って再起動できなくなる (監査 CR-1)。
     pub fn kill_now(&self) {
         let (child, job) = {
             let mut inner = self.lock();
             inner.generation = inner.generation.wrapping_add(1);
+            inner.active_start = None;
             inner.port = None;
             (inner.child.take(), inner.job.take())
         };
-        if let Some(mut child) = child {
-            if let Err(error) = child.start_kill() {
-                eprintln!("llama-server を止められません: {error}");
-            }
-            let _ = child.try_wait();
-        }
-        // Job Object を閉じると、割り当て済みの子は OS が終了させる (二重の保険)。
-        drop(job);
+        stop_child(child, job);
     }
 
     async fn supervise(self, generation: u64, port: u16) {
@@ -356,12 +487,6 @@ impl Engine {
         }
     }
 
-    fn next_generation(&self) -> u64 {
-        let mut inner = self.lock();
-        inner.generation = inner.generation.wrapping_add(1);
-        inner.generation
-    }
-
     fn is_current(&self, generation: u64) -> bool {
         self.lock().generation == generation
     }
@@ -391,6 +516,76 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// 準備完了を待つあいだの判定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EngineWait {
+    /// 準備完了。待ち受けポートが返る。
+    Ready(u16),
+    /// もう来ない (起動失敗・停止された)。待ち続けない。
+    Failed,
+    /// まだ待つ (起動処理中・読み込み中)。
+    Pending,
+}
+
+/// 起動・待機の判定に使う状態。
+///
+/// `Engine` から切り離した純粋な値にして、停止直後の `starting` / `loading` から
+/// 復帰できることをテストできるようにしている (監査 CR-1)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EngineState {
+    /// 進行中の `start` があるか (`kill_now` で false に戻る)。
+    pub starting: bool,
+    /// llama-server の待ち受けポート。
+    pub port: Option<u16>,
+    /// 直近の phase。
+    pub phase: EnginePhase,
+}
+
+impl EngineState {
+    /// 起動が必要か。
+    ///
+    /// phase ではなく「進行中の起動」とポートで判定する。`kill_now` は phase を
+    /// 書き換えないため、停止直後に `starting` / `loading` が残っていても
+    /// 起動し直せるようにする。
+    ///
+    /// `error` は特別扱いする。watchdog がクラッシュを検知したときは status を
+    /// `error` にするだけでポートを残すため、ポートの有無だけでは「もう動いていない」
+    /// ことを表せない (監査 CR2-2)。`starting` が立っている間は二重起動しない。
+    pub(crate) fn needs_start(self) -> bool {
+        !self.starting && (self.port.is_none() || self.phase == EnginePhase::Error)
+    }
+
+    /// 待機ループの次の一手。
+    pub(crate) fn wait_step(self) -> EngineWait {
+        if self.phase == EnginePhase::Ready {
+            if let Some(port) = self.port {
+                return EngineWait::Ready(port);
+            }
+        }
+        if self.phase == EnginePhase::Error {
+            return EngineWait::Failed;
+        }
+        // 起動処理も走っておらずポートも無い = 止められた。待っても来ないので
+        // 打ち切る (待機上限まで無駄に待たない)。
+        if !self.starting && self.port.is_none() {
+            return EngineWait::Failed;
+        }
+        EngineWait::Pending
+    }
+}
+
+/// 子プロセスを止めて Job Object を閉じる。二重に呼んでも安全。
+fn stop_child(child: Option<Child>, job: Option<JobObject>) {
+    if let Some(mut child) = child {
+        if let Err(error) = child.start_kill() {
+            eprintln!("llama-server を止められません: {error}");
+        }
+        let _ = child.try_wait();
+    }
+    // Job Object を閉じると、割り当て済みの子は OS が終了させる (二重の保険)。
+    drop(job);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -898,6 +1093,125 @@ mod tests {
         );
         assert!(!combined.fallback.contains("/models/a.gguf"));
     }
+    /// テスト用の状態。
+    fn engine_state(starting: bool, port: Option<u16>, phase: EnginePhase) -> EngineState {
+        EngineState {
+            starting,
+            port,
+            phase,
+        }
+    }
+
+    #[test]
+    fn engine_is_restarted_only_when_stopped() {
+        // 止まっている (起動処理中でもなくポートも無い) なら起動し直す。
+        for phase in [
+            EnginePhase::Starting,
+            EnginePhase::Loading,
+            EnginePhase::Ready,
+            EnginePhase::Error,
+        ] {
+            assert!(
+                engine_state(false, None, phase).needs_start(),
+                "停止中の {phase:?} は起動し直す"
+            );
+        }
+
+        // 起動処理が走っている間は二重に起こさない (ポートがまだ取れていなくても)。
+        for phase in [EnginePhase::Starting, EnginePhase::Loading] {
+            assert!(!engine_state(true, None, phase).needs_start());
+        }
+        // 稼働中も何もしない。
+        for phase in [
+            EnginePhase::Starting,
+            EnginePhase::Loading,
+            EnginePhase::Ready,
+        ] {
+            assert!(
+                !engine_state(false, Some(1234), phase).needs_start(),
+                "稼働中の {phase:?} では起動しない"
+            );
+        }
+        assert!(!engine_state(true, Some(1234), EnginePhase::Loading).needs_start());
+    }
+
+    #[test]
+    fn crashed_engine_with_a_stale_port_starts_again() {
+        // 監査 CR2-2: watchdog はクラッシュを検知すると status を `error` にするが
+        // ポートは残す。ポートの有無だけで判断すると、クラッシュ後にホットキーや
+        // トレイから自動再起動できなくなる。
+        let crashed = engine_state(false, Some(1234), EnginePhase::Error);
+        assert!(crashed.needs_start());
+        // 待機側も `error` なら待ち続けない。
+        assert_eq!(crashed.wait_step(), EngineWait::Failed);
+
+        // kill でポートが消えている場合も当然再起動する。
+        assert!(engine_state(false, None, EnginePhase::Error).needs_start());
+
+        // 起動処理が走っている間は、`error` が残っていても二重起動しない。
+        assert!(!engine_state(true, Some(1234), EnginePhase::Error).needs_start());
+        assert!(!engine_state(true, None, EnginePhase::Error).needs_start());
+    }
+
+    #[test]
+    fn killed_engine_in_a_stale_phase_starts_again() {
+        // 監査 CR-1 の回帰: `kill_now` は phase を書き換えないため、モデル読み込み中に
+        // バックグラウンド化すると `loading` が残る。ここで再起動できないと、
+        // ホットキー翻訳が待機上限まで待って失敗し、アプリ再起動まで翻訳できなくなる。
+        let stale_loading = engine_state(false, None, EnginePhase::Loading);
+        assert!(stale_loading.needs_start());
+        let stale_starting = engine_state(false, None, EnginePhase::Starting);
+        assert!(stale_starting.needs_start());
+
+        // 待機側も「止められた」と分かった時点で打ち切る (上限まで待たない)。
+        assert_eq!(stale_loading.wait_step(), EngineWait::Failed);
+        assert_eq!(stale_starting.wait_step(), EngineWait::Failed);
+    }
+
+    #[test]
+    fn waiting_stops_on_ready_or_error_or_stop() {
+        assert_eq!(
+            engine_state(true, Some(7777), EnginePhase::Ready).wait_step(),
+            EngineWait::Ready(7777)
+        );
+        assert_eq!(
+            engine_state(false, None, EnginePhase::Error).wait_step(),
+            EngineWait::Failed
+        );
+        assert_eq!(
+            engine_state(true, Some(7777), EnginePhase::Error).wait_step(),
+            EngineWait::Failed
+        );
+        // 起動処理中・モデル読み込み中は待つ。
+        for (starting, port, phase) in [
+            (true, None, EnginePhase::Starting),
+            (true, Some(7777), EnginePhase::Starting),
+            (true, Some(7777), EnginePhase::Loading),
+            // 起動処理が続いていれば、まだポートが無くても待つ。
+            (true, None, EnginePhase::Loading),
+        ] {
+            assert_eq!(
+                engine_state(starting, port, phase).wait_step(),
+                EngineWait::Pending,
+                "{phase:?} / {port:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_without_a_port_waits_then_times_out() {
+        // ready なのにポートが無い = 停止直後だが、起動処理の途中でもありうる。
+        // 起動処理が無ければ「止められた」として打ち切る。
+        assert_eq!(
+            engine_state(false, None, EnginePhase::Ready).wait_step(),
+            EngineWait::Failed
+        );
+        assert_eq!(
+            engine_state(true, None, EnginePhase::Ready).wait_step(),
+            EngineWait::Pending
+        );
+    }
+
     #[test]
     fn status_matches_the_event_contract() {
         let ready = serde_json::to_value(EngineStatus::new(EnginePhase::Ready, None)).unwrap();

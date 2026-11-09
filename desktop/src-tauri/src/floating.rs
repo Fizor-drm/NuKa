@@ -689,6 +689,29 @@ pub fn on_hotkey(app: &AppHandle, shortcut: &Shortcut) {
         return;
     }
 
+    start_capture(app, hotkey_vk);
+}
+
+/// トレイメニュー「翻訳ウィンドウを表示」から、選択テキストの取得を始める。
+///
+/// ホットキーと同じ capture フローを呼ぶが、表示中でもトグルで閉じない
+/// (トレイからは常に「取り直して表示」)。連打はホットキーと同じ間隔で無視する。
+pub fn trigger_capture(app: &AppHandle, hotkey_vk: Option<u16>) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if !state.floating.should_handle_press(Instant::now()) {
+        debug_log!("tray trigger ignored (debounce)");
+        return;
+    }
+    start_capture(app, hotkey_vk);
+}
+
+/// 選択テキストの取得を 1 回だけ始める (多重実行の防止込み)。
+fn start_capture(app: &AppHandle, hotkey_vk: Option<u16>) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
     if !state.floating.begin_capture() {
         debug_log!("capture ignored (busy)");
         return;
@@ -810,6 +833,38 @@ fn hide_with_reason(app: &AppHandle, reason: &str) {
             |elapsed| format!("{:.2}s", elapsed.as_secs_f64())
         )
     );
+    // 閉じたあとにエンジンだけが残るのを防ぐ (バックグラウンド時のみ)。
+    reclaim_idle_engine(app);
+}
+
+/// バックグラウンドで、訳すものが無くなったエンジンを止める。
+///
+/// 「ウィンドウを閉じたら VRAM を解放する」というバックグラウンド実行の契約を、
+/// ホットキー経由の起動にも適用する。次のときは止めない。
+///
+/// - メイン画面が見えている (通常の利用中)
+/// - `background.keep_engine` が ON (エンジン維持が設定されている)
+/// - メイン由来など、フローティング以外の翻訳がまだ動いている
+fn reclaim_idle_engine(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let settings = state.settings.get();
+    if !settings.background.enabled || settings.background.keep_engine {
+        return;
+    }
+    let main_visible = app
+        .get_webview_window(MAIN_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+    if main_visible {
+        return;
+    }
+    if state.jobs.has_job_from_other_origin(FLOATING_LABEL) {
+        return;
+    }
+    state.engine.kill_now();
+    debug_log!("engine stopped (floating hidden: 訳すものが無いため解放)");
 }
 
 /// `handle_window_event` の判定をユニットテストできるようにしたイベント種別。
@@ -828,19 +883,66 @@ enum WindowAction {
     PreventFloatingClose,
     /// floating のフォーカス変化を処理する。
     HandleFloatingFocus(bool),
+    /// メインの close を止めて隠す (トレイ常駐)。アプリは終了しない。
+    HideMainOnClose,
     /// メイン破棄時に隠れた floating を destroy する。
     DestroyFloating,
     Ignore,
 }
 
-fn decide_window_action(label: &str, kind: WindowEventKind) -> WindowAction {
+fn decide_window_action(
+    label: &str,
+    kind: WindowEventKind,
+    background_enabled: bool,
+) -> WindowAction {
     match (label, kind) {
         (FLOATING_LABEL, WindowEventKind::CloseRequested) => WindowAction::PreventFloatingClose,
         (FLOATING_LABEL, WindowEventKind::Focused(focused)) => {
             WindowAction::HandleFloatingFocus(focused)
         }
+        // トレイ常駐が有効なときは、メインの × をアプリ終了にせずバックグラウンド化する。
+        // 終了はトレイメニューの「終了」だけ (決定済み)。
+        (MAIN_LABEL, WindowEventKind::CloseRequested) if background_enabled => {
+            WindowAction::HideMainOnClose
+        }
         (MAIN_LABEL, WindowEventKind::Destroyed) => WindowAction::DestroyFloating,
         _ => WindowAction::Ignore,
+    }
+}
+
+/// 設定の `background.enabled`。まだ設定を読めない起動直後は既定 (常駐する)。
+pub(crate) fn background_enabled(app: &AppHandle) -> bool {
+    app.try_state::<AppState>()
+        .map(|state| state.settings.get().background.enabled)
+        .unwrap_or_else(|| crate::settings::BackgroundSettings::default().enabled)
+}
+
+/// メイン画面を閉じたときのバックグラウンド化。
+///
+/// - メインは破棄せず隠す (プロセスとトレイは残る)
+/// - フローティングが表示中なら一緒に隠す (決定済み)
+/// - メイン由来の翻訳を止める
+/// - `background.keep_engine` が false (既定) なら llama-server を止める。
+///   ここが「超軽量」の本体で、モデルの VRAM / メモリを解放する。
+fn hide_main_to_tray(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_LABEL) {
+        if let Err(error) = window.hide() {
+            eprintln!("メインウィンドウを隠せません: {error}");
+        }
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if state.floating.is_shown() {
+        hide_with_reason(app, "main-hidden");
+    }
+    // 隠した画面の翻訳を裏で続けない。
+    state.jobs.cancel_current_for_origin(MAIN_LABEL);
+    if !state.settings.get().background.keep_engine {
+        state.engine.kill_now();
+        debug_log!("engine stopped (background: VRAM を解放)");
+    } else {
+        debug_log!("engine kept (background.keep_engine)");
     }
 }
 
@@ -853,7 +955,8 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
         _ => WindowEventKind::Other,
     };
 
-    match decide_window_action(window.label(), kind) {
+    let background = background_enabled(window.app_handle());
+    match decide_window_action(window.label(), kind, background) {
         WindowAction::PreventFloatingClose => {
             // Alt+F4 などで floating を破棄されると、以降 hotkey が無反応になる
             // (get_webview_window が None になる)。close を止めて hide する。
@@ -865,11 +968,20 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
         WindowAction::HandleFloatingFocus(focused) => {
             handle_floating_focus(window.app_handle(), focused);
         }
+        WindowAction::HideMainOnClose => {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+            }
+            hide_main_to_tray(window.app_handle());
+        }
         WindowAction::DestroyFloating => {
             // メインが破棄されたら、隠れた floating を破棄してアプリを終了できる
             // ようにする。prevent_close があるため close() では止められるので
             // destroy() を使う。destroy() は proxy 経由でイベントループへ送られる
             // (main スレッドで直接実行されない) ため、ここから呼んでも安全。
+            //
+            // トレイ常駐が有効なときはメインを破棄しないため、通常はここへ来ない。
+            // (`background.enabled = false` のときだけ通る従来の経路)
             if let Some(floating) = window.app_handle().get_webview_window(FLOATING_LABEL) {
                 if let Err(error) = floating.destroy() {
                     eprintln!("フローティングウィンドウを破棄できません: {error}");
@@ -1055,6 +1167,14 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option
         if !write_clipboard_text(text) {
             eprintln!("クリップボードの退避を戻せませんでした");
         }
+    }
+
+    // 訳すものがあったときだけ、止まっているエンジンを起こす。起動中は
+    // engine:status (starting / loading) が全ウィンドウへ流れ、floating は
+    // 「エンジンを起動しています」を出してから翻訳に入る。
+    // 選択なし (noSelection) のときは起動しない (無駄に VRAM を使わない)。
+    if selected.is_some() {
+        crate::ensure_engine_started(app);
     }
 
     let Some(state) = app.try_state::<AppState>() else {
@@ -1770,29 +1890,59 @@ mod tests {
 
     #[test]
     fn window_actions_cover_close_focus_and_main_destroyed() {
-        use WindowAction::{DestroyFloating, HandleFloatingFocus, Ignore, PreventFloatingClose};
+        use WindowAction::{
+            DestroyFloating, HandleFloatingFocus, HideMainOnClose, Ignore, PreventFloatingClose,
+        };
         use WindowEventKind::{CloseRequested, Destroyed, Focused, Other};
 
-        assert_eq!(
-            decide_window_action(FLOATING_LABEL, CloseRequested),
-            PreventFloatingClose
-        );
-        assert_eq!(
-            decide_window_action(FLOATING_LABEL, Focused(true)),
-            HandleFloatingFocus(true)
-        );
-        assert_eq!(
-            decide_window_action(FLOATING_LABEL, Focused(false)),
-            HandleFloatingFocus(false)
-        );
-        assert_eq!(decide_window_action(FLOATING_LABEL, Destroyed), Ignore);
-        assert_eq!(decide_window_action(FLOATING_LABEL, Other), Ignore);
+        for background in [true, false] {
+            assert_eq!(
+                decide_window_action(FLOATING_LABEL, CloseRequested, background),
+                PreventFloatingClose
+            );
+            assert_eq!(
+                decide_window_action(FLOATING_LABEL, Focused(true), background),
+                HandleFloatingFocus(true)
+            );
+            assert_eq!(
+                decide_window_action(FLOATING_LABEL, Focused(false), background),
+                HandleFloatingFocus(false)
+            );
+            assert_eq!(
+                decide_window_action(FLOATING_LABEL, Destroyed, background),
+                Ignore
+            );
+            assert_eq!(
+                decide_window_action(FLOATING_LABEL, Other, background),
+                Ignore
+            );
 
-        assert_eq!(decide_window_action(MAIN_LABEL, Destroyed), DestroyFloating);
-        assert_eq!(decide_window_action(MAIN_LABEL, CloseRequested), Ignore);
-        assert_eq!(decide_window_action(MAIN_LABEL, Focused(false)), Ignore);
-        assert_eq!(decide_window_action("other", Destroyed), Ignore);
-        assert_eq!(decide_window_action("other", CloseRequested), Ignore);
+            // メインを破棄されたときの後始末は従来どおり。
+            assert_eq!(
+                decide_window_action(MAIN_LABEL, Destroyed, background),
+                DestroyFloating
+            );
+            assert_eq!(
+                decide_window_action(MAIN_LABEL, Focused(false), background),
+                Ignore
+            );
+            assert_eq!(decide_window_action("other", Destroyed, background), Ignore);
+            assert_eq!(
+                decide_window_action("other", CloseRequested, background),
+                Ignore
+            );
+        }
+
+        // トレイ常駐が有効なら、メインの × は「隠す」。
+        assert_eq!(
+            decide_window_action(MAIN_LABEL, CloseRequested, true),
+            HideMainOnClose
+        );
+        // 常駐しない設定では、従来どおり閉じて終了する (Destroyed で後始末)。
+        assert_eq!(
+            decide_window_action(MAIN_LABEL, CloseRequested, false),
+            Ignore
+        );
     }
 
     #[test]

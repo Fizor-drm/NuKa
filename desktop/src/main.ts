@@ -24,6 +24,7 @@ import {
   onDownloadError,
   onDownloadProgress,
   onEngineStatus,
+  onOpenSettings,
   onTranslationChunk,
   onTranslationDone,
   onTranslationError,
@@ -97,7 +98,7 @@ type JobEvent =
   | { kind: "progress"; jobId: number; done: number; total: number }
   | { kind: "chunk"; jobId: number; delta: string }
   | { kind: "done"; jobId: number; text: string; tokens?: number }
-  | { kind: "error"; jobId: number; message: string };
+  | { kind: "error"; jobId: number; message: string; messageKey?: string };
 
 interface InvokeWaiter {
   readonly seq: number;
@@ -132,6 +133,11 @@ interface AppState {
   floatingRecording: boolean;
   floatingRecordingWasEnabled: boolean;
   floatingError: string | null;
+  /** メインを閉じてもトレイに常駐する (background.enabled)。 */
+  backgroundEnabled: boolean;
+  /** バックグラウンドでもエンジンを止めない (background.keep_engine)。 */
+  backgroundKeepEngine: boolean;
+  backgroundError: string | null;
 }
 
 const state: AppState = {
@@ -162,6 +168,9 @@ const state: AppState = {
   floatingRecording: false,
   floatingRecordingWasEnabled: false,
   floatingError: null,
+  backgroundEnabled: true,
+  backgroundKeepEngine: false,
+  backgroundError: null,
 };
 
 function byId<T extends HTMLElement>(id: string): T {
@@ -243,12 +252,18 @@ const floatingHotkeyEl = byId<HTMLButtonElement>("floating-hotkey");
 const floatingUsageEl = byId<HTMLParagraphElement>("floating-hotkey-usage");
 const floatingErrorEl = byId<HTMLParagraphElement>("floating-hotkey-error");
 
-type SettingsSection = "runtime" | "language" | "floating" | "update" | "models";
+const backgroundEnabledEl = byId<HTMLInputElement>("background-enabled");
+const backgroundKeepEngineEl = byId<HTMLInputElement>("background-keep-engine");
+const backgroundDisabledNoteEl = byId<HTMLParagraphElement>("background-disabled-note");
+const backgroundErrorEl = byId<HTMLParagraphElement>("background-error");
+
+type SettingsSection = "runtime" | "language" | "floating" | "background" | "update" | "models";
 
 const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   "runtime",
   "language",
   "floating",
+  "background",
   "update",
   "models",
 ];
@@ -617,7 +632,10 @@ function applyJobEvent(event: JobEvent): void {
     }
     case "error": {
       state.translating = false;
-      state.translationError = event.message;
+      state.translationError =
+        event.messageKey !== undefined
+          ? localize({ key: event.messageKey, fallback: event.message })
+          : event.message;
       state.progress = null;
       state.jobId = null;
       renderAll();
@@ -983,6 +1001,8 @@ async function loadSettings(): Promise<void> {
     state.modelsDirSetting = settings.models_dir;
     state.floatingEnabled = settings.floating_window.enabled;
     state.floatingHotkey = settings.floating_window.hotkey;
+    state.backgroundEnabled = settings.background.enabled;
+    state.backgroundKeepEngine = settings.background.keep_engine;
   } catch {
     // 設定が読めなくても既定値で動かす
   }
@@ -1166,6 +1186,67 @@ async function saveRecordedHotkey(combo: string): Promise<void> {
     await applyFloatingSettings({ enabled: true });
   }
   renderFloatingSettings();
+}
+
+// ---------------------------------------------------------------------------
+// バックグラウンド (トレイ常駐)
+// ---------------------------------------------------------------------------
+
+function renderBackgroundSettings(): void {
+  backgroundEnabledEl.checked = state.backgroundEnabled;
+  backgroundKeepEngineEl.checked = state.backgroundKeepEngine;
+  // 常駐しないなら「エンジンを維持する」は意味を持たない。
+  backgroundKeepEngineEl.disabled = !state.backgroundEnabled;
+  backgroundDisabledNoteEl.hidden = state.backgroundEnabled;
+  backgroundErrorEl.hidden = state.backgroundError === null;
+  backgroundErrorEl.textContent = state.backgroundError ?? "";
+}
+
+/** バックグラウンド設定を保存する。失敗したら保存済みの値へ戻す。 */
+async function saveBackgroundSettings(): Promise<void> {
+  state.backgroundError = null;
+  try {
+    const settings = await ipc.setSettings({
+      background: {
+        enabled: state.backgroundEnabled,
+        keep_engine: state.backgroundKeepEngine,
+      },
+    });
+    state.backgroundEnabled = settings.background.enabled;
+    state.backgroundKeepEngine = settings.background.keep_engine;
+  } catch (error) {
+    state.backgroundError = t("settings.background.saveFailed", {
+      detail: describeError(error),
+    });
+    try {
+      const settings = await ipc.getSettings();
+      state.backgroundEnabled = settings.background.enabled;
+      state.backgroundKeepEngine = settings.background.keep_engine;
+    } catch {
+      // 取得できなければ現在の表示を保つ。
+    }
+  }
+  renderBackgroundSettings();
+}
+
+async function handleBackgroundEnabledChange(): Promise<void> {
+  const desired = backgroundEnabledEl.checked;
+  state.backgroundEnabled = desired;
+  if (!desired) {
+    // 常駐を切ったら「エンジン維持」は効かないので見た目も合わせる。
+    backgroundKeepEngineEl.checked = state.backgroundKeepEngine;
+  }
+  backgroundEnabledEl.disabled = true;
+  renderBackgroundSettings();
+  await saveBackgroundSettings();
+  backgroundEnabledEl.disabled = false;
+}
+
+async function handleBackgroundKeepEngineChange(): Promise<void> {
+  state.backgroundKeepEngine = backgroundKeepEngineEl.checked;
+  backgroundKeepEngineEl.disabled = true;
+  await saveBackgroundSettings();
+  backgroundKeepEngineEl.disabled = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1492,7 @@ function renderSettings(): void {
     input.checked = input.value === state.uiLanguage;
   }
   renderFloatingSettings();
+  renderBackgroundSettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,7 +1891,12 @@ function bindTranslationEvents(): void {
     });
   });
   onTranslationError((payload) => {
-    handleJobEvent({ kind: "error", jobId: payload.jobId, message: payload.message });
+    handleJobEvent({
+      kind: "error",
+      jobId: payload.jobId,
+      message: payload.message,
+      messageKey: payload.messageKey,
+    });
   });
   onTranslationSuperseded((payload) => {
     handleTranslationSuperseded(payload.jobId);
@@ -1954,6 +2041,19 @@ function bindUi(): void {
 
   floatingEnabledEl.addEventListener("change", () => {
     void handleFloatingToggle();
+  });
+
+  backgroundEnabledEl.addEventListener("change", () => {
+    void handleBackgroundEnabledChange();
+  });
+
+  backgroundKeepEngineEl.addEventListener("change", () => {
+    void handleBackgroundKeepEngineChange();
+  });
+
+  // トレイメニューの「設定」で設定ビューを開く。
+  onOpenSettings(() => {
+    setView("settings");
   });
 
   floatingHotkeyEl.addEventListener("click", () => {

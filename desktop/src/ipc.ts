@@ -39,6 +39,7 @@ export interface Settings {
   installed_models: InstalledModel[];
   active_model: string | null;
   floating_window: FloatingWindowSettings;
+  background: BackgroundSettings;
 }
 
 /** フローティング翻訳ウィンドウ (Phase 1) の設定。 */
@@ -52,6 +53,19 @@ export interface FloatingSettingsPatch {
   hotkey?: string;
 }
 
+/** バックグラウンド実行 (トレイ常駐) の設定。 */
+export interface BackgroundSettings {
+  /** メイン画面を閉じてもトレイに常駐する (既定 true)。 */
+  enabled: boolean;
+  /** バックグラウンドでもエンジンを止めない (既定 false = 止めて VRAM を解放)。 */
+  keep_engine: boolean;
+}
+
+export interface BackgroundSettingsPatch {
+  enabled?: boolean;
+  keep_engine?: boolean;
+}
+
 export interface SettingsPatch {
   gpu_layers?: number;
   context_tokens?: number;
@@ -59,6 +73,7 @@ export interface SettingsPatch {
   auto_translate?: boolean;
   auto_update_check?: boolean;
   ui_language?: "ja" | "en" | "zh";
+  background?: BackgroundSettingsPatch;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +208,8 @@ export interface DonePayload {
 export interface ErrorPayload {
   jobId: number;
   message: string;
+  /** 辞書の key。あれば `message` を fallback として表示言語に合わせて訳す。 */
+  messageKey?: string;
 }
 
 /** 新しい翻訳に jobId を差し替えられた (この job の done/error は来ない)。 */
@@ -271,6 +288,16 @@ export function onTranslationSuperseded(handler: (payload: SupersededPayload) =>
 
 export function onFloatingCapture(handler: (payload: FloatingCapturePayload) => void): void {
   subscribe("floating:capture", handler);
+}
+
+/**
+ * トレイメニューの「設定」で、メイン画面を設定ビューへ切り替える。
+ * ペイロードは無い (null)。
+ */
+export function onOpenSettings(handler: () => void): void {
+  subscribe<null>("ui:open-settings", () => {
+    handler();
+  });
 }
 
 export function onDownloadProgress(handler: (payload: DownloadProgressPayload) => void): void {

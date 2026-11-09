@@ -13,7 +13,10 @@
 //!   translation:progress { jobId, done, total }
 //!   translation:chunk { jobId, delta }
 //!   translation:done { jobId, text, tokens? }
-//!   translation:error { jobId, message }
+//!   translation:error { jobId, message, messageKey? }
+//!
+//! `messageKey` は辞書 (`src/i18n.ts`) の key。付いているときは `message` を
+//! フォールバックとして表示言語に合わせて訳す (`localize`)。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,7 +28,9 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::time::timeout;
 
 use crate::detect::{self, DetectedLanguage};
-use crate::engine::{Engine, EnginePhase, EngineStatus, SERVER_ALIAS};
+use crate::engine::{
+    Engine, EnginePhase, EngineReady, EngineStatus, ENGINE_READY_LIMIT, SERVER_ALIAS,
+};
 use crate::floating;
 use crate::message::LocalizedText;
 use crate::prompt::{
@@ -87,6 +92,9 @@ struct DoneEvent {
 struct ErrorEvent {
     job_id: u32,
     message: String,
+    /// 辞書 (`src/i18n.ts`) の key。あれば UI 側が表示言語に合わせて訳す。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_key: Option<String>,
 }
 
 /// 新しい翻訳に jobId を差し替えられたことを知らせる。
@@ -176,6 +184,16 @@ impl JobManager {
         }
     }
 
+    /// `origin` 以外のジョブが進行中か。
+    ///
+    /// フローティングを閉じたあとに、ほかの画面 (メイン) の翻訳を
+    /// 巻き込まずにエンジンを解放してよいかの判定に使う。
+    pub fn has_job_from_other_origin(&self, origin: &str) -> bool {
+        self.lock()
+            .as_ref()
+            .is_some_and(|control| control.origin != origin)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<JobControl>> {
         self.inner
             .current
@@ -208,8 +226,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub fn set_settings(state: State<'_, AppState>, patch: SettingsPatch) -> Result<Settings, String> {
-    state.settings.apply(patch)
+pub fn set_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    patch: SettingsPatch,
+) -> Result<Settings, String> {
+    let language_changed = patch.ui_language.is_some();
+    let saved = state.settings.apply(patch)?;
+    // トレイメニューは WebView の辞書を通らないので、表示言語が変わったら
+    // Rust 側で作り直す (失敗しても設定の保存は成功している)。
+    if language_changed {
+        crate::tray::refresh_labels(&app);
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -239,8 +268,9 @@ pub fn translate(
     }
     let engine = state.engine.clone();
     let jobs = state.jobs.clone();
+    let settings = state.settings.get();
     tauri::async_runtime::spawn(async move {
-        run_translation(app, engine, jobs, job_id, cancel, req).await;
+        run_translation(app, engine, jobs, settings, job_id, cancel, req).await;
     });
     job_id
 }
@@ -456,15 +486,61 @@ struct JobSuccess {
     tokens: Option<u32>,
 }
 
+/// ジョブの失敗。`key` があれば UI が表示言語に合わせて訳す (無ければ日本語のまま)。
+#[derive(Debug, PartialEq, Eq)]
+struct JobError {
+    message: String,
+    key: Option<&'static str>,
+}
+
+impl JobError {
+    fn raw(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            key: None,
+        }
+    }
+
+    /// 辞書にもある文言。`message` は日本語フォールバック。
+    fn keyed(key: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            key: Some(key),
+        }
+    }
+}
+
+impl From<String> for JobError {
+    fn from(message: String) -> Self {
+        Self::raw(message)
+    }
+}
+
 async fn run_translation(
     app: AppHandle,
     engine: Engine,
     jobs: JobManager,
+    settings: Settings,
     job_id: u32,
     cancel: Arc<AtomicBool>,
     req: TranslateRequest,
 ) {
-    let outcome = translate_job(&app, &engine, job_id, &cancel, &req).await;
+    // バックグラウンド化で止めていた / まだ起動中のエンジンをここで待つ。
+    // 待っている間も中止できる (監査 M-2)。
+    let ready = engine
+        .ensure_ready(&settings, ENGINE_READY_LIMIT, &cancel)
+        .await;
+    let outcome = match ready {
+        // 待機中に閉じられた。翻訳は始めない (done も error も流さない)。
+        EngineReady::Cancelled => {
+            jobs.finish(job_id);
+            return;
+        }
+        EngineReady::Ready(port) => {
+            translate_job(&app, &engine, Some(port), job_id, &cancel, &req).await
+        }
+        EngineReady::Unavailable => translate_job(&app, &engine, None, job_id, &cancel, &req).await,
+    };
     jobs.finish(job_id);
 
     match outcome {
@@ -480,9 +556,13 @@ async fn run_translation(
         }
         // 中止された。done も error も流さない (呼んだ側が知っている)。
         Ok(None) => {}
-        Err(message) => {
+        Err(error) => {
             if !is_cancelled(&cancel) {
-                let event = ErrorEvent { job_id, message };
+                let event = ErrorEvent {
+                    job_id,
+                    message: error.message,
+                    message_key: error.key.map(str::to_string),
+                };
                 if let Err(error) = app.emit("translation:error", event) {
                     eprintln!("translation:error を送れません: {error}");
                 }
@@ -494,14 +574,15 @@ async fn run_translation(
 async fn translate_job(
     app: &AppHandle,
     engine: &Engine,
+    port: Option<u16>,
     job_id: u32,
     cancel: &AtomicBool,
     req: &TranslateRequest,
-) -> Result<Option<JobSuccess>, String> {
+) -> Result<Option<JobSuccess>, JobError> {
     // 原文は常に 400 文字前後へ割ってから直列に訳す。
     let chunks = prompt::split_text(&req.text, CHUNK_LIMIT);
     let Some(first) = chunks.first() else {
-        return Err(PromptError::EmptyText.to_string());
+        return Err(JobError::raw(PromptError::EmptyText.to_string()));
     };
     let source_lang = req.source_lang.as_deref();
     let form = req.form.as_deref();
@@ -518,20 +599,25 @@ async fn translate_job(
     })
     .map_err(|error| error.to_string())?;
 
-    let Some(port) = engine.port() else {
+    let Some(port) = port else {
         let status = engine.status();
         return Err(match status.state {
-            EnginePhase::Error => format!(
+            EnginePhase::Error => JobError::raw(format!(
                 "エンジンを起動できていません。{}",
                 status
                     .detail
                     .map(|detail| detail.fallback)
                     .unwrap_or_default()
-            ),
+            )),
             EnginePhase::Ready => {
-                "エンジンの待ち受けポートがありません。再起動してください。".to_string()
+                JobError::raw("エンジンの待ち受けポートがありません。再起動してください。")
             }
-            _ => "エンジンを準備しています。少し待ってからもう一度お試しください。".to_string(),
+            // 待っても準備できなかった / 途中で止められた。待機上限は
+            // ENGINE_READY_LIMIT (engine.rs) の 1 か所で決めている。
+            _ => JobError::keyed(
+                "engine.readyTimeout",
+                "エンジンの準備ができませんでした。もう一度お試しください。",
+            ),
         });
     };
 
@@ -598,7 +684,7 @@ async fn translate_job(
 
         let cleaned = prompt::clean_translation(&raw);
         if cleaned.is_empty() {
-            return Err("モデルが訳文を返しませんでした。".to_string());
+            return Err(JobError::raw("モデルが訳文を返しませんでした。"));
         }
 
         parts.push(cleaned.clone());

@@ -82,6 +82,31 @@ impl Default for FloatingWindowSettings {
     }
 }
 
+/// バックグラウンド実行 (トレイ常駐) の設定。
+///
+/// `#[serde(default)]` を付けてあるので、古い settings.json にこの項目が無くても
+/// 既定 (常駐する / エンジンは止める) で読み込める。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundSettings {
+    /// メイン画面を閉じてもプロセスを残し、トレイに常駐するか。
+    pub enabled: bool,
+    /// バックグラウンド化しても llama-server を止めないか。
+    ///
+    /// 既定は false (止める)。止めるとモデルの VRAM / メモリが解放され、
+    /// 次に翻訳するときに自動で読み込み直す。
+    pub keep_engine: bool,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep_engine: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -112,6 +137,8 @@ pub struct Settings {
     pub active_model: Option<String>,
     /// フローティング翻訳ウィンドウ。
     pub floating_window: FloatingWindowSettings,
+    /// バックグラウンド実行 (トレイ常駐)。
+    pub background: BackgroundSettings,
 }
 
 impl Default for Settings {
@@ -130,7 +157,21 @@ impl Default for Settings {
             installed_models: Vec::new(),
             active_model: None,
             floating_window: FloatingWindowSettings::default(),
+            background: BackgroundSettings::default(),
         }
+    }
+}
+
+/// `set_settings` が受けるバックグラウンド設定の差分。
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct BackgroundSettingsPatch {
+    pub enabled: Option<bool>,
+    pub keep_engine: Option<bool>,
+}
+
+impl BackgroundSettingsPatch {
+    fn is_empty(self) -> bool {
+        self.enabled.is_none() && self.keep_engine.is_none()
     }
 }
 
@@ -146,6 +187,7 @@ pub struct SettingsPatch {
     pub auto_translate: Option<bool>,
     pub auto_update_check: Option<bool>,
     pub ui_language: Option<String>,
+    pub background: Option<BackgroundSettingsPatch>,
 }
 
 #[derive(Clone)]
@@ -213,6 +255,14 @@ impl SettingsStore {
             }
             if let Some(value) = patch.ui_language {
                 settings.ui_language = value;
+            }
+            if let Some(background) = patch.background.filter(|value| !value.is_empty()) {
+                if let Some(enabled) = background.enabled {
+                    settings.background.enabled = enabled;
+                }
+                if let Some(keep_engine) = background.keep_engine {
+                    settings.background.keep_engine = keep_engine;
+                }
             }
             Ok(())
         })
@@ -555,6 +605,7 @@ mod tests {
                 auto_translate: Some(false),
                 auto_update_check: Some(false),
                 ui_language: Some("zh".to_string()),
+                ..Default::default()
             })
             .expect("設定を保存できる");
         assert_eq!(updated.gpu_layers, 20);
@@ -718,6 +769,85 @@ mod tests {
         let settings = SettingsStore::new(path).get();
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.floating_window, FloatingWindowSettings::default());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn background_defaults_match_the_contract() {
+        let settings = Settings::default();
+        // 既定は「トレイに常駐する」「エンジンは止める (超軽量)」。
+        assert!(settings.background.enabled);
+        assert!(!settings.background.keep_engine);
+    }
+
+    #[test]
+    fn background_patch_round_trips_and_touches_only_given_fields() {
+        let directory = temp_dir("background-roundtrip");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+
+        let updated = store
+            .apply(SettingsPatch {
+                background: Some(BackgroundSettingsPatch {
+                    enabled: Some(false),
+                    keep_engine: Some(true),
+                }),
+                ..Default::default()
+            })
+            .expect("バックグラウンド設定を保存できる");
+        assert!(!updated.background.enabled);
+        assert!(updated.background.keep_engine);
+        assert_eq!(SettingsStore::new(path.clone()).get(), updated);
+
+        // 片方だけの差分は、もう片方の値を保つ。
+        let updated = store
+            .apply(SettingsPatch {
+                background: Some(BackgroundSettingsPatch {
+                    enabled: Some(true),
+                    keep_engine: None,
+                }),
+                ..Default::default()
+            })
+            .expect("片方だけでも保存できる");
+        assert!(updated.background.enabled);
+        assert!(updated.background.keep_engine);
+        assert_eq!(SettingsStore::new(path).get(), updated);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn empty_background_patch_leaves_settings_untouched() {
+        let directory = temp_dir("background-empty");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        store
+            .apply(SettingsPatch {
+                background: Some(BackgroundSettingsPatch {
+                    enabled: Some(false),
+                    keep_engine: Some(true),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let updated = store
+            .apply(SettingsPatch {
+                background: Some(BackgroundSettingsPatch::default()),
+                ..Default::default()
+            })
+            .expect("空の差分でも保存できる");
+        assert!(!updated.background.enabled);
+        assert!(updated.background.keep_engine);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn settings_without_background_stay_compatible() {
+        // 1.3.1 以前の settings.json (background そのものが無い) を読む想定。
+        let directory = temp_dir("background-missing");
+        let path = directory.join("settings.json");
+        fs::write(&path, r#"{"theme":"dark","gpu_layers":12}"#).unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert_eq!(settings.background, BackgroundSettings::default());
         let _ = fs::remove_dir_all(&directory);
     }
 }
