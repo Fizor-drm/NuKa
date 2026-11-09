@@ -40,9 +40,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        floating::on_hotkey(app);
+                        floating::on_hotkey(app, shortcut);
                     }
                 })
                 .build(),

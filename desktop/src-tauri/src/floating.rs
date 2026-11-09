@@ -16,7 +16,8 @@
 //!
 //! - `read_clipboard_text` / `write_clipboard_text`: 選択テキストの取得と退避の復元
 //! - `send_copy_shortcut`: 前景アプリへの Ctrl+C (KEYEVENTF_SCANCODE で送る)
-//! - `wait_for_modifiers_release`: ホットキーの修飾子が離れるまで待つ
+//! - `wait_for_hotkey_keys_release`: ホットキーのキーと修飾子が離れるまで待つ
+//! - `send_vk_key`: 押しっぱなしの Shift / Alt を一時解除・復元する
 //! - `cursor_position` / `monitor_work_area`: 表示位置の計算
 //!
 //! 取得したテキストは Tauri のイベントでこのアプリのウィンドウに渡すだけで、
@@ -53,8 +54,11 @@ pub const WINDOW_HEIGHT: f64 = 300.0;
 /// ホットキー発火イベント。全ウィンドウへ送る。
 pub const CAPTURE_EVENT: &str = "floating:capture";
 
-/// 修飾子が離れるまで待つ上限。離れないままでも取得に進む。
-const MODIFIER_WAIT_LIMIT: Duration = Duration::from_millis(600);
+/// ホットキーのキーと修飾子が離れるまで待つ上限。
+///
+/// 人間の通常の解放 (200〜500ms) より長く取り、押しっぱなしのときは
+/// タイムアウト後に Shift / Alt を一時解除して Ctrl+C を送る。
+const KEY_RELEASE_WAIT_LIMIT: Duration = Duration::from_millis(900);
 /// Ctrl+C を送ってからクリップボードを読むまでの待ち。
 const CLIPBOARD_SETTLE: Duration = Duration::from_millis(250);
 /// 表示直後のフォーカス揺れを無視する時間。
@@ -408,53 +412,73 @@ pub fn normalize_hotkey(input: &str) -> Option<String> {
     parse_hotkey(input).map(|spec| spec.to_string())
 }
 
-fn code_for_key(key: char) -> Option<Code> {
-    const LETTERS: [Code; 26] = [
-        Code::KeyA,
-        Code::KeyB,
-        Code::KeyC,
-        Code::KeyD,
-        Code::KeyE,
-        Code::KeyF,
-        Code::KeyG,
-        Code::KeyH,
-        Code::KeyI,
-        Code::KeyJ,
-        Code::KeyK,
-        Code::KeyL,
-        Code::KeyM,
-        Code::KeyN,
-        Code::KeyO,
-        Code::KeyP,
-        Code::KeyQ,
-        Code::KeyR,
-        Code::KeyS,
-        Code::KeyT,
-        Code::KeyU,
-        Code::KeyV,
-        Code::KeyW,
-        Code::KeyX,
-        Code::KeyY,
-        Code::KeyZ,
-    ];
-    const DIGITS: [Code; 10] = [
-        Code::Digit0,
-        Code::Digit1,
-        Code::Digit2,
-        Code::Digit3,
-        Code::Digit4,
-        Code::Digit5,
-        Code::Digit6,
-        Code::Digit7,
-        Code::Digit8,
-        Code::Digit9,
-    ];
+const LETTER_CODES: [Code; 26] = [
+    Code::KeyA,
+    Code::KeyB,
+    Code::KeyC,
+    Code::KeyD,
+    Code::KeyE,
+    Code::KeyF,
+    Code::KeyG,
+    Code::KeyH,
+    Code::KeyI,
+    Code::KeyJ,
+    Code::KeyK,
+    Code::KeyL,
+    Code::KeyM,
+    Code::KeyN,
+    Code::KeyO,
+    Code::KeyP,
+    Code::KeyQ,
+    Code::KeyR,
+    Code::KeyS,
+    Code::KeyT,
+    Code::KeyU,
+    Code::KeyV,
+    Code::KeyW,
+    Code::KeyX,
+    Code::KeyY,
+    Code::KeyZ,
+];
+const DIGIT_CODES: [Code; 10] = [
+    Code::Digit0,
+    Code::Digit1,
+    Code::Digit2,
+    Code::Digit3,
+    Code::Digit4,
+    Code::Digit5,
+    Code::Digit6,
+    Code::Digit7,
+    Code::Digit8,
+    Code::Digit9,
+];
 
+fn code_for_key(key: char) -> Option<Code> {
     match key {
-        'A'..='Z' => LETTERS.get((key as usize) - ('A' as usize)).copied(),
-        '0'..='9' => DIGITS.get((key as usize) - ('0' as usize)).copied(),
+        'A'..='Z' => LETTER_CODES.get((key as usize) - ('A' as usize)).copied(),
+        '0'..='9' => DIGIT_CODES.get((key as usize) - ('0' as usize)).copied(),
         _ => None,
     }
+}
+
+/// ショートカットのキーから Windows の仮想キーコードを引く。
+/// 押しっぱなし判定に使う (修飾子は VK_CONTROL / VK_SHIFT / VK_MENU を見る)。
+#[cfg(windows)]
+fn shortcut_vk(shortcut: &Shortcut) -> Option<u16> {
+    let key = shortcut.key;
+    // VK_A..=VK_Z は 0x41..=0x5A、VK_0..=VK_9 は 0x30..=0x39。
+    if let Some(index) = LETTER_CODES.iter().position(|code| *code == key) {
+        return Some(0x41 + index as u16);
+    }
+    DIGIT_CODES
+        .iter()
+        .position(|code| *code == key)
+        .map(|index| 0x30 + index as u16)
+}
+
+#[cfg(not(windows))]
+fn shortcut_vk(_shortcut: &Shortcut) -> Option<u16> {
+    None
 }
 
 /// ホットキーが登録できなかったときのメッセージ。
@@ -623,7 +647,7 @@ pub fn apply_hotkey(app: &AppHandle, state: &FloatingState) -> Result<(), Locali
 }
 
 /// ホットキーが押されたときの処理。プラグインのハンドラから呼ぶ。
-pub fn on_hotkey(app: &AppHandle) {
+pub fn on_hotkey(app: &AppHandle, shortcut: &Shortcut) {
     let Some(window) = app.get_webview_window(FLOATING_LABEL) else {
         return;
     };
@@ -631,6 +655,7 @@ pub fn on_hotkey(app: &AppHandle) {
         return;
     };
 
+    let hotkey_vk = shortcut_vk(shortcut);
     let now = Instant::now();
     // キーリピートやエージェントの二重押下で、show 直後にトグル hide しない。
     if !state.floating.should_handle_press(now) {
@@ -643,7 +668,7 @@ pub fn on_hotkey(app: &AppHandle) {
     let visible = state.floating.is_shown() && window.is_visible().unwrap_or(false);
     let focused = window.is_focused().unwrap_or(false);
     debug_log!(
-        "hotkey: shown={} visible={} focused={}",
+        "hotkey: shown={} visible={} focused={} vk={hotkey_vk:?}",
         state.floating.is_shown(),
         visible,
         focused
@@ -672,7 +697,7 @@ pub fn on_hotkey(app: &AppHandle) {
     let trigger_started = Instant::now();
     let app_handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        capture_and_show(&app_handle, trigger_started);
+        capture_and_show(&app_handle, trigger_started, hotkey_vk);
         if let Some(state) = app_handle.try_state::<AppState>() {
             state.floating.end_capture();
         }
@@ -928,6 +953,41 @@ fn schedule_blur_hide(app: &AppHandle, epoch: u64, delay: Duration) {
 // 選択テキストの取得フロー
 // ---------------------------------------------------------------------------
 
+/// タイムアウト時に一時解除する修飾子。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ForcedModifierRelease {
+    shift: bool,
+    alt: bool,
+}
+
+impl ForcedModifierRelease {
+    fn any(self) -> bool {
+        self.shift || self.alt
+    }
+}
+
+/// 押されている Shift / Alt のうち、一時解除する対象を決める。
+/// Ctrl は Ctrl+C に必要なので対象外。ホットキーのキー自体も対象外。
+fn forced_modifier_release(shift_down: bool, alt_down: bool) -> ForcedModifierRelease {
+    ForcedModifierRelease {
+        shift: shift_down,
+        alt: alt_down,
+    }
+}
+
+/// 現在押されている Shift / Alt を調べて、一時解除の対象を得る。
+#[cfg(windows)]
+fn current_forced_modifier_release() -> ForcedModifierRelease {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_MENU, VK_SHIFT};
+
+    forced_modifier_release(is_vk_pressed(VK_SHIFT), is_vk_pressed(VK_MENU))
+}
+
+#[cfg(not(windows))]
+fn current_forced_modifier_release() -> ForcedModifierRelease {
+    ForcedModifierRelease::default()
+}
+
 /// Ctrl+C でクリップボードが更新されたかと、読み取った内容から選択テキストを
 /// 採用するかを決める。
 ///
@@ -945,7 +1005,7 @@ fn decide_selected(copied: bool, captured: Option<&str>) -> Option<String> {
     Some(text.to_string())
 }
 
-fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
+fn capture_and_show(app: &AppHandle, trigger_started: Instant, hotkey_vk: Option<u16>) {
     let Some(window) = app.get_webview_window(FLOATING_LABEL) else {
         return;
     };
@@ -955,7 +1015,24 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
 
     // 前景アプリの選択テキストを取るため、クリップボードを退避してから Ctrl+C を送る。
     let backup = read_clipboard_text();
-    wait_for_modifiers_release(MODIFIER_WAIT_LIMIT);
+    let released_in_time = wait_for_hotkey_keys_release(hotkey_vk, KEY_RELEASE_WAIT_LIMIT);
+    // 押しっぱなしで時間切れになった場合、そのまま Ctrl+C を送るとホットキーと
+    // 同じ組み合わせ (例: Ctrl+Alt+C) になり、ブラウザ等ではコピーされない。
+    // Shift / Alt だけ一時解除して Ctrl+C を届かせる (Ctrl はコピーに必要)。
+    let forced_release = if released_in_time {
+        ForcedModifierRelease::default()
+    } else {
+        current_forced_modifier_release()
+    };
+    if forced_release.any() {
+        debug_log!(
+            "modifier hold timeout: force-releasing shift={} alt={}",
+            forced_release.shift,
+            forced_release.alt
+        );
+        send_forced_modifier_state(forced_release, true);
+    }
+
     // 既に同じテキストがクリップボードにあっても、Ctrl+C でコピーが起きたかを
     // シーケンス番号の変化で判定する (テキスト比較では noSelection と誤判定する)。
     let sequence_before = clipboard_sequence_number();
@@ -964,6 +1041,14 @@ fn capture_and_show(app: &AppHandle, trigger_started: Instant) {
     let sequence_after = clipboard_sequence_number();
     let captured = read_clipboard_text();
     let selected = decide_selected(sequence_after != sequence_before, captured.as_deref());
+
+    if forced_release.any() {
+        // capture 開始時に押されていた修飾子の状態へ戻す。capture 中にユーザーが
+        // 離した場合は down が残るリスクがあるが、capture は数百 ms なので許容する
+        // (物理状態を問い合わせても、合成 keyup 後は up に見えるため判別できない)。
+        send_forced_modifier_state(forced_release, false);
+        debug_log!("modifiers restored after copy");
+    }
 
     // 退避がテキストだったときだけ戻す。画像などは復元しない (README に明記)。
     if let Some(text) = backup.as_deref().filter(|text| !text.is_empty()) {
@@ -1157,25 +1242,75 @@ fn write_clipboard_text(text: &str) -> bool {
     true
 }
 
-/// 押されている修飾子 (Ctrl / Shift / Alt) が離れるまで待つ。
-///
-/// ホットキーのキー自体が離れるのを待つためではなく、Ctrl が押されたままだと
-/// 送る Ctrl+C が Ctrl+Shift+C などになるのを避けるため。
+/// ホットキーのキーと修飾子 (Ctrl / Shift / Alt) が離れるまで待つ。
+/// 制限時間内にすべて離れれば true、タイムアウトなら false。
 #[cfg(windows)]
-fn wait_for_modifiers_release(limit: Duration) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
-    };
+fn wait_for_hotkey_keys_release(hotkey_vk: Option<u16>, limit: Duration) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT};
 
-    // SAFETY: GetAsyncKeyState は現在のキー状態を読むだけ。
-    let pressed = |key: u16| unsafe { (GetAsyncKeyState(key as i32) as u16) & 0x8000 != 0 };
-
-    let started = std::time::Instant::now();
-    while pressed(VK_CONTROL) || pressed(VK_SHIFT) || pressed(VK_MENU) {
+    let started = Instant::now();
+    loop {
+        let any_pressed = is_vk_pressed(VK_CONTROL)
+            || is_vk_pressed(VK_SHIFT)
+            || is_vk_pressed(VK_MENU)
+            || hotkey_vk.is_some_and(is_vk_pressed);
+        if !any_pressed {
+            return true;
+        }
         if started.elapsed() >= limit {
-            return;
+            return false;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 現在その仮想キーが押されているか。
+#[cfg(windows)]
+fn is_vk_pressed(vk: u16) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    // SAFETY: GetAsyncKeyState は現在のキー状態を読むだけ。
+    unsafe { (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0 }
+}
+
+/// 押しっぱなしの Shift / Alt を一時解除 (key_up=true) または復元 (false) する。
+#[cfg(windows)]
+fn send_forced_modifier_state(release: ForcedModifierRelease, key_up: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_MENU, VK_SHIFT};
+
+    if release.shift {
+        send_vk_key(VK_SHIFT, key_up);
+    }
+    if release.alt {
+        send_vk_key(VK_MENU, key_up);
+    }
+}
+
+/// VK ベースの keydown / keyup を 1 つ送る。
+#[cfg(windows)]
+fn send_vk_key(vk: u16, key_up: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    };
+
+    let flags = if key_up { KEYEVENTF_KEYUP } else { 0 };
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+
+    // SAFETY: 長さ 1 の INPUT を正しいサイズで渡すだけ。ポインタは保持しない。
+    let sent = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        eprintln!("修飾キーの合成入力を送れませんでした (vk=0x{vk:02X})");
     }
 }
 
@@ -1301,7 +1436,12 @@ fn monitor_work_area(point: (i32, i32)) -> Option<WorkArea> {
 
 // Windows 以外ではビルドだけ通るスタブ。NuKa の配布対象は Windows のみ。
 #[cfg(not(windows))]
-fn wait_for_modifiers_release(_limit: Duration) {}
+fn wait_for_hotkey_keys_release(_hotkey_vk: Option<u16>, _limit: Duration) -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn send_forced_modifier_state(_release: ForcedModifierRelease, _key_up: bool) {}
 
 #[cfg(not(windows))]
 fn send_copy_shortcut() {}
@@ -1405,6 +1545,48 @@ mod tests {
             .to_shortcut()
             .expect("変換できる");
         assert_eq!(shortcut, Shortcut::new(Some(Modifiers::ALT), Code::Digit1));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn shortcut_vk_maps_top_row_keys() {
+        let shortcut = |code: Code| Shortcut::new(Some(Modifiers::CONTROL), code);
+        assert_eq!(shortcut_vk(&shortcut(Code::KeyA)), Some(0x41));
+        assert_eq!(shortcut_vk(&shortcut(Code::KeyC)), Some(0x43));
+        assert_eq!(shortcut_vk(&shortcut(Code::KeyZ)), Some(0x5A));
+        assert_eq!(shortcut_vk(&shortcut(Code::Digit0)), Some(0x30));
+        assert_eq!(shortcut_vk(&shortcut(Code::Digit1)), Some(0x31));
+        assert_eq!(shortcut_vk(&shortcut(Code::Digit9)), Some(0x39));
+        // パーサが受け付けないキーは VK に変換しない。
+        assert_eq!(shortcut_vk(&shortcut(Code::F1)), None);
+    }
+
+    #[test]
+    fn forced_release_targets_only_shift_and_alt() {
+        assert_eq!(
+            forced_modifier_release(false, false),
+            ForcedModifierRelease::default()
+        );
+        assert!(!forced_modifier_release(false, false).any());
+
+        assert_eq!(
+            forced_modifier_release(true, false),
+            ForcedModifierRelease {
+                shift: true,
+                alt: false
+            }
+        );
+        assert_eq!(
+            forced_modifier_release(false, true),
+            ForcedModifierRelease {
+                shift: false,
+                alt: true
+            }
+        );
+        let both = forced_modifier_release(true, true);
+        assert!(both.shift);
+        assert!(both.alt);
+        assert!(both.any());
     }
 
     fn work_area(left: i32, top: i32, right: i32, bottom: i32) -> WorkArea {
