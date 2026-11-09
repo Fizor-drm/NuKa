@@ -7,6 +7,14 @@ import { icon } from "./icons";
 import { t } from "./i18n";
 import type { GlossaryPair } from "./ipc";
 
+/**
+ * 用語集に登録できる対の上限。
+ *
+ * Rust 側の `settings::MAX_GLOSSARY_PAIRS` と同じ 200。UI で上限に達したら
+ * 行の追加を止める (保存時に黙って切り捨てられて再起動で消えるのを防ぐ)。
+ */
+export const MAX_GLOSSARY_PAIRS = 200;
+
 export class GlossaryEditor {
   private readonly rows: HTMLElement;
   private readonly emptyHint: HTMLElement;
@@ -20,6 +28,12 @@ export class GlossaryEditor {
   }
 
   addRow(pair?: GlossaryPair, focus = false): void {
+    // 上限に達したら空行を増やさない (保存できない行を作らない)。
+    // 保存済みの復元 (pair あり) は上限までしか来ない (Rust 側も 200 で止める)。
+    if (pair === undefined && this.isFull()) {
+      this.updateEmptyHint();
+      return;
+    }
     const row = document.createElement("div");
     row.className = "glossary-row";
 
@@ -71,6 +85,33 @@ export class GlossaryEditor {
     if (focus) {
       source.focus();
     }
+  }
+
+  /**
+   * 保存済みの用語集で行を作り直す (起動時の復元)。
+   *
+   * `onChange` は呼ばない。復元しただけで「編集された」扱いになり、
+   * settings.json への保存や再翻訳が走るのを避ける。空なら入力用の空行を 1 つ置く。
+   */
+  setPairs(pairs: readonly GlossaryPair[]): void {
+    this.rows.replaceChildren();
+    if (pairs.length === 0) {
+      this.addRow();
+      return;
+    }
+    for (const pair of pairs) {
+      this.addRow(pair);
+    }
+  }
+
+  /** 今の行数 (空行も 1 行として数える)。 */
+  count(): number {
+    return this.rows.childElementCount;
+  }
+
+  /** 上限 [`MAX_GLOSSARY_PAIRS`] に達しているか。 */
+  isFull(): boolean {
+    return this.count() >= MAX_GLOSSARY_PAIRS;
   }
 
   getPairs(): GlossaryPair[] {

@@ -7,6 +7,7 @@
  */
 
 import { GlossaryEditor } from "./glossary";
+import { GlossarySaver, glossarySignature } from "./glossary-save";
 import { icon } from "./icons";
 import {
   applyTranslations,
@@ -59,6 +60,21 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 const AUTO_TRANSLATE_DELAY = 700;
 const DETECT_DELAY = 400;
 const MAX_BUFFERED_EVENTS = 800;
+/**
+ * 用語集を settings.json へ保存するまで待つ時間。
+ *
+ * 1 文字ごとに `set_settings` を呼ぶと保存が爆発するので、入力が止まってから
+ * まとめて 1 回だけ書く (`scheduleGlossarySave`)。
+ *
+ * 終了時の取りこぼし (監査 Low) の方針:
+ * - 実終了の直前にフロントから同期保存はできない (IPC の向きが逆で await 保証が
+ *   ない)。Rust 側の終了経路を触るのは v1.3.4-1.3.5 の常駐修正の範囲なので避ける。
+ * - 代わりに、ウィンドウが隠れた (トレイ常駐) ときと pagehide で、タイマーを
+ *   待たずに即保存する (`flushPendingGlossarySave`)。トレイ常駐が既定なので、
+ *   通常の「閉じる」はここで保存される。
+ * - プロセスを即座に強制終了した場合の 500ms 分は明示的にリスク受容する。
+ */
+const GLOSSARY_SAVE_DELAY = 500;
 
 const ENGINE_LABELS: Record<EngineStatus["state"], string> = {
   starting: "engine.starting",
@@ -111,7 +127,10 @@ interface AppState {
   targetLang: string;
   form: FormChoice;
   glossary: GlossaryPair[];
+  /** 翻訳リクエストに載せる用語集の署名 (JSON)。変化が無ければ再翻訳しない。 */
   effectiveGlossary: string;
+  /** 直近に settings.json へ保存した用語集の署名 (JSON)。無変更の保存を避ける。 */
+  savedGlossary: string;
   translation: string;
   translationError: string | null;
   engine: EngineStatus;
@@ -151,6 +170,7 @@ const state: AppState = {
   form: "",
   glossary: [],
   effectiveGlossary: "[]",
+  savedGlossary: "[]",
   translation: "",
   translationError: null,
   engine: { state: "starting" },
@@ -215,6 +235,11 @@ const glossaryPanelEl = byId<HTMLElement>("glossary-panel");
 const glossaryRowsEl = byId<HTMLDivElement>("glossary-rows");
 const glossaryEmptyEl = byId<HTMLParagraphElement>("glossary-empty");
 const glossaryAddEl = byId<HTMLButtonElement>("glossary-add");
+const glossaryLimitEl = byId<HTMLParagraphElement>("glossary-limit");
+
+const contextToggleEl = byId<HTMLButtonElement>("context-toggle");
+const contextPanelEl = byId<HTMLElement>("context-panel");
+const contextInputEl = byId<HTMLTextAreaElement>("context-text");
 
 const formChipButtons = Array.from(formChipsEl.querySelectorAll<HTMLButtonElement>(".chip"));
 
@@ -387,6 +412,7 @@ let waiter: InvokeWaiter | null = null;
 let staleJobId: number | null = null;
 let pendingTranslate = false;
 let appStatusTimer: number | undefined;
+let glossarySaveTimer: number | undefined;
 /** invoke 返却前に見た superseded の jobId (取りこぼし防止)。 */
 const supersededJobs = new Set<number>();
 /** 記録開始時にホットキーを外す処理。完了まではキー入力を受け付けない。 */
@@ -396,6 +422,49 @@ let hotkeySuspendPending = false;
 function getSourceText(): string {
   return sourceInputEl.value;
 }
+
+/**
+ * 用語集を保存・送信できる形へ整える。
+ *
+ * - 前後の空白を落とす
+ * - 原文・訳語のどちらかが空の行は落とす (未入力の行は送らない・保存しない)
+ *
+ * Rust 側 (`settings::normalize_glossary`) も同じ整列をするので、UI の空行が
+ * settings.json に残ることはない。
+ */
+function glossaryForStorage(pairs: readonly GlossaryPair[]): GlossaryPair[] {
+  return pairs
+    .map((pair) => ({ source: pair.source.trim(), target: pair.target.trim() }))
+    .filter((pair) => pair.source !== "" && pair.target !== "");
+}
+
+/**
+ * 用語集だけを settings.json へ保存するループ。
+ *
+ * `set_settings` は差分 (patch) を受けて、Rust 側がロック下で
+ * 「最新を読む → 差分適用 → 検証 → 保存」する。設定全体を送り返さないので、
+ * ここから用語集だけを送ってもテーマ・言語・常駐などの項目は変わらない。
+ * 用語集は常駐エンジンの判定 (resident_target) に無関係なので、
+ * この保存でエンジンが止まったり起動したりすることもない。
+ *
+ * 競合 (保存中に編集) の扱いは `GlossarySaver` のコメントを参照。保存済みの
+ * 署名は「送った値」ではなく「バックエンドが正規化して返した値」で更新する。
+ */
+const glossarySaver = new GlossarySaver({
+  read: () => glossaryForStorage(state.glossary),
+  save: async (pairs) => {
+    const saved = await ipc.setSettings({ glossary: [...pairs] });
+    return saved.glossary ?? [];
+  },
+  savedSignature: () => state.savedGlossary,
+  setSavedSignature: (signature) => {
+    state.savedGlossary = signature;
+  },
+  onError: (error) => {
+    // 保存できなくても次の編集で再試行する (署名は進めない)。
+    showAppStatus(t("status.settingsSaveFailed", { detail: describeError(error) }));
+  },
+});
 
 function buildRequest(text: string): TranslateRequest {
   const request: TranslateRequest = {
@@ -408,11 +477,14 @@ function buildRequest(text: string): TranslateRequest {
   if (state.targetLang === "ja" && state.form !== "") {
     request.form = state.form;
   }
-  const glossary = state.glossary
-    .map((pair) => ({ source: pair.source.trim(), target: pair.target.trim() }))
-    .filter((pair) => pair.source !== "" && pair.target !== "");
+  const glossary = glossaryForStorage(state.glossary);
   if (glossary.length > 0) {
     request.glossary = glossary;
+  }
+  // 文脈はこのセッション内だけで保持する (永続化は別件)。空欄なら送らない。
+  const context = contextInputEl.value.trim();
+  if (context !== "") {
+    request.context = context;
   }
   return request;
 }
@@ -862,14 +934,50 @@ function handleFormChoice(form: FormChoice): void {
 
 function handleGlossaryChange(): void {
   state.glossary = glossaryEditor.getPairs();
-  const effective = JSON.stringify(
-    state.glossary.filter((pair) => pair.source.trim() !== "" && pair.target.trim() !== ""),
-  );
-  if (effective === state.effectiveGlossary) {
+  // 保存・送信に使うのは「両側が埋まった対」だけ。空行の追加や片側だけの
+  // 入力では署名が変わらないので、保存も再翻訳も走らせない。
+  const signature = glossarySignature(glossaryForStorage(state.glossary));
+  if (signature !== state.savedGlossary) {
+    scheduleGlossarySave();
+  }
+  renderGlossaryLimit();
+  if (signature === state.effectiveGlossary) {
     return;
   }
-  state.effectiveGlossary = effective;
+  state.effectiveGlossary = signature;
   scheduleAutoTranslate();
+}
+
+/** 用語集の保存を予約する。連続した編集は 1 回の保存にまとめる。 */
+function scheduleGlossarySave(): void {
+  window.clearTimeout(glossarySaveTimer);
+  glossarySaveTimer = window.setTimeout(() => {
+    glossarySaveTimer = undefined;
+    // 保存ループ自体が直列化されており、実行中に入った編集も次の周回で拾う。
+    void glossarySaver.flush();
+  }, GLOSSARY_SAVE_DELAY);
+}
+
+/**
+ * 保留中の用語集保存を、タイマーを待たずに流す (ベストエフォート)。
+ *
+ * ウィンドウが隠れた (トレイ常駐) ときと pagehide で呼ぶ。実終了直前の
+ * 同期保存は保証できないが、通常の「閉じる」でタイマー分を取りこぼさない。
+ */
+function flushPendingGlossarySave(): void {
+  if (glossarySaveTimer === undefined) {
+    return;
+  }
+  window.clearTimeout(glossarySaveTimer);
+  glossarySaveTimer = undefined;
+  void glossarySaver.flush();
+}
+
+/** 用語集の上限表示。200 対に達したら「行を追加」を止めて注記を出す。 */
+function renderGlossaryLimit(): void {
+  const full = glossaryEditor.isFull();
+  glossaryAddEl.disabled = full;
+  glossaryLimitEl.hidden = !full;
 }
 
 function swapLanguages(): void {
@@ -1033,6 +1141,11 @@ async function loadSettings(): Promise<void> {
     state.floatingModel = settings.floating_window.model;
     state.backgroundEnabled = settings.background.enabled;
     state.backgroundResidentEngine = settings.background.resident_engine;
+    // 用語集は settings.json が正。復元した内容を「送信済み・保存済み」の
+    // 基準にして、起動直後に保存や再翻訳が走らないようにする。
+    state.glossary = settings.glossary ?? [];
+    state.effectiveGlossary = glossarySignature(glossaryForStorage(state.glossary));
+    state.savedGlossary = state.effectiveGlossary;
   } catch {
     // 設定が読めなくても既定値で動かす
   }
@@ -1040,6 +1153,10 @@ async function loadSettings(): Promise<void> {
   renderThemeButton(themeToggleEl, state.theme);
   renderAutoToggle();
   reportMainTargetLang();
+  // 用語集エディタへ復元する (空なら入力用の空行が 1 つ入る)。
+  // bootstrap 側で行を足すと、復元分と空行が二重になるのでここへ統合した。
+  glossaryEditor.setPairs(state.glossary);
+  renderGlossaryLimit();
 }
 
 // ---------------------------------------------------------------------------
@@ -2065,6 +2182,22 @@ function setGlossaryOpen(open: boolean): void {
   }
 }
 
+/**
+ * 「文脈」パネルの開閉。用語集パネルと同じ流儀 (data-open + inert) で、
+ * 開いたときは入力欄へフォーカスを移す。
+ */
+function setContextOpen(open: boolean): void {
+  contextPanelEl.dataset["open"] = String(open);
+  contextToggleEl.setAttribute("aria-pressed", String(open));
+  contextToggleEl.setAttribute("aria-expanded", String(open));
+  contextPanelEl.toggleAttribute("inert", !open);
+  if (open) {
+    contextInputEl.focus();
+  } else if (contextPanelEl.contains(document.activeElement)) {
+    contextToggleEl.focus();
+  }
+}
+
 function bindTranslationEvents(): void {
   onEngineStatus((status) => {
     handleEngineStatus(status);
@@ -2152,8 +2285,27 @@ function bindUi(): void {
     setGlossaryOpen(glossaryPanelEl.dataset["open"] !== "true");
   });
 
+  // 文脈は次の翻訳から効く。入力のたびに再翻訳すると、まだ書き終えていない
+  // 背景で訳し直してしまうので、自動翻訳のきっかけにはしない
+  // (既存の翻訳結果はそのまま残す)。
+  contextToggleEl.addEventListener("click", () => {
+    setContextOpen(contextPanelEl.dataset["open"] !== "true");
+  });
+
   glossaryAddEl.addEventListener("click", () => {
     glossaryEditor.addRow(undefined, true);
+    renderGlossaryLimit();
+  });
+
+  // 用語集の保留中保存を、非表示・終了の直前に流す (ベストエフォート)。
+  // 実終了時の同期保存は保証できない (方針は GLOSSARY_SAVE_DELAY のコメント)。
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      flushPendingGlossarySave();
+    }
+  });
+  window.addEventListener("pagehide", () => {
+    flushPendingGlossarySave();
   });
 
   themeToggleEl.addEventListener("click", () => {
@@ -2459,7 +2611,7 @@ async function bootstrap(): Promise<void> {
   bindDownloadEvents();
   bindUpdateEvents();
   bindUi();
-  glossaryEditor.addRow();
+  // 用語集の行は loadSettings が settings.json から復元する (空なら空行 1 つ)。
   await loadSettings();
   applyTheme(state.theme);
   renderThemeButton(themeToggleEl, state.theme);

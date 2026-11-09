@@ -16,9 +16,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::prompt::GlossaryPair;
+
 pub const MIN_CONTEXT_TOKENS: u32 = 512;
 pub const MAX_CONTEXT_TOKENS: u32 = 32768;
 pub const MAX_GPU_LAYERS: u32 = 1000;
+
+/// 保存する用語集の上限 (対)。
+///
+/// 1 対は 2 つの短い文字列なので 200 対でも settings.json は数十 KB に収まる。
+/// 手編集や UI 側の不具合で無限に増えないよう、保存時にここで頭打ちにする。
+pub const MAX_GLOSSARY_PAIRS: usize = 200;
 
 /// UI 表示言語。既定は日本語。
 pub const UI_LANGUAGE_DEFAULT: &str = "ja";
@@ -150,6 +158,13 @@ pub struct Settings {
     pub floating_window: FloatingWindowSettings,
     /// バックグラウンド実行 (トレイ常駐)。
     pub background: BackgroundSettings,
+    /// 翻訳に使う用語集 (単一セット)。
+    ///
+    /// 構造体側の `#[serde(default)]` により、1.3.5 以前の settings.json
+    /// (glossary が無い) は空の用語集として読める。保存する形は
+    /// [`normalize_glossary`] で整える (空行は保存しない・前後の空白は落とす)。
+    /// 用語集は翻訳プロンプトだけに効き、エンジンの起動引数には関与しない。
+    pub glossary: Vec<GlossaryPair>,
 }
 
 impl Default for Settings {
@@ -169,6 +184,7 @@ impl Default for Settings {
             active_model: None,
             floating_window: FloatingWindowSettings::default(),
             background: BackgroundSettings::default(),
+            glossary: Vec::new(),
         }
     }
 }
@@ -220,6 +236,11 @@ pub struct SettingsPatch {
     pub auto_update_check: Option<bool>,
     pub ui_language: Option<String>,
     pub background: Option<BackgroundSettingsPatch>,
+    /// 用語集。省略すると今の値を保ち、空配列を渡すと全部消す。
+    ///
+    /// 保存前に [`normalize_glossary`] で整列するので、UI の空行が
+    /// settings.json に残ることはない。
+    pub glossary: Option<Vec<GlossaryPair>>,
 }
 
 #[derive(Clone)]
@@ -296,6 +317,10 @@ impl SettingsStore {
                     settings.background.resident_engine = resident;
                 }
             }
+            if let Some(glossary) = patch.glossary {
+                // UI の空行や前後の空白は保存しない。メモリもファイルと同じ形にする。
+                settings.glossary = normalize_glossary(glossary);
+            }
             Ok(())
         })
     }
@@ -331,6 +356,31 @@ fn normalize_optional(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// 用語集を保存できる形へ整える。
+///
+/// - 原文・訳語の前後の空白を落とす
+/// - どちらかが空になった対は捨てる (UI の未入力行は保存しない)
+/// - [`MAX_GLOSSARY_PAIRS`] を超えたぶんは後ろから切り捨てる
+///
+/// `set_settings` の保存経路と、settings.json の手編集を読む経路の両方で通す。
+fn normalize_glossary(pairs: Vec<GlossaryPair>) -> Vec<GlossaryPair> {
+    pairs
+        .into_iter()
+        .filter_map(|pair| {
+            let source = pair.source.trim();
+            let target = pair.target.trim();
+            if source.is_empty() || target.is_empty() {
+                return None;
+            }
+            Some(GlossaryPair {
+                source: source.to_string(),
+                target: target.to_string(),
+            })
+        })
+        .take(MAX_GLOSSARY_PAIRS)
+        .collect()
 }
 
 fn validate(settings: &Settings) -> Result<(), String> {
@@ -383,6 +433,9 @@ fn sanitize(settings: &mut Settings) {
         model.file = model.file.trim().to_string();
         model.path = model.path.trim().to_string();
     }
+    // 用語集も手編集で壊れうる。保存経路と同じ整列を通してから書き戻す
+    // (load_or_default が差分を見て settings.json を整えた形へ更新する)。
+    settings.glossary = normalize_glossary(std::mem::take(&mut settings.glossary));
 }
 
 fn load_or_default(path: &Path) -> Settings {
@@ -482,6 +535,7 @@ mod tests {
         assert!(settings.installed_runtime.is_none());
         assert!(settings.installed_models.is_empty());
         assert!(settings.active_model.is_none());
+        assert!(settings.glossary.is_empty());
     }
 
     #[test]
@@ -1007,6 +1061,200 @@ mod tests {
         let settings = SettingsStore::new(path).get();
         assert!(!settings.background.enabled);
         assert!(settings.background.resident_engine);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn settings_without_glossary_stay_compatible() {
+        // 1.3.5 以前の settings.json (glossary そのものが無い) を読む想定。
+        // 旧 JSON に glossary が無くても Default (空) で読め、書き直しでも壊れない。
+        let directory = temp_dir("glossary-missing");
+        let path = directory.join("settings.json");
+        fs::write(&path, r#"{"theme":"dark","gpu_layers":12}"#).unwrap();
+        let settings = SettingsStore::new(path.clone()).get();
+        assert_eq!(settings.theme, Theme::Dark);
+        assert!(settings.glossary.is_empty());
+        // 読み直しても同じ (missing の既定が空 vec であること)。
+        assert!(SettingsStore::new(path).get().glossary.is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn glossary_round_trips_through_the_patch() {
+        let directory = temp_dir("glossary-roundtrip");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let pairs = vec![
+            GlossaryPair {
+                source: "オーナー".to_string(),
+                target: "assignee".to_string(),
+            },
+            GlossaryPair {
+                source: "案件".to_string(),
+                target: "project".to_string(),
+            },
+        ];
+
+        let updated = store
+            .apply(SettingsPatch {
+                glossary: Some(pairs.clone()),
+                ..Default::default()
+            })
+            .expect("用語集を保存できる");
+        assert_eq!(updated.glossary, pairs);
+        // 再起動しても残る (settings.json から読み直す)。
+        assert_eq!(SettingsStore::new(path.clone()).get().glossary, pairs);
+        // ほかの設定項目は触らない。
+        assert_eq!(updated.theme, Theme::Light);
+        assert_eq!(updated.context_tokens, 8192);
+        assert_eq!(updated.background, BackgroundSettings::default());
+
+        // 空配列は「全部消す」。
+        let cleared = store
+            .apply(SettingsPatch {
+                glossary: Some(Vec::new()),
+                ..Default::default()
+            })
+            .expect("空の用語集も保存できる");
+        assert!(cleared.glossary.is_empty());
+        assert!(SettingsStore::new(path.clone()).get().glossary.is_empty());
+
+        // 省略したときは今の値を保つ (無関係な設定保存で用語集を消さない)。
+        store
+            .apply(SettingsPatch {
+                glossary: Some(pairs.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let kept = store
+            .apply(SettingsPatch {
+                theme: Some(Theme::Dark),
+                ..Default::default()
+            })
+            .expect("用語集を指定しない保存でも壊れない");
+        assert_eq!(kept.glossary, pairs);
+        assert_eq!(SettingsStore::new(path).get().glossary, pairs);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn blank_glossary_rows_are_dropped_and_values_trimmed_on_save() {
+        let directory = temp_dir("glossary-normalize");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let updated = store
+            .apply(SettingsPatch {
+                glossary: Some(vec![
+                    // 空行 (UI の未入力行)
+                    GlossaryPair::default(),
+                    // 原文だけ
+                    GlossaryPair {
+                        source: "   ".to_string(),
+                        target: "x".to_string(),
+                    },
+                    // 訳語だけ
+                    GlossaryPair {
+                        source: "y".to_string(),
+                        target: "  ".to_string(),
+                    },
+                    // 前後の空白は落として保存する
+                    GlossaryPair {
+                        source: "  案件 ".to_string(),
+                        target: " project  ".to_string(),
+                    },
+                ]),
+                ..Default::default()
+            })
+            .expect("整列して保存できる");
+        assert_eq!(
+            updated.glossary,
+            vec![GlossaryPair {
+                source: "案件".to_string(),
+                target: "project".to_string(),
+            }]
+        );
+        // メモリとファイルが同じ整列結果になる。
+        assert_eq!(
+            SettingsStore::new(path.clone()).get().glossary,
+            updated.glossary
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"source\": \"\""));
+        assert!(!raw.contains("\"target\": \"\""));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn blank_glossary_rows_are_dropped_and_values_trimmed_on_load() {
+        // settings.json の手編集も保存と同じ整列を通す。
+        let directory = temp_dir("glossary-load");
+        let path = directory.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"glossary":[
+                {"source":"  ","target":"x"},
+                {"source":"y","target":""},
+                {"source":" 案件 ","target":" project "}
+            ]}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path.clone()).get();
+        assert_eq!(
+            settings.glossary,
+            vec![GlossaryPair {
+                source: "案件".to_string(),
+                target: "project".to_string(),
+            }]
+        );
+        // 整列した形で書き戻される (次回起動では空行を読まない)。
+        assert_eq!(SettingsStore::new(path).get().glossary, settings.glossary);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn glossary_is_capped_at_the_documented_limit() {
+        // 境界: 200 対はそのまま、201 対は 200 対で止まる。
+        // (UI 側も `glossary.ts` の MAX_GLOSSARY_PAIRS で 201 行目を追加させない)
+        let pairs = |count: usize| -> Vec<GlossaryPair> {
+            (0..count)
+                .map(|index| GlossaryPair {
+                    source: format!("source-{index}"),
+                    target: format!("target-{index}"),
+                })
+                .collect()
+        };
+        let directory = temp_dir("glossary-cap");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+
+        // ちょうど上限: 1 対も落とさない。
+        let exact = store
+            .apply(SettingsPatch {
+                glossary: Some(pairs(MAX_GLOSSARY_PAIRS)),
+                ..Default::default()
+            })
+            .expect("上限ちょうどは保存できる");
+        assert_eq!(exact.glossary.len(), MAX_GLOSSARY_PAIRS);
+        assert_eq!(
+            SettingsStore::new(path.clone()).get().glossary,
+            exact.glossary
+        );
+
+        // 上限 +1: 最後の 1 対だけを落とす (先頭から 200 対を残す)。
+        let over = store
+            .apply(SettingsPatch {
+                glossary: Some(pairs(MAX_GLOSSARY_PAIRS + 1)),
+                ..Default::default()
+            })
+            .expect("上限を超えても保存できる");
+        assert_eq!(over.glossary.len(), MAX_GLOSSARY_PAIRS);
+        assert_eq!(over.glossary[0].source, "source-0");
+        assert_eq!(
+            over.glossary[MAX_GLOSSARY_PAIRS - 1].source,
+            format!("source-{}", MAX_GLOSSARY_PAIRS - 1)
+        );
+        // 切り捨て後の内容がそのまま永続化される (再起動で silently 消えない)。
+        assert_eq!(SettingsStore::new(path).get().glossary, over.glossary);
         let _ = fs::remove_dir_all(&directory);
     }
 }

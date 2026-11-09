@@ -130,7 +130,7 @@ button {
 
 .view-translate {
   display: grid;
-  grid-template-rows: 48px minmax(0, 1fr) auto;
+  grid-template-rows: 48px minmax(0, 1fr) auto auto;
   min-height: 0;
 }
 
@@ -689,6 +689,14 @@ button {
   background: var(--hover);
 }
 
+.secondary-button:disabled,
+.secondary-button:disabled:hover {
+  background: var(--surface);
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.6;
+}
+
 .copy-button[aria-disabled="true"] {
   color: var(--muted);
   cursor: default;
@@ -742,9 +750,10 @@ button {
   background: var(--accent);
 }
 
-/* ---------- 用語集 ---------- */
+/* ---------- 用語集 / 文脈 (折りたたみパネル) ---------- */
 
-.glossary {
+.glossary,
+.context {
   display: grid;
   grid-template-rows: 0fr;
   background: var(--surface);
@@ -754,36 +763,42 @@ button {
     border-color 160ms ease;
 }
 
-.glossary[data-open="true"] {
+.glossary[data-open="true"],
+.context[data-open="true"] {
   grid-template-rows: 1fr;
   border-top-color: var(--border);
 }
 
-.glossary-clip {
+.glossary-clip,
+.context-clip {
   min-height: 0;
   overflow: hidden;
 }
 
-.glossary-inner {
+.glossary-inner,
+.context-inner {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 12px 16px 16px;
 }
 
-.glossary-head {
+.glossary-head,
+.context-head {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-.glossary-title {
+.glossary-title,
+.context-title {
   margin: 0;
   font-size: 13px;
   font-weight: 600;
 }
 
-.glossary-hint {
+.glossary-hint,
+.context-hint {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
@@ -836,6 +851,42 @@ button {
   font-size: 12px;
 }
 
+.glossary-limit {
+  margin: 0;
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.context-input {
+  width: 100%;
+  min-height: 60px;
+  max-height: 132px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--canvas);
+  color: inherit;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+}
+
+.context-input::placeholder {
+  color: var(--muted);
+}
+
+.context-input:focus-visible {
+  border-color: var(--accent);
+}
+
+.context-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
 /* ---------- モーション ---------- */
 
 @keyframes pulse {
@@ -863,7 +914,8 @@ button {
     animation: none;
   }
 
-  .glossary {
+  .glossary,
+  .context {
     transition: none;
   }
 }
