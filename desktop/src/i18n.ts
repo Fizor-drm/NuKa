@@ -151,15 +151,24 @@ const ja: Dict = {
   "settings.floating.hotkeyInvalid": "Ctrl・Alt・Shift + 英数字の組み合わせで指定してください。",
   "settings.floating.hotkeyConflict":
     "このホットキーはほかのアプリが使用中のため登録できませんでした。設定は保存されましたが、このキーはまだ有効ではありません。",
+  "settings.floating.modelLabel": "フローティング用モデル",
+  "settings.floating.modelSame": "アクティブモデルと同じ",
+  "settings.floating.modelAria": "フローティング用モデル",
+  "settings.floating.modelEmpty": "インストール済みのモデルがありません。",
+  "settings.floating.modelNote":
+    "常時起動を軽くするには、小型モデル (0.8B など) を選んでください。専用モデルを選ぶと、そのモデルで常時起動します。",
   "settings.floating.adminNote":
     "管理者権限で実行されているアプリの上では、選択テキストを取得できません。",
   "settings.floating.saveFailed": "設定を保存できませんでした: {detail}",
 
   "settings.backgroundHeading": "バックグラウンド",
   "settings.background.enable": "ウィンドウを閉じてもトレイに常駐する",
-  "settings.background.keepEngine": "バックグラウンドでもエンジンを動かしたままにする",
-  "settings.background.keepEngineNote":
-    "オフ (既定) にすると、閉じたときにモデルをメモリから解放します。次に使うときに自動で読み込み直します。",
+  "settings.background.residentEngine":
+    "フローティング用エンジンを常時起動しておく (専用モデル選択時)",
+  "settings.background.residentEngineNote":
+    "翻訳ウィンドウ用の小型モデルを起動したままにします。オフにすると、使うたびにモデルを読み込み直します。",
+  "settings.background.residentEngineNeedsModel":
+    "常時起動は、フローティング用モデルを選ぶと有効になります。未選択のときは、使うたびにモデルを読み込み直します。",
   "settings.background.quitNote": "アプリの終了は、トレイアイコンのメニュー「終了」から行います。",
   "settings.background.disabledNote":
     "常駐しない場合、メイン画面を閉じるとアプリが終了します。",
@@ -469,14 +478,23 @@ const en: Dict = {
     "Use Ctrl, Alt, or Shift together with a letter or digit.",
   "settings.floating.hotkeyConflict":
     "Another app already uses this shortcut, so it could not be registered. The setting was saved, but the shortcut is not active yet.",
+  "settings.floating.modelLabel": "Model for the floating window",
+  "settings.floating.modelSame": "Same as the active model",
+  "settings.floating.modelAria": "Model for the floating window",
+  "settings.floating.modelEmpty": "No models are installed.",
+  "settings.floating.modelNote":
+    "Choose a small model (for example 0.8B) to keep the always-on engine light. Selecting a dedicated model enables the always-on engine.",
   "settings.floating.adminNote": "Text cannot be captured from apps running as administrator.",
   "settings.floating.saveFailed": "Could not save settings: {detail}",
 
   "settings.backgroundHeading": "Background",
   "settings.background.enable": "Keep NuKa running in the tray when the window is closed",
-  "settings.background.keepEngine": "Keep the engine running in the background",
-  "settings.background.keepEngineNote":
-    "Leave this off (default) to release the model from memory when the window closes. It reloads automatically the next time you translate.",
+  "settings.background.residentEngine":
+    "Keep the floating-window engine running (when a dedicated model is selected)",
+  "settings.background.residentEngineNote":
+    "Keeps the small model for the translation window loaded. Turn it off to reload the model each time you use it.",
+  "settings.background.residentEngineNeedsModel":
+    "Always-on starts once you pick a model for the floating window. Without one, the model is reloaded each time you use it.",
   "settings.background.quitNote": "To quit NuKa, use “Quit” in the tray icon menu.",
   "settings.background.disabledNote":
     "When NuKa does not stay resident, closing the main window quits the app.",
@@ -779,14 +797,22 @@ const zh: Dict = {
   "settings.floating.hotkeyInvalid": "请使用 Ctrl、Alt 或 Shift 与字母或数字的组合。",
   "settings.floating.hotkeyConflict":
     "该快捷键已被其他应用占用，无法注册。设置已保存，但此快捷键尚未生效。",
+  "settings.floating.modelLabel": "浮动窗口模型",
+  "settings.floating.modelSame": "与当前模型相同",
+  "settings.floating.modelAria": "浮动窗口模型",
+  "settings.floating.modelEmpty": "没有已安装的模型。",
+  "settings.floating.modelNote":
+    "为减轻常驻引擎的负担，请选择小模型（如 0.8B）。选择专用模型后，将使用该模型常驻运行。",
   "settings.floating.adminNote": "无法从以管理员权限运行的应用中获取所选文本。",
   "settings.floating.saveFailed": "无法保存设置：{detail}",
 
   "settings.backgroundHeading": "后台运行",
   "settings.background.enable": "关闭窗口后仍驻留在系统托盘",
-  "settings.background.keepEngine": "在后台保持引擎运行",
-  "settings.background.keepEngineNote":
-    "关闭（默认）时，关闭窗口会释放模型占用的内存，下次翻译时自动重新加载。",
+  "settings.background.residentEngine": "保持浮动窗口引擎常驻运行（选择专用模型时）",
+  "settings.background.residentEngineNote":
+    "保持翻译窗口用的小模型处于加载状态。关闭后，每次使用时都会重新加载模型。",
+  "settings.background.residentEngineNeedsModel":
+    "选择浮动窗口模型后即可常驻运行。未选择时，每次使用都会重新加载模型。",
   "settings.background.quitNote": "退出应用请使用托盘图标菜单中的“退出”。",
   "settings.background.disabledNote": "不驻留时，关闭主窗口即退出应用。",
   "settings.background.saveFailed": "无法保存设置：{detail}",

@@ -4,13 +4,21 @@
 //! (`engine`)、言語検出 (`detect`)、設定の永続化 (`settings`) を持ち、
 //! `commands` がフロントエンドとの IPC を束ねる。
 //!
+//! # エンジン (2 インスタンス)
+//!
+//! llama-server はメイン画面用とフローティング用で 2 つ持つ。
+//!
+//! - メイン用: 選択中のモデル。オンデマンドで起動し、メイン画面を閉じたら止める
+//!   (大型モデルの VRAM を解放する)。
+//! - フローティング用: フローティング専用モデル。`background.resident_engine`
+//!   (既定 ON) ならアプリ起動中ずっと起動しておく。ホットキー翻訳のたびに
+//!   モデルを読み込む待ち時間をなくすのが目的。
+//!
 //! # トレイ常駐 (バックグラウンド実行)
 //!
 //! `settings.background.enabled` (既定 true) が有効なとき、メイン画面を閉じても
 //! プロセスは終了せずトレイに常駐する (`tray`)。アプリの終了はトレイメニューの
-//! 「終了」だけ。バックグラウンド化したときは、`background.keep_engine` が false
-//! (既定) なら llama-server を止めて VRAM / メモリを解放し、次に使うときに
-//! 起動し直す。
+//! 「終了」だけ。
 
 pub mod catalog;
 pub mod commands;
@@ -27,7 +35,7 @@ pub mod updater;
 use tauri::{Emitter, Manager};
 
 use crate::commands::JobManager;
-use crate::engine::Engine;
+use crate::engine::{Engine, EngineRole};
 use crate::floating::FloatingState;
 use crate::installer::DownloadManager;
 use crate::settings::SettingsStore;
@@ -41,12 +49,25 @@ const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Tauri が管理する共有状態。
 pub struct AppState {
+    /// メイン画面用エンジン (選択中のモデル、オンデマンド)。
     pub engine: Engine,
+    /// フローティングウィンドウ用エンジン (専用モデル、常時起動できる)。
+    pub floating_engine: Engine,
     pub settings: SettingsStore,
     pub jobs: JobManager,
     pub downloads: DownloadManager,
     pub updates: UpdateState,
     pub floating: FloatingState,
+}
+
+impl AppState {
+    /// 役割に対応するエンジン。呼び出し側が「どちらを操作するか」を明示する。
+    pub fn engine_for(&self, role: EngineRole) -> &Engine {
+        match role {
+            EngineRole::Main => &self.engine,
+            EngineRole::Floating => &self.floating_engine,
+        }
+    }
 }
 
 pub fn run() {
@@ -82,12 +103,14 @@ pub fn run() {
                 None => eprintln!("設定ファイル: 永続化なし (メモリ内のみ)"),
             }
 
-            let engine = Engine::new(app.handle().clone());
+            let engine = Engine::new(app.handle().clone(), EngineRole::Main);
+            let floating_engine = Engine::new(app.handle().clone(), EngineRole::Floating);
             let initial = settings.get();
             // 中断されたアップデートの残骸を起動時に掃除する。
             updater::clean_cache(app.handle());
             app.manage(AppState {
                 engine: engine.clone(),
+                floating_engine: floating_engine.clone(),
                 settings,
                 jobs: JobManager::new(),
                 downloads: DownloadManager::new(),
@@ -109,10 +132,24 @@ pub fn run() {
                 eprintln!("トレイを用意できません: {}", error.fallback);
             }
 
-            // 起動と同時に llama-server を起こす。準備できるまで UI には starting が見える。
+            // 起動と同時にメイン用 llama-server を起こす。準備できるまで UI には
+            // starting が見える (起動直後はメイン画面が表示される)。
+            let main_settings = initial.clone();
             tauri::async_runtime::spawn(async move {
-                engine.start(&initial).await;
+                engine.start(&main_settings).await;
             });
+
+            // フローティング用は「専用モデルを選んで常時起動が有効」なときだけ
+            // 先に起こす。未指定のまま起こすとアクティブモデルの二重ロードに
+            // なるため (CR4-1)、従来どおりオンデマンドに任せる。
+            if initial.floating_engine_resident()
+                && engine::can_resolve(EngineRole::Floating, &initial, app.handle())
+            {
+                let settings = initial.clone();
+                tauri::async_runtime::spawn(async move {
+                    floating_engine.start(&settings).await;
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -154,23 +191,25 @@ pub fn run() {
         tauri::RunEvent::ExitRequested {
             code: None, api, ..
         } => {
-            stop_engine(app_handle);
             let can_restore = app_handle
                 .get_webview_window(floating::MAIN_LABEL)
                 .is_some();
             if floating::background_enabled(app_handle) && can_restore {
+                // トレイ常駐を続ける。エンジンは触らない (メイン用は hide 時に
+                // 停止済み、フローティング用は常駐設定に従う)。
                 api.prevent_exit();
             } else {
-                // 子プロセスを止めたら、Tauri/wry の後片付けに進まずプロセスを終える。
-                // WebView2 の破棄が戻らずアプリが残ることがあるための安全策で、
-                // 通常の終了は 1 秒ほどで終わる。
+                // 終了するときだけ子プロセスを止め、Tauri/wry の後片付けに進まず
+                // プロセスを終える。WebView2 の破棄が戻らずアプリが残ることが
+                // あるための安全策で、通常の終了は 1 秒ほどで終わる。
+                stop_engines(app_handle);
                 std::process::exit(0);
             }
         }
         // プログラム側からの終了要求 (トレイの「終了」= code あり) や Exit では
         // 子プロセスだけ止める。
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            stop_engine(app_handle);
+            stop_engines(app_handle);
         }
         _ => {}
     });
@@ -178,7 +217,7 @@ pub fn run() {
 
 /// メインウィンドウを表示して前面に出す。トレイと二重起動の通知から呼ぶ。
 ///
-/// バックグラウンド化で止めていたエンジンもここで起こす (起動完了は待たない)。
+/// バックグラウンド化で止めていたメイン用エンジンもここで起こす (起動完了は待たない)。
 pub fn show_main(app_handle: &tauri::AppHandle) {
     let Some(window) = app_handle.get_webview_window(floating::MAIN_LABEL) else {
         eprintln!("メインウィンドウが見つかりません");
@@ -191,7 +230,7 @@ pub fn show_main(app_handle: &tauri::AppHandle) {
     if let Err(error) = window.set_focus() {
         eprintln!("メインウィンドウにフォーカスできません: {error}");
     }
-    ensure_engine_started(app_handle);
+    ensure_engine_started(app_handle, EngineRole::Main);
 }
 
 /// メイン画面へ「設定画面を開く」を依頼する (トレイの「設定」)。
@@ -209,7 +248,7 @@ pub fn request_settings_view(app_handle: &tauri::AppHandle) {
 pub fn quit(app_handle: &tauri::AppHandle) {
     // 通知領域にアイコンを残さないよう、終了前にトレイを片付ける。
     tray::destroy(app_handle);
-    stop_engine(app_handle);
+    stop_engines(app_handle);
     app_handle.exit(0);
     // WebView2 の破棄が戻らずプロセスが残ることがあるため、猶予後に確実に終える。
     // (エンジンは停止済みで、Job Object もプロセス終了で閉じる)
@@ -219,24 +258,30 @@ pub fn quit(app_handle: &tauri::AppHandle) {
     });
 }
 
-/// エンジンが止まっていれば起こす。準備完了は待たずに戻る。
+/// 指定した役割のエンジンが止まっていれば起こす。準備完了は待たずに戻る。
 ///
 /// バックグラウンド化で止めたエンジンを、メインの再表示やホットキー発火で
 /// 読み込み直すための入口。進み具合は `engine:status` で全ウィンドウへ流れる。
-pub(crate) fn ensure_engine_started(app_handle: &tauri::AppHandle) {
+pub(crate) fn ensure_engine_started(app_handle: &tauri::AppHandle, role: EngineRole) {
     let Some(state) = app_handle.try_state::<AppState>() else {
         return;
     };
-    let engine = state.engine.clone();
+    let engine = state.engine_for(role).clone();
     let settings = state.settings.get();
     tauri::async_runtime::spawn(async move {
         engine.ensure_started(&settings).await;
     });
 }
 
-/// llama-server を確実に止める。二重に呼ばれても安全。
-pub(crate) fn stop_engine(app_handle: &tauri::AppHandle) {
+/// 指定した役割の llama-server を確実に止める。二重に呼ばれても安全。
+pub(crate) fn stop_engine(app_handle: &tauri::AppHandle, role: EngineRole) {
     if let Some(state) = app_handle.try_state::<AppState>() {
-        state.engine.kill_now();
+        state.engine_for(role).kill_now();
     }
+}
+
+/// 両方の llama-server を止める (終了時)。二重に呼ばれても安全。
+pub(crate) fn stop_engines(app_handle: &tauri::AppHandle) {
+    stop_engine(app_handle, EngineRole::Main);
+    stop_engine(app_handle, EngineRole::Floating);
 }

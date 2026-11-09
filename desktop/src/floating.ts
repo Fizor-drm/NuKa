@@ -337,8 +337,9 @@ async function refreshAppearance(): Promise<void> {
     // 設定が読めなくても翻訳は続ける。
   }
   // エンジンはバックグラウンドで止められていることがある。状態を取り直す。
+  // メイン画面用とは別インスタンスなので、フローティング用の role を指定する。
   try {
-    const status = await ipc.getEngineStatus();
+    const status = await ipc.getEngineStatus("floating");
     setEnginePhase(status.state);
   } catch {
     // エンジンの状態が読めなくても翻訳は続ける。
@@ -577,8 +578,12 @@ function bindEvents(): void {
   onFloatingCapture((payload) => {
     void handleCapture(payload);
   });
-  // バックグラウンドで止めたエンジンの起動状況は全ウィンドウに届く。
+  // エンジンの起動状況は全ウィンドウに届く。メイン画面用の status は無視し、
+  // フローティング用の status だけを反映する (role 省略時は main 扱い)。
   onEngineStatus((status) => {
+    if (status.role !== "floating") {
+      return;
+    }
     setEnginePhase(status.state);
   });
   onTranslationProgress((payload) => {

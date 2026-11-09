@@ -63,7 +63,7 @@ pub struct InstalledModel {
 /// フローティング翻訳ウィンドウ (Phase 1) の設定。
 ///
 /// `#[serde(default)]` を付けてあるので、古い settings.json にこの項目が無くても
-/// 既定 (有効 / Ctrl+Shift+T) で読み込める。
+/// 既定 (有効 / Ctrl+Shift+T / 専用モデルなし) で読み込める。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FloatingWindowSettings {
@@ -71,6 +71,11 @@ pub struct FloatingWindowSettings {
     pub enabled: bool,
     /// ホットキー。Ctrl / Alt / Shift + 英数字 1 文字。
     pub hotkey: String,
+    /// フローティング用エンジンが使うモデル (`installed_models` の file)。
+    ///
+    /// `None` ならアクティブモデルと同じ (従来動作)。小型モデルを指定すると、
+    /// 常時起動しても VRAM を抑えられる。
+    pub model: Option<String>,
 }
 
 impl Default for FloatingWindowSettings {
@@ -78,6 +83,7 @@ impl Default for FloatingWindowSettings {
         Self {
             enabled: true,
             hotkey: crate::floating::DEFAULT_HOTKEY.to_string(),
+            model: None,
         }
     }
 }
@@ -85,24 +91,27 @@ impl Default for FloatingWindowSettings {
 /// バックグラウンド実行 (トレイ常駐) の設定。
 ///
 /// `#[serde(default)]` を付けてあるので、古い settings.json にこの項目が無くても
-/// 既定 (常駐する / エンジンは止める) で読み込める。
+/// 既定 (常駐する / フローティング用エンジンは常時起動) で読み込める。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BackgroundSettings {
     /// メイン画面を閉じてもプロセスを残し、トレイに常駐するか。
     pub enabled: bool,
-    /// バックグラウンド化しても llama-server を止めないか。
+    /// フローティング用エンジンを、アプリ起動中ずっと起動しておくか。
     ///
-    /// 既定は false (止める)。止めるとモデルの VRAM / メモリが解放され、
-    /// 次に翻訳するときに自動で読み込み直す。
-    pub keep_engine: bool,
+    /// 既定は true。ただし実際に常時起動するのは「フローティング専用モデル」が
+    /// 選ばれているときだけ (`floating_engine_resident`)。未指定ならアクティブ
+    /// モデルの二重ロードを避けるためオンデマンドになる。メイン用エンジンは
+    /// 大型モデルを使うため、この設定に関わらずメイン画面を閉じたら止める
+    /// (VRAM の解放は現行どおり)。
+    pub resident_engine: bool,
 }
 
 impl Default for BackgroundSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            keep_engine: false,
+            resident_engine: true,
         }
     }
 }
@@ -162,16 +171,36 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// フローティング用エンジンを常時起動する設定か。
+    ///
+    /// **フローティング専用モデル (`floating_window.model`) が選ばれていること**が
+    /// 条件。未指定のまま常時起動すると、アクティブモデルをメイン用と二重に
+    /// 読み込んで VRAM を倍使いするため、その場合は従来どおりオンデマンドにする。
+    ///
+    /// トレイ常駐 (`background.enabled`) を切っているときは「起動中ずっと」の
+    /// 意味が無いので含める。
+    ///
+    /// この predicate が常時起動の唯一の判定。起動・設定変更・メイン非表示・
+    /// フローティング終了のすべての経路でここを使う。
+    pub fn floating_engine_resident(&self) -> bool {
+        self.background.enabled
+            && self.background.resident_engine
+            && self.floating_window.enabled
+            && self.floating_window.model.is_some()
+    }
+}
+
 /// `set_settings` が受けるバックグラウンド設定の差分。
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct BackgroundSettingsPatch {
     pub enabled: Option<bool>,
-    pub keep_engine: Option<bool>,
+    pub resident_engine: Option<bool>,
 }
 
 impl BackgroundSettingsPatch {
     fn is_empty(self) -> bool {
-        self.enabled.is_none() && self.keep_engine.is_none()
+        self.enabled.is_none() && self.resident_engine.is_none()
     }
 }
 
@@ -260,8 +289,8 @@ impl SettingsStore {
                 if let Some(enabled) = background.enabled {
                     settings.background.enabled = enabled;
                 }
-                if let Some(keep_engine) = background.keep_engine {
-                    settings.background.keep_engine = keep_engine;
+                if let Some(resident) = background.resident_engine {
+                    settings.background.resident_engine = resident;
                 }
             }
             Ok(())
@@ -331,6 +360,11 @@ fn sanitize(settings: &mut Settings) {
     settings.server_path = settings.server_path.take().and_then(normalize_optional);
     settings.models_dir = settings.models_dir.take().and_then(normalize_optional);
     settings.active_model = settings.active_model.take().and_then(normalize_optional);
+    settings.floating_window.model = settings
+        .floating_window
+        .model
+        .take()
+        .and_then(normalize_optional);
     settings.installed_runtime = settings.installed_runtime.take().and_then(|mut runtime| {
         runtime.server_path = normalize_optional(runtime.server_path)?;
         Some(runtime)
@@ -722,6 +756,8 @@ mod tests {
             settings.floating_window.hotkey,
             crate::floating::DEFAULT_HOTKEY
         );
+        // 専用モデルの既定は None = アクティブモデルと同じ (従来動作)。
+        assert!(settings.floating_window.model.is_none());
     }
 
     #[test]
@@ -733,12 +769,76 @@ mod tests {
             .update(|settings| {
                 settings.floating_window.enabled = false;
                 settings.floating_window.hotkey = "Ctrl+Alt+K".to_string();
+                settings.floating_window.model =
+                    Some("plamo-3-translate-0.8b-Q2_K.gguf".to_string());
                 Ok(())
             })
             .expect("フローティング設定を保存できる");
         assert!(!updated.floating_window.enabled);
         assert_eq!(updated.floating_window.hotkey, "Ctrl+Alt+K");
+        assert_eq!(
+            updated.floating_window.model.as_deref(),
+            Some("plamo-3-translate-0.8b-Q2_K.gguf")
+        );
         assert_eq!(SettingsStore::new(path).get(), updated);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn floating_model_can_be_cleared_and_blank_values_are_dropped_on_load() {
+        let directory = temp_dir("floating-model-clear");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        store
+            .update(|settings| {
+                settings.floating_window.model =
+                    Some("plamo-3-translate-2b-Q4_K_M.gguf".to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert!(SettingsStore::new(path.clone())
+            .get()
+            .floating_window
+            .model
+            .is_some());
+
+        // 空文字を保存すると「アクティブモデルと同じ」(None) に戻る。
+        store
+            .update(|settings| {
+                settings.floating_window.model = None;
+                Ok(())
+            })
+            .unwrap();
+        assert!(SettingsStore::new(path.clone())
+            .get()
+            .floating_window
+            .model
+            .is_none());
+
+        // 手編集で空白だけになっていたら None に正規化する。
+        fs::write(
+            &path,
+            r#"{"floating_window":{"enabled":true,"hotkey":"Ctrl+Shift+T","model":"   "}}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert!(settings.floating_window.model.is_none());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn settings_without_a_floating_model_stay_compatible() {
+        // 1.3.2 以前の settings.json (floating_window.model が無い) を読む想定。
+        let directory = temp_dir("floating-model-missing");
+        let path = directory.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"floating_window":{"enabled":false,"hotkey":"Ctrl+Alt+C"}}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert!(!settings.floating_window.enabled);
+        assert!(settings.floating_window.model.is_none());
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -775,9 +875,35 @@ mod tests {
     #[test]
     fn background_defaults_match_the_contract() {
         let settings = Settings::default();
-        // 既定は「トレイに常駐する」「エンジンは止める (超軽量)」。
+        // 既定は「トレイに常駐する」「フローティング用エンジンは常時起動」。
         assert!(settings.background.enabled);
-        assert!(!settings.background.keep_engine);
+        assert!(settings.background.resident_engine);
+    }
+
+    #[test]
+    fn resident_engine_requires_a_dedicated_floating_model() {
+        // CR4-1: 専用モデルが無いのに常時起動すると、アクティブモデルを
+        // メイン用と二重に読み込む。既定 (model=None) では常駐しない。
+        let mut settings = Settings::default();
+        assert!(!settings.floating_engine_resident());
+
+        settings.floating_window.model = Some("plamo-3-translate-0.8b-Q2_K.gguf".to_string());
+        assert!(settings.floating_engine_resident());
+
+        // どれか 1 つでも欠ければ常駐しない (単一 predicate)。
+        settings.floating_window.enabled = false;
+        assert!(!settings.floating_engine_resident());
+        settings.floating_window.enabled = true;
+
+        settings.background.resident_engine = false;
+        assert!(!settings.floating_engine_resident());
+        settings.background.resident_engine = true;
+
+        settings.background.enabled = false;
+        assert!(!settings.floating_engine_resident());
+        settings.background.enabled = true;
+
+        assert!(settings.floating_engine_resident());
     }
 
     #[test]
@@ -790,13 +916,13 @@ mod tests {
             .apply(SettingsPatch {
                 background: Some(BackgroundSettingsPatch {
                     enabled: Some(false),
-                    keep_engine: Some(true),
+                    resident_engine: Some(false),
                 }),
                 ..Default::default()
             })
             .expect("バックグラウンド設定を保存できる");
         assert!(!updated.background.enabled);
-        assert!(updated.background.keep_engine);
+        assert!(!updated.background.resident_engine);
         assert_eq!(SettingsStore::new(path.clone()).get(), updated);
 
         // 片方だけの差分は、もう片方の値を保つ。
@@ -804,13 +930,13 @@ mod tests {
             .apply(SettingsPatch {
                 background: Some(BackgroundSettingsPatch {
                     enabled: Some(true),
-                    keep_engine: None,
+                    resident_engine: None,
                 }),
                 ..Default::default()
             })
             .expect("片方だけでも保存できる");
         assert!(updated.background.enabled);
-        assert!(updated.background.keep_engine);
+        assert!(!updated.background.resident_engine);
         assert_eq!(SettingsStore::new(path).get(), updated);
         let _ = fs::remove_dir_all(&directory);
     }
@@ -824,7 +950,7 @@ mod tests {
             .apply(SettingsPatch {
                 background: Some(BackgroundSettingsPatch {
                     enabled: Some(false),
-                    keep_engine: Some(true),
+                    resident_engine: Some(false),
                 }),
                 ..Default::default()
             })
@@ -836,7 +962,7 @@ mod tests {
             })
             .expect("空の差分でも保存できる");
         assert!(!updated.background.enabled);
-        assert!(updated.background.keep_engine);
+        assert!(!updated.background.resident_engine);
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -848,6 +974,36 @@ mod tests {
         fs::write(&path, r#"{"theme":"dark","gpu_layers":12}"#).unwrap();
         let settings = SettingsStore::new(path).get();
         assert_eq!(settings.background, BackgroundSettings::default());
+        assert!(settings.background.resident_engine);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn legacy_keep_engine_is_ignored_and_resident_engine_defaults_on() {
+        // 1.3.2 の settings.json は `background.keep_engine` を持つ。フィールド名を
+        // `resident_engine` に変えたので old キーは未知フィールドとして無視され、
+        // 新しい既定 (常時起動 ON) で読めること。
+        let directory = temp_dir("background-legacy");
+        let path = directory.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"background":{"enabled":true,"keep_engine":true}}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert!(settings.background.enabled);
+        assert!(settings.background.resident_engine);
+
+        // keep_engine = false だった旧設定でも、新既定 (ON) で読み込む。
+        let path = directory.join("settings-off.json");
+        fs::write(
+            &path,
+            r#"{"background":{"enabled":false,"keep_engine":false}}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path).get();
+        assert!(!settings.background.enabled);
+        assert!(settings.background.resident_engine);
         let _ = fs::remove_dir_all(&directory);
     }
 }

@@ -736,6 +736,63 @@
                     キーを押して記録
                   </span>
                 </div>
+                <div class="settings-field">
+                  <span class="settings-label" data-i18n="settings.floating.modelLabel">
+                    フローティング用モデル
+                  </span>
+                  <div class="model-picker">
+                    <button
+                      type="button"
+                      class="model-picker-button"
+                      id="floating-model-button"
+                      aria-haspopup="listbox"
+                      aria-expanded="false"
+                      aria-controls="floating-model-list"
+                    >
+                      <span class="lang-button-label" id="floating-model-label">
+                        アクティブモデルと同じ
+                      </span>
+                      <svg
+                        class="icon lang-button-chevron"
+                        viewBox="0 0 24 24"
+                        width="14"
+                        height="14"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                        focusable="false"
+                      >
+                        <path d="m6 9 6 6 6-6" />
+                      </svg>
+                    </button>
+                    <div
+                      class="lang-popover model-picker-popover"
+                      id="floating-model-popover"
+                      hidden
+                    >
+                      <ul
+                        class="lang-list"
+                        id="floating-model-list"
+                        role="listbox"
+                        data-i18n-aria-label="settings.floating.modelAria"
+                      ></ul>
+                      <p
+                        class="lang-empty"
+                        id="floating-model-empty"
+                        data-i18n="settings.floating.modelEmpty"
+                        hidden
+                      >
+                        インストール済みのモデルがありません。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <p class="settings-muted" data-i18n="settings.floating.modelNote">
+                  常時起動を軽くするには、小型モデル (0.8B など) を選んでください。専用モデルを選ぶと、そのモデルで常時起動します。
+                </p>
                 <p class="settings-note" id="floating-hotkey-usage"></p>
                 <p class="settings-error" id="floating-hotkey-error" role="status" hidden></p>
                 <p class="settings-muted" data-i18n="settings.floating.adminNote">
@@ -776,13 +833,16 @@
                   常駐しない場合、メイン画面を閉じるとアプリが終了します。
                 </p>
                 <label class="settings-check">
-                  <input type="checkbox" id="background-keep-engine" />
-                  <span data-i18n="settings.background.keepEngine">
-                    バックグラウンドでもエンジンを動かしたままにする
+                  <input type="checkbox" id="background-resident-engine" />
+                  <span data-i18n="settings.background.residentEngine">
+                    フローティング用エンジンを常時起動しておく
                   </span>
                 </label>
-                <p class="settings-muted" data-i18n="settings.background.keepEngineNote">
-                  オフ (既定) にすると、閉じたときにモデルをメモリから解放します。次に使うときに自動で読み込み直します。
+                <p
+                  class="settings-muted"
+                  id="background-resident-engine-note"
+                >
+                  翻訳ウィンドウ用の小型モデルを起動したままにします。オフにすると、使うたびにモデルを読み込み直します。
                 </p>
                 <p class="settings-error" id="background-error" role="status" hidden></p>
               </section>
