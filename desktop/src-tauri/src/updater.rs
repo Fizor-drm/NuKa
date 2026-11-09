@@ -23,7 +23,6 @@ use tokio::io::AsyncWriteExt;
 use crate::engine::{Engine, EnginePhase};
 use crate::installer::DownloadManager;
 use crate::message::{text, LocalizedText};
-use crate::settings::SettingsStore;
 
 pub const REPO: &str = "Fizor-drm/NuKa";
 pub const RELEASES_URL: &str = "https://github.com/Fizor-drm/NuKa/releases/latest";
@@ -805,7 +804,6 @@ pub fn install(
     state: &UpdateState,
     engine: &Engine,
     floating_engine: &Engine,
-    settings: &SettingsStore,
 ) -> Result<(), LocalizedText> {
     // take() で消費し、二重起動を防ぐ。起動に失敗したときだけ戻す。
     let downloaded = {
@@ -877,11 +875,8 @@ pub fn install(
         Ok(child) => child,
         Err(error) => {
             if engine_was_ready {
-                let engine = engine.clone();
-                let settings = settings.get();
-                tauri::async_runtime::spawn(async move {
-                    engine.start(&settings).await;
-                });
+                // 起動入口を統一し、起動完了後の常駐ポリシー再同期も通す (M1)。
+                crate::commands::start_engine_with_sync(app, crate::engine::EngineRole::Main, true);
             }
             return restore(
                 text(
@@ -893,6 +888,10 @@ pub fn install(
         }
     };
     let pid = child.id();
+    // ここから先はプロセス終了まで戻らない。pending の同期 ticket やホットキー
+    // 由来の起動要求がエンジンを復活させないよう、終了状態にしてから止める
+    // (Medium 2)。
+    crate::commands::begin_shutdown(app);
     // インストーラーの起動まで成功したので、終了前に常駐中のフローティング用も
     // 止める (残プロセスを残さない)。検証・spawn の失敗時は止めない (L-1)。
     floating_engine.kill_now();

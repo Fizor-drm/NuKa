@@ -9,10 +9,12 @@
 //! llama-server はメイン画面用とフローティング用で 2 つ持つ。
 //!
 //! - メイン用: 選択中のモデル。オンデマンドで起動し、メイン画面を閉じたら止める
-//!   (大型モデルの VRAM を解放する)。
+//!   (大型モデルの VRAM を解放する)。ただし共有モデルで常時起動が ON のときは、
+//!   フローティング翻訳を担う 1 本として維持する (`engine::resident_target`)。
 //! - フローティング用: フローティング専用モデル。`background.resident_engine`
 //!   (既定 ON) ならアプリ起動中ずっと起動しておく。ホットキー翻訳のたびに
-//!   モデルを読み込む待ち時間をなくすのが目的。
+//!   モデルを読み込む待ち時間をなくすのが目的。専用モデルがアクティブモデルと
+//!   同じファイルなら 2 本目は起こさず、メイン用を共有する。
 //!
 //! # トレイ常駐 (バックグラウンド実行)
 //!
@@ -53,6 +55,11 @@ pub struct AppState {
     pub engine: Engine,
     /// フローティングウィンドウ用エンジン (専用モデル、常時起動できる)。
     pub floating_engine: Engine,
+    /// ジョブ受け付けとエンジンの停止/再起動を直列化する制御ロック。
+    ///
+    /// 設定変更で予約された停止/再起動と翻訳ジョブの受け付けが競合して、
+    /// 新しいジョブのエンジンを止めてしまわないようにする (H1)。
+    pub engine_control: commands::EngineControl,
     pub settings: SettingsStore,
     pub jobs: JobManager,
     pub downloads: DownloadManager,
@@ -109,8 +116,9 @@ pub fn run() {
             // 中断されたアップデートの残骸を起動時に掃除する。
             updater::clean_cache(app.handle());
             app.manage(AppState {
-                engine: engine.clone(),
-                floating_engine: floating_engine.clone(),
+                engine,
+                floating_engine,
+                engine_control: commands::EngineControl::default(),
                 settings,
                 jobs: JobManager::new(),
                 downloads: DownloadManager::new(),
@@ -134,21 +142,18 @@ pub fn run() {
 
             // 起動と同時にメイン用 llama-server を起こす。準備できるまで UI には
             // starting が見える (起動直後はメイン画面が表示される)。
-            let main_settings = initial.clone();
-            tauri::async_runtime::spawn(async move {
-                engine.start(&main_settings).await;
-            });
+            // 起動完了後の再同期も含めた統一経路を通す (M1)。
+            commands::start_engine_with_sync(app.handle(), EngineRole::Main, false);
 
             // フローティング用は「専用モデルを選んで常時起動が有効」なときだけ
             // 先に起こす。専用モデル未指定や、解決モデルがメイン用と同一のときは
-            // 二重ロードを避けてメイン用エンジンへ相乗りする (CR4-1 / High)。
+            // 2 本目を起こさない (共有時はメイン用 1 本を常駐として維持する)。
+            // 判定は `engine::should_run_floating_engine` → `resident_target` の
+            // 1 か所に集約する。
             if engine::should_run_floating_engine(&initial, &engine::exe_directory())
                 && engine::can_resolve(EngineRole::Floating, &initial, app.handle())
             {
-                let settings = initial.clone();
-                tauri::async_runtime::spawn(async move {
-                    floating_engine.start(&settings).await;
-                });
+                commands::start_engine_with_sync(app.handle(), EngineRole::Floating, false);
             }
             Ok(())
         })
@@ -223,10 +228,15 @@ pub fn show_main(app_handle: &tauri::AppHandle) {
         eprintln!("メインウィンドウが見つかりません");
         return;
     };
+    // 可視性の変化を制御境界へ知らせ、変更前の可視性スナップショットを持つ
+    // 同期 ticket を無効化する (Medium 2)。表示完了後にもう一度進め、表示中の
+    // 状態変更を確定させる。
+    commands::invalidate_engine_sync(app_handle);
     let _ = window.unminimize();
     if let Err(error) = window.show() {
         eprintln!("メインウィンドウを表示できません: {error}");
     }
+    commands::invalidate_engine_sync(app_handle);
     if let Err(error) = window.set_focus() {
         eprintln!("メインウィンドウにフォーカスできません: {error}");
     }
@@ -263,17 +273,10 @@ pub fn quit(app_handle: &tauri::AppHandle) {
 /// バックグラウンド化で止めたエンジンを、メインの再表示やホットキー発火で
 /// 読み込み直すための入口。実際に起こすのは `engine::serving_role` が決めた
 /// エンジン (解決モデルが同一ならメイン用を共有する)。進み具合は
-/// `engine:status` で全ウィンドウへ流れる。
+/// `engine:status` で全ウィンドウへ流れる。起動完了後の再同期も統一経路で行う
+/// (M1)。
 pub(crate) fn ensure_engine_started(app_handle: &tauri::AppHandle, requested: EngineRole) {
-    let Some(state) = app_handle.try_state::<AppState>() else {
-        return;
-    };
-    let settings = state.settings.get();
-    let role = engine::serving_role(requested, &settings, &engine::exe_directory());
-    let engine = state.engine_for(role).clone();
-    tauri::async_runtime::spawn(async move {
-        engine.ensure_started(&settings).await;
-    });
+    commands::start_engine_requested(app_handle, requested);
 }
 
 /// 指定した役割の llama-server を確実に止める。二重に呼ばれても安全。
@@ -284,7 +287,11 @@ pub(crate) fn stop_engine(app_handle: &tauri::AppHandle, role: EngineRole) {
 }
 
 /// 両方の llama-server を止める (終了時)。二重に呼ばれても安全。
+///
+/// 終了処理の開始を制御境界へ記録し、以後の起動予約 (pending の同期 ticket や
+/// ホットキー由来の起動) を拒否してから止める (Medium 2)。
 pub(crate) fn stop_engines(app_handle: &tauri::AppHandle) {
+    commands::begin_shutdown(app_handle);
     stop_engine(app_handle, EngineRole::Main);
     stop_engine(app_handle, EngineRole::Floating);
 }

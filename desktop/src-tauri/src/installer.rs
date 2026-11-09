@@ -536,6 +536,8 @@ where
 /// llama.cpp の 2 つの zip をダウンロードして展開し、検証して記録する。
 ///
 /// 実行中の `llama-server.exe` は Windows でロックされるため、先にエンジンを止める。
+/// 再起動はここでは行わない。呼び出し側 (commands::install_runtime) が常駐/表示
+/// ポリシーに従って復元する (M1: 直接 start してポリシーを無視しない)。
 pub async fn install_runtime(
     app: &AppHandle,
     settings: &SettingsStore,
@@ -551,8 +553,6 @@ pub async fn install_runtime(
     match result {
         Ok(runtime) => {
             emit_done(app, KIND, ID);
-            // 新しいランタイム (またはまだ何も無い状態) で状態を作り直す。
-            engine.start(&settings.get()).await;
             Ok(runtime)
         }
         Err(error) => {
@@ -562,8 +562,6 @@ pub async fn install_runtime(
                 message.fallback
             );
             emit_error(app, KIND, ID, &message);
-            // 既存のランタイムが残っていればそれで戻す。無ければ未導入のエラー状態。
-            engine.start(&settings.get()).await;
             Err(message)
         }
     }

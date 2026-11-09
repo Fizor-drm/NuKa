@@ -30,6 +30,7 @@
 //! 復元しない (取得した選択テキストがクリップボードに残る)。クリップボードの
 //! 形式を完全に保存・復元するには Phase 1 の範囲を超えるため、README にも明記する。
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -120,9 +121,17 @@ fn elapsed_label() -> String {
 
 /// デバッグ用ログ。リリースビルドでは何も出さない
 /// (`NUKA_FLOATING_DEBUG=1` を設定したときだけ出す)。
+///
+/// stderr が閉じられている環境 (E2E ランチャーがパイプを閉じる等) でも
+/// 書き込み失敗でパニックしないよう、`eprintln!` ではなく結果を捨てる
+/// `writeln!` を使う。
 fn debug_log(message: impl std::fmt::Display) {
     if cfg!(debug_assertions) || std::env::var_os("NUKA_FLOATING_DEBUG").is_some() {
-        eprintln!("[floating {}] {message}", elapsed_label());
+        let _ = writeln!(
+            std::io::stderr(),
+            "[floating {}] {message}",
+            elapsed_label()
+        );
     }
 }
 
@@ -258,7 +267,10 @@ impl FloatingState {
         self.shown.store(shown, Ordering::SeqCst);
     }
 
-    fn is_shown(&self) -> bool {
+    /// フローティングウィンドウを表示中か (hide 済みなら false)。
+    ///
+    /// 常駐ポリシーの再同期が「表示中の翻訳に使うエンジンを止めない」判定に使う。
+    pub(crate) fn is_shown(&self) -> bool {
         self.shown.load(Ordering::SeqCst)
     }
 
@@ -862,27 +874,39 @@ enum Reclaim {
 ///   このときエンジンは 1 つ (メイン用) だけなので、「フローティング用だけ止める」
 ///   という選択肢はない。メイン画面が見えている・どちらかの翻訳が動いている間は
 ///   止めず、誰も使っていないときだけ止める。
-/// - `resident`: `engine::should_run_floating_engine` (別モデルの常時起動)。
-///   フローティング用は残し、メイン用だけを「メインが隠れていて暇」なときに止める。
+/// - `resident`: 常駐ポリシー ([`crate::engine::resident_target`]) の保持先。
+///   保持先がフローティング用ならフローティング用を残し、メイン用だけを
+///   「メインが隠れていて暇」なときに止める。
 /// - どちらでもない: フローティング用を (翻訳中を除き) 止め、メイン用も
 ///   非表示かつ暇なら止める。
+///
+/// 共有時も、保持先がメイン用 (`resident = Some(Main)`) ならメイン用を維持する。
+/// 「常駐 ON なのにフローティングを閉じるたびにメイン用まで止まる」不具合の修正で、
+/// 共有と常駐は排他ではない (案A)。
 fn decide_reclaim(
     shared: bool,
-    resident: bool,
+    resident: Option<EngineRole>,
     main_visible: bool,
     main_busy: bool,
     floating_busy: bool,
 ) -> Reclaim {
+    let keep_main = resident == Some(EngineRole::Main);
+    let keep_floating = resident == Some(EngineRole::Floating);
     if shared {
         // 共有エンジンはメイン用。floating 側の都合だけで止めない。
         if main_visible || main_busy || floating_busy {
             return Reclaim::KeepAll;
         }
-        return Reclaim::StopBoth;
+        // 常駐の保持先が共有エンジンなら、メイン非表示でも維持する。
+        return if keep_main {
+            Reclaim::StopFloating
+        } else {
+            Reclaim::StopBoth
+        };
     }
     // 常時起動 OFF のときは、訳していないフローティング用を解放する (M-3)。
-    let stop_floating = !resident && !floating_busy;
-    let stop_main = !main_visible && !main_busy;
+    let stop_floating = !keep_floating && !floating_busy;
+    let stop_main = !keep_main && !main_visible && !main_busy;
     match (stop_floating, stop_main) {
         (true, true) => Reclaim::StopBoth,
         (false, true) => Reclaim::StopMain,
@@ -894,10 +918,10 @@ fn decide_reclaim(
 /// バックグラウンドで、訳すものが無くなったエンジンを止める。
 ///
 /// 「閉じたら VRAM を解放する」というバックグラウンド実行の契約を、ホットキー
-/// 経由の起動にも適用する。独立エンジンを常時起動している
-/// (`engine::should_run_floating_engine`) ときはフローティング用を残し、
-/// メイン用だけを解放する。解決モデルが同一で共有しているときは、メイン用を
-/// 使っている間は止めない (`decide_reclaim` の shared 分岐)。
+/// 経由の起動にも適用する。常駐ポリシー ([`crate::engine::resident_target`]) の
+/// 保持先がフローティング用ならそれを残し、メイン用だけを解放する。解決モデルが
+/// 同一で共有しているときも、保持先がメイン用なら維持する
+/// (`decide_reclaim` の shared 分岐)。
 ///
 /// - メイン画面が見えている (通常の利用中) ときは共有エンジンを止めない
 /// - 共有エンジンでメイン/フローティングの翻訳が動いているときも止めない
@@ -906,17 +930,40 @@ fn reclaim_idle_engine(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
-    let settings = state.settings.get();
-    let search_root = crate::engine::exe_directory();
+    // 可視性はメインスレッドへの問い合わせを含むためロック外で読む。読む前後で
+    // 世代を照合し、その間に show/hide が入っていたら、古い可視性で停止せず
+    // 共通の再同期に委ねる (Medium 2)。例えば blur-hide が main_visible=false を
+    // 読んだ直後に show_main が表示 + 起動予約を完了した場合、ここで古い false の
+    // まま Main を止めると、表示中の画面だけエンジンなしになる。
+    let snapshot_epoch = {
+        let control = state.engine_control.lock();
+        control.sync_epoch()
+    };
     let main_visible = app
         .get_webview_window(MAIN_LABEL)
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false);
+    let search_root = crate::engine::exe_directory();
+    // 判断と停止を制御ロック下で行う。新しいジョブの受け付けと直列化され、
+    // 「ジョブが来た直後に停止する」競合を避ける。停止だけなので同期予約の
+    // invalidate はしない (保留中のポリシー変更を失わない)。
+    let control = state.engine_control.lock();
+    if control.sync_epoch() != snapshot_epoch {
+        // 可視性の読み取り後に状態が変わった。古い値で停止せず、最新状態で
+        // 計画し直す (sync_engines_now が新しい ticket を発行する)。
+        drop(control);
+        crate::commands::sync_engines_now(app);
+        return;
+    }
+    // ホットキー記録中の一時的な enabled=false を通常の OFF と混同しない (M3)。
+    let settings = control.effective_settings(state.settings.get());
     let main_busy = state.jobs.has_job_from_other_origin(FLOATING_LABEL);
     let floating_busy = state.jobs.has_running_job_from_origin(FLOATING_LABEL);
+    let resident =
+        crate::engine::resident_target(&settings, &search_root).map(|target| target.role);
     match decide_reclaim(
         crate::engine::models_shared(&settings, &search_root),
-        crate::engine::should_run_floating_engine(&settings, &search_root),
+        resident,
         main_visible,
         main_busy,
         floating_busy,
@@ -988,19 +1035,35 @@ pub(crate) fn background_enabled(app: &AppHandle) -> bool {
         .unwrap_or_else(|| crate::settings::BackgroundSettings::default().enabled)
 }
 
+/// メインを隠したときに維持するエンジン (メイン用, フローティング用)。
+///
+/// 常駐ポリシーの保持先だけを残し、それ以外は `kill_now` で止める。起動処理中の
+/// エンジンも `kill_now` が取り消すため、ここで起動状態を見る必要はない。
+/// 共有モデルで常駐 ON のときはメイン用 1 本を残す (案A)。
+fn decide_hidden_engines(target: Option<EngineRole>) -> (bool, bool) {
+    (
+        target == Some(EngineRole::Main),
+        target == Some(EngineRole::Floating),
+    )
+}
+
 /// メイン画面を閉じたときのバックグラウンド化。
 ///
 /// - メインは破棄せず隠す (プロセスとトレイは残る)
 /// - フローティングが表示中なら一緒に隠す (決定済み)
 /// - メイン由来の翻訳を止める
-/// - メイン用エンジンは常に止める (常時起動の設定に関わらず)。
-///   ここが「超軽量」の本体で、大型モデルの VRAM / メモリを解放する。
-///   解決モデルを共有している場合はこのエンジンがフローティング翻訳も担うが、
-///   メイン非表示で止めるのは 1.3.2 と同じ挙動 (止められたら次のホットキーで
-///   オンデマンドに起動し直す)。
-/// - フローティング用の独立エンジンは `engine::should_run_floating_engine`
-///   (別モデルの常時起動) が成立しているときだけ維持する。
+/// - エンジンは常駐ポリシー ([`crate::engine::resident_target`]) の保持先だけ残す。
+///   - 保持先がメイン用 (共有モデルで常駐 ON): この 1 本を維持する。共有エンジンが
+///     フローティング翻訳も担うため、ここで止めると次のホットキーで読み込み直しに
+///     なる (案A の修正点)。
+///   - 保持先がフローティング用 (専用モデルで常駐 ON): 従来どおりメイン用は止め、
+///     フローティング用を維持する。
+///   - 常駐 OFF: 従来どおり両方止める (大型モデルの VRAM / メモリを解放する)。
 fn hide_main_to_tray(app: &AppHandle) {
+    // 可視性が変わる前に、変更前の可視性スナップショットを持つ同期 ticket を
+    // 無効化する。停止判断より先に効かせ、隠した後に古い visible=true で
+    // 起動予約されるのを防ぐ (Medium 2)。
+    crate::commands::invalidate_engine_sync(app);
     if let Some(window) = app.get_webview_window(MAIN_LABEL) {
         if let Err(error) = window.hide() {
             eprintln!("メインウィンドウを隠せません: {error}");
@@ -1014,14 +1077,28 @@ fn hide_main_to_tray(app: &AppHandle) {
     }
     // 隠した画面の翻訳を裏で続けない。
     state.jobs.cancel_current_for_origin(MAIN_LABEL);
-    let settings = state.settings.get();
-    state.engine.kill_now();
-    debug_log!("main engine stopped (background: VRAM を解放)");
-    if crate::engine::should_run_floating_engine(&settings, &crate::engine::exe_directory()) {
-        debug_log!("floating engine kept (should_run_floating_engine)");
+    // 停止判断と停止を制御ロック下で行う。ここから解放するまで、新しいジョブの
+    // 受け付けや同期の適用は割り込めない。hide 中に予約された同期 ticket も
+    // ここで無効化し、隠した後に古い可視性で起動されないようにする (Medium 2)。
+    let mut control = state.engine_control.lock();
+    control.invalidate_sync();
+    // ホットキー記録中の一時的な enabled=false を通常の OFF と混同しない (M3)。
+    let settings = control.effective_settings(state.settings.get());
+    let target =
+        crate::engine::resident_target(&settings, &crate::engine::exe_directory()).map(|t| t.role);
+    let (keep_main, keep_floating) = decide_hidden_engines(target);
+    if keep_main {
+        // 共有モデルの常駐: フローティング翻訳を担う 1 本を維持する。
+        debug_log!("main engine kept (resident with shared model)");
+    } else {
+        state.engine.kill_now();
+        debug_log!("main engine stopped (background: VRAM を解放)");
+    }
+    if keep_floating {
+        debug_log!("floating engine kept (resident with dedicated model)");
     } else {
         state.floating_engine.kill_now();
-        debug_log!("floating engine stopped (共有モデルまたは常時起動なし)");
+        debug_log!("floating engine stopped (not resident)");
     }
 }
 
@@ -2047,46 +2124,137 @@ mod tests {
 
     #[test]
     fn reclaim_keeps_the_resident_engine_and_frees_the_main_one() {
+        use EngineRole::{Floating, Main};
         use Reclaim::{KeepAll, StopBoth, StopFloating, StopMain};
+
+        let resident = Some(Floating);
 
         // 共有していない場合 (専用モデルあり/常時起動の有無)。
 
         // 常時起動 ON: メインが見えていれば両方残す。隠れていて暇ならメインだけ止める。
-        assert_eq!(decide_reclaim(false, true, true, false, false), KeepAll);
-        assert_eq!(decide_reclaim(false, true, true, true, false), KeepAll);
-        assert_eq!(decide_reclaim(false, true, false, false, false), StopMain);
+        assert_eq!(decide_reclaim(false, resident, true, false, false), KeepAll);
+        assert_eq!(decide_reclaim(false, resident, true, true, false), KeepAll);
+        assert_eq!(
+            decide_reclaim(false, resident, false, false, false),
+            StopMain
+        );
         // メインの翻訳中はメイン用を残す。
-        assert_eq!(decide_reclaim(false, true, false, true, false), KeepAll);
+        assert_eq!(decide_reclaim(false, resident, false, true, false), KeepAll);
 
         // 常時起動 OFF: メインが表示中でもフローティング用は止める (M-3)。
         assert_eq!(
-            decide_reclaim(false, false, true, false, false),
+            decide_reclaim(false, None, true, false, false),
             StopFloating
         );
         assert_eq!(
-            decide_reclaim(false, false, false, true, false),
+            decide_reclaim(false, None, false, true, false),
             StopFloating
         );
         // メインが隠れていて暇なら両方止める (v1.3.2 と同じ)。
-        assert_eq!(decide_reclaim(false, false, false, false, false), StopBoth);
+        assert_eq!(decide_reclaim(false, None, false, false, false), StopBoth);
         // フローティングの翻訳中はフローティング用を止めない。
-        assert_eq!(decide_reclaim(false, false, true, false, true), KeepAll);
-        assert_eq!(decide_reclaim(false, false, false, false, true), StopMain);
+        assert_eq!(decide_reclaim(false, None, true, false, true), KeepAll);
+        assert_eq!(decide_reclaim(false, None, false, false, true), StopMain);
+
+        // 保持先がメイン用になることは共有時だけ (非共有では起こらないが、
+        // 渡されたらメイン用を残す)。
+        assert_eq!(
+            decide_reclaim(false, Some(Main), false, false, false),
+            StopFloating
+        );
+    }
+
+    #[test]
+    fn hiding_main_keeps_only_the_resident_engine() {
+        use EngineRole::{Floating, Main};
+
+        // 常駐 OFF: 従来どおり両方止める (大型モデルの VRAM を解放)。
+        assert_eq!(decide_hidden_engines(None), (false, false));
+        // 専用モデルで常駐 ON: フローティング用だけ残す。
+        assert_eq!(decide_hidden_engines(Some(Floating)), (false, true));
+        // 共有モデルで常駐 ON: メイン用 1 本を残す (ここが不具合の修正点)。
+        assert_eq!(decide_hidden_engines(Some(Main)), (true, false));
+        // 起動処理中でも判断は同じ。残さない側は kill_now が起動も取り消す。
+    }
+
+    #[test]
+    fn a_stale_reclaim_visibility_snapshot_never_stops_a_just_shown_main_engine() {
+        // 監査順序を barrier で固定する:
+        // reclaim が main_visible=false を取得 → show_main が表示 + invalidate +
+        // Main 起動予約 → reclaim 続行。古い可視性で Main を止めず、共通の
+        // 再同期に委ねることを確認する (本番と同じ EngineControl/SyncEpoch を使う)。
+        use std::sync::{Arc, Barrier, Mutex};
+
+        struct FakeEngines {
+            main_starting: bool,
+            main_alive: bool,
+        }
+
+        let control = Arc::new(crate::commands::EngineControl::default());
+        let engines = Arc::new(Mutex::new(FakeEngines {
+            main_starting: false,
+            main_alive: false,
+        }));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let reclaim_control = Arc::clone(&control);
+        let reclaim_engines = Arc::clone(&engines);
+        let reclaim_barrier = Arc::clone(&barrier);
+        let reclaim = std::thread::spawn(move || {
+            // 可視性の前に世代を記録し、「非表示」というスナップショットを読む。
+            let snapshot_epoch = reclaim_control.lock().sync_epoch();
+            let main_visible = false;
+            // show_main の表示 + invalidate + 起動予約を待つ。
+            reclaim_barrier.wait();
+            reclaim_barrier.wait();
+            // 制御ロック取得後に世代を照合する (本番の reclaim と同じ判定)。
+            let control = reclaim_control.lock();
+            if control.sync_epoch() != snapshot_epoch {
+                // 古い可視性で停止しない (共通の再同期に委ねる)。
+                return;
+            }
+            drop(control);
+            if !main_visible {
+                // StopMain 相当。
+                reclaim_engines.lock().expect("engines").main_alive = false;
+            }
+        });
+
+        // show_main 相当: barrier の後に invalidate + Main 起動予約。
+        barrier.wait();
+        control.lock().invalidate_sync();
+        {
+            let mut engines = engines.lock().expect("engines");
+            engines.main_starting = true;
+            engines.main_alive = true;
+        }
+        barrier.wait();
+
+        reclaim.join().expect("reclaim thread");
+        let engines = engines.lock().expect("engines");
+        assert!(engines.main_starting, "Main の起動予約は残る");
+        assert!(engines.main_alive, "表示中の Main を古い可視性で止めない");
     }
 
     #[test]
     fn reclaim_never_stops_a_shared_engine_while_it_is_in_use() {
-        use Reclaim::{KeepAll, StopBoth};
+        use EngineRole::Main;
+        use Reclaim::{KeepAll, StopBoth, StopFloating};
+
+        let resident = Some(Main);
 
         // 共有エンジン (メイン用) は 1 つだけ。floating を閉じただけでは止めない。
-        assert_eq!(decide_reclaim(true, false, true, false, false), KeepAll);
+        assert_eq!(decide_reclaim(true, None, true, false, false), KeepAll);
         // メインの翻訳中・フローティングの翻訳中も止めない。
-        assert_eq!(decide_reclaim(true, false, false, true, false), KeepAll);
-        assert_eq!(decide_reclaim(true, false, false, false, true), KeepAll);
+        assert_eq!(decide_reclaim(true, None, false, true, false), KeepAll);
+        assert_eq!(decide_reclaim(true, None, false, false, true), KeepAll);
         // メインが隠れていて、どちらの翻訳も動いていないときだけ止める。
-        assert_eq!(decide_reclaim(true, false, false, false, false), StopBoth);
-        // 共有時は resident (独立エンジン) の指定より共有を優先する。
-        assert_eq!(decide_reclaim(true, true, true, false, false), KeepAll);
-        assert_eq!(decide_reclaim(true, true, false, false, false), StopBoth);
+        assert_eq!(decide_reclaim(true, None, false, false, false), StopBoth);
+        // 共有でも常駐 ON ならメイン用を 1 本維持する (案A)。
+        assert_eq!(decide_reclaim(true, resident, true, false, false), KeepAll);
+        assert_eq!(
+            decide_reclaim(true, resident, false, false, false),
+            StopFloating
+        );
     }
 }

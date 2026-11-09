@@ -101,9 +101,11 @@ pub struct BackgroundSettings {
     ///
     /// 既定は true。ただし実際に常時起動するのは「フローティング専用モデル」が
     /// 選ばれているときだけ (`floating_engine_resident`)。未指定ならアクティブ
-    /// モデルの二重ロードを避けるためオンデマンドになる。メイン用エンジンは
-    /// 大型モデルを使うため、この設定に関わらずメイン画面を閉じたら止める
-    /// (VRAM の解放は現行どおり)。
+    /// モデルの二重ロードを避けるためオンデマンドになる。専用モデルがアクティブ
+    /// と同じファイルなら 2 本目は起こさず、共有しているメイン用エンジン 1 本を
+    /// 維持する (`engine::resident_target`)。メイン用エンジンは、この設定が ON で
+    /// 共有モデルを保持しているときを除き、メイン画面を閉じたら止める
+    /// (VRAM の解放)。
     pub resident_engine: bool,
 }
 
@@ -181,8 +183,9 @@ impl Settings {
     /// トレイ常駐 (`background.enabled`) を切っているときは「起動中ずっと」の
     /// 意味が無いので含める。
     ///
-    /// この predicate が常時起動の唯一の判定。起動・設定変更・メイン非表示・
-    /// フローティング終了のすべての経路でここを使う。
+    /// この predicate が常時起動の設定条件。保持先 (メイン用 1 本かフローティング
+    /// 用か) の決定は `engine::resident_target` が行い、起動・設定変更・メイン
+    /// 非表示・フローティング終了のすべての経路でそれを使う。
     pub fn floating_engine_resident(&self) -> bool {
         self.background.enabled
             && self.background.resident_engine

@@ -173,6 +173,14 @@ struct Inner {
     status: EngineStatus,
     port: Option<u16>,
     child: Option<Child>,
+    /// 稼働中の子が読み込んだモデル。停止中・起動処理中は `None`。
+    ///
+    /// 設定のモデルが変わったときに「いまの子を起こし直すべきか」を比べるために持つ。
+    model: Option<PathBuf>,
+    /// 予約済みの起動が読み込む予定のモデル。起動処理中だけ `Some`。
+    ///
+    /// 起動完了を待たずに「この起動はどのモデルか」を判定できるようにする。
+    reserved_model: Option<PathBuf>,
     /// llama-server を道連れにする Job Object (Windows のみ意味を持つ)。
     /// このハンドルを閉じると OS が割り当て済みの子プロセスも終了させる。
     job: Option<JobObject>,
@@ -207,6 +215,8 @@ impl Engine {
                 status: EngineStatus::new(role, EnginePhase::Starting, None),
                 port: None,
                 child: None,
+                model: None,
+                reserved_model: None,
                 job: None,
             })),
             http,
@@ -235,6 +245,22 @@ impl Engine {
         self.lock().active_start.is_some()
     }
 
+    /// 稼働中の子プロセスが読み込んでいるモデル (停止中・起動処理中は `None`)。
+    ///
+    /// 設定のモデル変更を反映するとき、いまのエンジンがどのモデルを掴んでいるかを
+    /// 比べるために使う。`has_process` が true でも、起動処理中はまだ `None`。
+    pub fn running_model(&self) -> Option<PathBuf> {
+        self.lock().model.clone()
+    }
+
+    /// 起動処理中に読み込む予定のモデル (停止中・稼働中は `None`)。
+    ///
+    /// 起動完了を待たずに、その起動を続けてよいか (設定のモデルと一致するか) を
+    /// 判定するために使う。`running_model` と違い、子の spawn 前でも分かる。
+    pub fn reserved_model(&self) -> Option<PathBuf> {
+        self.lock().reserved_model.clone()
+    }
+
     /// このインスタンスの status を作る (role の付け忘れを防ぐ)。
     fn status_of(&self, state: EnginePhase, detail: Option<LocalizedText>) -> EngineStatus {
         EngineStatus::new(self.role, state, detail)
@@ -255,40 +281,16 @@ impl Engine {
         }
     }
 
-    /// 止まっていれば起動する。進行中の起動があれば何もしない。
-    ///
-    /// バックグラウンド化 (`kill_now`) で止めたエンジンを、ホットキーやトレイから
-    /// 使うときに呼ぶ。起動の完了は待たない (`ensure_ready` は待つ)。
-    pub async fn ensure_started(&self, settings: &Settings) {
-        // 速い経路: 稼働中・起動処理中なら何もしない。
-        // 実際の二重起動の防止は `begin_start` が 1 つのロックで行う。
-        if !self.state().needs_start() {
-            return;
-        }
-        let Some(generation) = self.begin_start(false) else {
-            return;
-        };
-        self.spawn_engine(generation, settings).await;
-    }
-
-    /// 止まっていれば起動し、準備完了まで待つ。
-    ///
-    /// `cancel` が立ったら待機を即座に打ち切る (監査 M-2)。
-    pub async fn ensure_ready(
-        &self,
-        settings: &Settings,
-        limit: Duration,
-        cancel: &AtomicBool,
-    ) -> EngineReady {
-        self.ensure_started(settings).await;
-        self.wait_until_ready(limit, cancel).await
-    }
-
     /// 準備完了 (ready かつ待ち受けポートあり) になるまで待つ。
     ///
     /// - 起動失敗 (`error`) と「止められた」を知った時点で諦める
     /// - `limit` を超えたら `Unavailable`
     /// - `cancel` が立ったら `Cancelled` (待機中も中止できる)
+    ///
+    /// ここでは**起動しない**。起動の予約はジョブ受け付け時に制御ロック下で
+    /// 確定済みで、取消済みジョブが制御ロック外で新しい起動を奪わないようにする
+    /// (監査 Medium 1)。停止/異常終了からの復旧は commands 側で job id・取消・
+    /// 希望モデルを再検証してから `reserve_start` する。
     pub async fn wait_until_ready(&self, limit: Duration, cancel: &AtomicBool) -> EngineReady {
         let deadline = Instant::now() + limit;
         loop {
@@ -311,16 +313,39 @@ impl Engine {
         &self.http
     }
 
-    /// 起動して `/health` の監視を始める。結果は `engine:status` で流れる。
+    /// 起動を同期に予約する (既存の子の停止・モデル解決までを行う)。
     ///
-    /// 既存の子プロセスは止めてから起動し直す (`restart_engine` 用)。
-    /// tokio のプロセスドライバを使うので、ランタイムの中で呼ぶこと
-    /// (`tauri::async_runtime::spawn` の中など)。
-    pub async fn start(&self, settings: &Settings) {
-        let Some(generation) = self.begin_start(true) else {
-            return;
+    /// 戻り値は [spawn_reserved] に渡す予約。実際の子プロセスの spawn は
+    /// tokio ランタイムの中で行う必要があるため、呼び出し側はここで「どの起動を
+    /// するか」を確定してから非同期に spawn する。ジョブ受け付けと起動の停止が
+    /// 競合しないよう、呼び出し側の制御ロック下で使うこと。
+    ///
+    /// モデル・ランタイムの解決もここで行う。解決できない場合は `fail_start` で
+    /// エラー状態にして `None` を返す (無駄な spawn タスクを残さない)。
+    pub(crate) fn reserve_start(&self, settings: &Settings, force: bool) -> Option<ReservedStart> {
+        let generation = self.begin_start(force)?;
+        let paths = match resolve_paths(settings, &self.app, self.role) {
+            Ok(paths) => paths,
+            Err(detail) => {
+                self.fail_start(generation, detail);
+                return None;
+            }
         };
-        self.spawn_engine(generation, settings).await;
+        {
+            let mut inner = self.lock();
+            if inner.active_start == Some(generation) {
+                inner.reserved_model = Some(paths.model.clone());
+            }
+        }
+        Some(ReservedStart { generation, paths })
+    }
+
+    /// 予約済みの起動を実行する。tokio ランタイムの中で呼ぶこと。
+    ///
+    /// 予約後に別の起動・停止が入っていたら、古い予約は静かに捨てる。
+    pub(crate) async fn spawn_reserved(&self, reserved: ReservedStart, settings: &Settings) {
+        self.spawn_engine(reserved.generation, reserved.paths, settings)
+            .await;
     }
 
     /// 起動の開始を宣言する。戻り値はこの起動の世代。
@@ -345,10 +370,12 @@ impl Engine {
             }
             let child = inner.child.take();
             let job = inner.job.take();
+            inner.model = None;
+            inner.reserved_model = None;
             inner.generation = inner.generation.wrapping_add(1);
             let generation = inner.generation;
             // 判定と同時に「起動処理中」を立てる。ここを分けると、並行した
-            // ensure_started が二重に llama-server を起こす。
+            // 予約 (`reserve_start`) が二重に llama-server を起こす。
             inner.active_start = Some(generation);
             inner.port = None;
             (child, job, generation)
@@ -368,15 +395,12 @@ impl Engine {
         Some(generation)
     }
 
-    /// 起動本体。呼ぶ前に `begin_start` で世代を取っておくこと。
-    async fn spawn_engine(&self, generation: u64, settings: &Settings) {
-        let paths = match resolve_paths(settings, &self.app, self.role) {
-            Ok(paths) => paths,
-            Err(detail) => {
-                self.fail_start(generation, detail);
-                return;
-            }
-        };
+    /// 起動本体。呼ぶ前に `reserve_start` で世代と解決済みパスを取っておくこと。
+    async fn spawn_engine(&self, generation: u64, paths: ServerPaths, settings: &Settings) {
+        // 予約後に別の起動・停止が入っていたら、プロセスを起こさずに捨てる。
+        if !self.is_current(generation) {
+            return;
+        }
 
         let port = match pick_free_port() {
             Ok(port) => port,
@@ -418,6 +442,8 @@ impl Engine {
             inner.child = Some(child);
             inner.job = job;
             inner.port = Some(port);
+            inner.model = Some(paths.model);
+            inner.reserved_model = None;
             // 起動処理はここで完了。以後の待機は supervise が見る。
             inner.active_start = None;
         }
@@ -435,6 +461,7 @@ impl Engine {
         let mut inner = self.lock();
         if inner.active_start == Some(generation) {
             inner.active_start = None;
+            inner.reserved_model = None;
         }
     }
 
@@ -480,6 +507,8 @@ impl Engine {
         inner.generation = inner.generation.wrapping_add(1);
         inner.active_start = None;
         inner.port = None;
+        inner.model = None;
+        inner.reserved_model = None;
         (inner.child.take(), inner.job.take())
     }
 
@@ -705,6 +734,16 @@ fn stop_child(child: Option<Child>, job: Option<JobObject>) {
 pub(crate) struct ServerPaths {
     pub model: PathBuf,
     pub server: PathBuf,
+}
+
+/// 予約済みの起動。`Engine::reserve_start` が作り、`spawn_reserved` が実行する。
+///
+/// 予約の時点で世代とモデル・ランタイムのパスを固定する。予約後に設定が変わって
+/// 新しい起動・停止が入った場合、この予約は世代不一致で捨てられる。
+#[derive(Debug)]
+pub(crate) struct ReservedStart {
+    generation: u64,
+    paths: ServerPaths,
 }
 
 fn model_relative() -> PathBuf {
@@ -974,13 +1013,91 @@ pub(crate) fn serving_role(
     }
 }
 
+/// 常駐の保持理由。ログと「保持先が変わったか」の説明に使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentReason {
+    /// フローティング専用モデルが別ファイルで解決できた (2 本目のエンジン)。
+    DedicatedModel,
+    /// 専用モデルがアクティブモデルと同一ファイル。メイン用 1 本を共有する。
+    SharedWithMain,
+}
+
+impl ResidentReason {
+    /// デバッグログ用の短い識別子。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DedicatedModel => "dedicated-model",
+            Self::SharedWithMain => "shared-with-main",
+        }
+    }
+}
+
+/// 常時起動 (常駐) で保持するエンジン。
+///
+/// 「どの役割のエンジンを、どのモデルで、なぜ保持するか」を 1 つの値にまとめる。
+/// 保持先は `Main` (共有モデル) か `Floating` (専用モデル) のどちらか。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentTarget {
+    /// 保持するエンジンの役割。
+    pub role: EngineRole,
+    /// そのエンジンが読み込むモデルの実パス (解決済み)。
+    pub model: PathBuf,
+    /// なぜ保持するか (共有か専用か)。
+    pub reason: ResidentReason,
+}
+
+/// フローティング専用モデルの実パス。未指定・未登録・実ファイルなしは `None`。
+///
+/// [`resolve_model_path_for`] は専用モデルが使えないときにアクティブモデルへ
+/// フォールバックする。常駐の判定ではそのフォールバックを「専用モデルなし」と
+/// みなす必要がある (未導入の専用モデルを選んだまま黙ってメイン用を常駐させない)
+/// ため、ここでは代替チェーンへ落とさず、専用モデル自身が解決できたときだけ返す。
+fn dedicated_model_path(settings: &Settings) -> Option<PathBuf> {
+    let file = settings.floating_window.model.as_deref()?;
+    let model = settings
+        .installed_models
+        .iter()
+        .find(|model| model.file == file)?;
+    let path = PathBuf::from(&model.path);
+    path.is_file().then_some(path)
+}
+
+/// 常時起動で保持すべきエンジン。常駐しないなら `None`。
+///
+/// 判定は次の 3 段だけ:
+/// 1. [`Settings::floating_engine_resident`] (常駐の設定そのもの)
+/// 2. フローティング専用モデルが実際に解決できるか (安全ガード)
+/// 3. メイン用と同じモデルか ([`serving_role`]) — 共有ならメイン用 1 本を保持
+///
+/// 専用モデルが未 DL・削除済みなどでアクティブモデルへフォールバックしている
+/// ときは 2 で `None` を返す。常時起動・設定変更・メイン非表示・フローティング
+/// 終了の全経路はこの関数の結果だけを見る。呼び出し側で `models_shared` や
+/// 独立起動 bool を再実装しない (二重ロード事故の再発防止)。
+pub(crate) fn resident_target(settings: &Settings, search_root: &Path) -> Option<ResidentTarget> {
+    if !settings.floating_engine_resident() {
+        return None;
+    }
+    let model = dedicated_model_path(settings)?;
+    // ルーティングと同じ判定を使う。同一モデルならメイン用へ相乗りする。
+    let role = serving_role(EngineRole::Floating, settings, search_root);
+    let reason = match role {
+        EngineRole::Main => ResidentReason::SharedWithMain,
+        EngineRole::Floating => ResidentReason::DedicatedModel,
+    };
+    Some(ResidentTarget {
+        role,
+        model,
+        reason,
+    })
+}
+
 /// フローティング用の独立エンジンを起動・維持すべきか。
 ///
-/// 常時起動の条件 (`Settings::floating_engine_resident`) を満たし、かつ解決モデルが
-/// メイン用と異なるときだけ true。同一モデルならメイン用と共有するので、2 つ目の
-/// エンジンは起動しない (専用モデルにアクティブモデルを選んだ場合も同じ)。
+/// [`resident_target`] がフローティング用を保持先にしているときだけ true。
+/// 同一モデルで共有するときはメイン用 1 本を維持するので、2 本目は起動しない
+/// (専用モデルにアクティブモデルを選んだ場合も同じ)。
 pub(crate) fn should_run_floating_engine(settings: &Settings, search_root: &Path) -> bool {
-    settings.floating_engine_resident() && !models_shared(settings, search_root)
+    resident_target(settings, search_root).is_some_and(|target| target.role == EngineRole::Floating)
 }
 
 /// `start` から親を最大 `depth` 階層たどり、`relative` が実在する場所を返す。
@@ -1712,8 +1829,10 @@ mod tests {
             serving_role(EngineRole::Floating, &settings, &base),
             EngineRole::Main
         );
-        // 常時起動の条件は満たすが、同一モデルなので 2 本目は起動しない。
+        // 常時起動の条件は満たすが、専用モデルが解決できないので常駐しない
+        // (黙ってメイン用を維持しない: 安全ガード)。
         assert!(settings.floating_engine_resident());
+        assert_eq!(resident_target(&settings, &base), None);
         assert!(!should_run_floating_engine(&settings, &base));
         let _ = fs::remove_dir_all(&base);
     }
@@ -1731,6 +1850,178 @@ mod tests {
         assert_eq!(
             serving_role(EngineRole::Floating, &settings, &base),
             EngineRole::Floating
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 常駐ポリシーの predicate 表。
+    ///
+    /// 設定の組み合わせごとに「保持先・モデル・理由」を 1 か所で固定する。ここが
+    /// 変わるときは、起動・設定変更・メイン非表示・フローティング終了の全経路が
+    /// 同じ判断 (`resident_target`) を共有していることを確認すること。
+    #[test]
+    fn resident_policy_table_is_the_single_source_of_truth() {
+        let base = temp_dir("resident-policy");
+        let active = base.join("14b.gguf");
+        fs::write(&active, b"m").unwrap();
+        let small = base.join("0.8b.gguf");
+        fs::write(&small, b"m").unwrap();
+        let installed = |file: &str, path: &Path| InstalledModel {
+            file: file.to_string(),
+            repo: "pfnet/test".to_string(),
+            bytes: 1,
+            path: path.to_string_lossy().into_owned(),
+            installed_at: 0,
+        };
+        let settings = Settings {
+            active_model: Some("14b.gguf".to_string()),
+            installed_models: vec![
+                installed("14b.gguf", &active),
+                installed("0.8b.gguf", &small),
+            ],
+            ..Default::default()
+        };
+        let policy = |settings: &Settings| {
+            resident_target(settings, &base)
+                .map(|target| (target.role, target.model, target.reason))
+        };
+
+        // 専用モデル未指定: 既定の常駐 ON でも何も保持しない
+        // (アクティブモデルを二重ロードしない)。
+        assert_eq!(policy(&settings), None);
+        assert!(!should_run_floating_engine(&settings, &base));
+
+        // 別ファイルの専用モデル: フローティング用を 1 本保持する。
+        let mut split = settings.clone();
+        split.floating_window.model = Some("0.8b.gguf".to_string());
+        assert_eq!(
+            policy(&split),
+            Some((
+                EngineRole::Floating,
+                small.clone(),
+                ResidentReason::DedicatedModel
+            ))
+        );
+        assert!(should_run_floating_engine(&split, &base));
+
+        // 専用モデルにアクティブと同じファイル: 2 本目は起こさず、
+        // 共有しているメイン用 1 本を保持する (案A)。
+        let mut shared = settings.clone();
+        shared.floating_window.model = Some("14b.gguf".to_string());
+        assert_eq!(
+            policy(&shared),
+            Some((
+                EngineRole::Main,
+                active.clone(),
+                ResidentReason::SharedWithMain
+            ))
+        );
+        assert!(!should_run_floating_engine(&shared, &base));
+
+        // 常駐 OFF / トレイ常駐 OFF / フローティング無効は保持しない。
+        let mut off = split.clone();
+        off.background.resident_engine = false;
+        assert_eq!(policy(&off), None);
+        assert!(!should_run_floating_engine(&off, &base));
+        let mut no_tray = split.clone();
+        no_tray.background.enabled = false;
+        assert_eq!(policy(&no_tray), None);
+        let mut disabled = split.clone();
+        disabled.floating_window.enabled = false;
+        assert_eq!(policy(&disabled), None);
+
+        // 未登録の専用モデル: フォールバックせず常駐しない (安全ガード)。
+        let mut unknown = split.clone();
+        unknown.floating_window.model = Some("unknown.gguf".to_string());
+        assert_eq!(policy(&unknown), None);
+        assert!(!should_run_floating_engine(&unknown, &base));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_dedicated_model_is_not_kept_resident() {
+        // 0.8B を選んでいたが実ファイルが消えた。翻訳の解決は 14B へフォール
+        // バックするが、常駐は「黙ってメイン用を維持する」ことをしない。
+        let base = temp_dir("resident-missing-dedicated");
+        let active = base.join("14b.gguf");
+        fs::write(&active, b"m").unwrap();
+        let settings = Settings {
+            active_model: Some("14b.gguf".to_string()),
+            installed_models: vec![
+                InstalledModel {
+                    file: "14b.gguf".to_string(),
+                    repo: "pfnet/test".to_string(),
+                    bytes: 1,
+                    path: active.to_string_lossy().into_owned(),
+                    installed_at: 0,
+                },
+                InstalledModel {
+                    file: "0.8b.gguf".to_string(),
+                    repo: "pfnet/test".to_string(),
+                    bytes: 1,
+                    path: base.join("missing.gguf").to_string_lossy().into_owned(),
+                    installed_at: 0,
+                },
+            ],
+            floating_window: crate::settings::FloatingWindowSettings {
+                model: Some("0.8b.gguf".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(settings.floating_engine_resident());
+        assert_eq!(
+            resolved_model_path(EngineRole::Floating, &settings, &base),
+            Some(active)
+        );
+        assert!(models_shared(&settings, &base));
+        assert_eq!(resident_target(&settings, &base), None);
+        assert!(!should_run_floating_engine(&settings, &base));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resident_target_moves_between_shared_and_split_models() {
+        let base = temp_dir("resident-transitions");
+        let wide = base.join("14b.gguf");
+        fs::write(&wide, b"m").unwrap();
+        let small = base.join("0.8b.gguf");
+        fs::write(&small, b"m").unwrap();
+        let installed = |file: &str, path: &Path| InstalledModel {
+            file: file.to_string(),
+            repo: "pfnet/test".to_string(),
+            bytes: 1,
+            path: path.to_string_lossy().into_owned(),
+            installed_at: 0,
+        };
+        let mut settings = Settings {
+            active_model: Some("14b.gguf".to_string()),
+            installed_models: vec![installed("14b.gguf", &wide), installed("0.8b.gguf", &small)],
+            ..Default::default()
+        };
+        settings.floating_window.model = Some("0.8b.gguf".to_string());
+
+        // 専用モデルが別ファイル: フローティング用を保持。
+        let target = resident_target(&settings, &base).expect("常駐する");
+        assert_eq!(target.role, EngineRole::Floating);
+        assert_eq!(target.model, small);
+        assert_eq!(target.reason, ResidentReason::DedicatedModel);
+        assert!(should_run_floating_engine(&settings, &base));
+
+        // アクティブを専用モデルと同じにすると共有: メイン用 1 本を保持。
+        settings.active_model = Some("0.8b.gguf".to_string());
+        let target = resident_target(&settings, &base).expect("常駐する");
+        assert_eq!(target.role, EngineRole::Main);
+        assert_eq!(target.reason, ResidentReason::SharedWithMain);
+        assert!(!should_run_floating_engine(&settings, &base));
+
+        // アクティブを戻すとまた専用エンジン。保持先が Main↔Floating で移る。
+        settings.active_model = Some("14b.gguf".to_string());
+        assert_eq!(
+            resident_target(&settings, &base).map(|target| target.role),
+            Some(EngineRole::Floating)
         );
         let _ = fs::remove_dir_all(&base);
     }
