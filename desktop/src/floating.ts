@@ -12,6 +12,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { applyTranslations, isUiLanguage, localize, setUiLanguage, t } from "./i18n";
 import {
@@ -39,6 +40,14 @@ const MAX_BUFFERED_EVENTS = 800;
 const COPY_FEEDBACK_DURATION = 1500;
 /** 差し替え済み jobId を覚えておく上限。 */
 const MAX_SUPERSEDED_JOBS = 32;
+/**
+ * ヘッダーをドラッグしてもよいかの判定に使う、除外する要素。
+ *
+ * ボタンと言語ポップオーバー (role=listbox とその子要素) はクリック操作を
+ * 優先する。ヘッダー背景・訳マーク・`.floating-drag` スペーサーは該当しない
+ * ので、そこからはウィンドウをドラッグできる。
+ */
+const DRAG_EXCLUSIONS = "button, a, input, select, textarea, [role='listbox'], [role='option']";
 
 type JobEvent =
   | { kind: "progress"; jobId: number; done: number; total: number }
@@ -102,6 +111,8 @@ const langPopoverEl = byId<HTMLUListElement>("floating-lang-popover");
 const copyEl = byId<HTMLButtonElement>("floating-copy");
 const copyLabelEl = byId<HTMLSpanElement>("floating-copy-label");
 const closeEl = byId<HTMLButtonElement>("floating-close");
+const barEl = byId<HTMLElement>("floating-bar");
+const gripEl = byId<HTMLDivElement>("floating-grip");
 const messageEl = byId<HTMLParagraphElement>("floating-message");
 const textEl = byId<HTMLDivElement>("floating-text");
 const contentEl = byId<HTMLElement>("floating-content");
@@ -587,6 +598,52 @@ function closeWindow(origin: "close-button" | "escape"): void {
   void hideFloating(origin).catch(() => undefined);
 }
 
+// ---------------------------------------------------------------------------
+// ウィンドウ操作 (ヘッダードラッグ / 右下つまみのリサイズ)
+// ---------------------------------------------------------------------------
+
+/**
+ * ヘッダーをつかんだときのウィンドウ移動。
+ *
+ * pointerdown で OS へドラッグ開始要求を送る。返る Promise の完了は
+ * ドラッグ終了を意味しないため、pointerup は待たずに開始する。ボタンと言語
+ * ポップオーバーの上は通常のクリック操作を優先し、ドラッグを開始しない。
+ */
+function startWindowDrag(event: PointerEvent): void {
+  if (event.button !== 0) {
+    return;
+  }
+  const target = event.target;
+  if (target instanceof Element && target.closest(DRAG_EXCLUSIONS) !== null) {
+    return;
+  }
+  // ドラッグ中のテキスト選択を防ぐ。
+  event.preventDefault();
+  void getCurrentWindow()
+    .startDragging()
+    .catch((error) => {
+      console.error("ウィンドウのドラッグを開始できません", error);
+    });
+}
+
+/**
+ * 右下のつまみをつかんだときのウィンドウリサイズ (右下方向のみ)。
+ *
+ * `startWindowDrag` と同様、ここで返る Promise の完了はリサイズ終了を意味しない
+ * (OS への開始要求のみ) ため、pointerup は待たない。
+ */
+function startWindowResize(event: PointerEvent): void {
+  if (event.button !== 0) {
+    return;
+  }
+  event.preventDefault();
+  void getCurrentWindow()
+    .startResizeDragging("SouthEast")
+    .catch((error) => {
+      console.error("ウィンドウのリサイズを開始できません", error);
+    });
+}
+
 function bindEvents(): void {
   onFloatingCapture((payload) => {
     void handleCapture(payload);
@@ -713,6 +770,10 @@ function bindEvents(): void {
   closeEl.addEventListener("click", () => {
     closeWindow("close-button");
   });
+
+  // ウィンドウ操作。リスナーはここで一度だけ登録する。
+  barEl.addEventListener("pointerdown", startWindowDrag);
+  gripEl.addEventListener("pointerdown", startWindowResize);
 
   // × ボタンと同じ。言語リストが開いていればリストだけ閉じる。
   document.addEventListener("keydown", (event) => {

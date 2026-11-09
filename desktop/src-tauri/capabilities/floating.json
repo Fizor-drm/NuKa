@@ -1,7 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "floating",
-  "description": "フローティング翻訳ウィンドウの権限。イベント購読とコマンド呼び出し (core:default) のみを許可する。dialog と opener は付与しない (このウィンドウはファイル選択も外部リンクも開かない)。",
+  "description": "フローティング翻訳ウィンドウの権限。イベント購読とコマンド呼び出し (core:default) に加え、ヘッダーのドラッグ移動と右下のリサイズつまみで core:window の start-dragging / start-resize-dragging を許可する。権限の境界: この 2 権限は floating ウィンドウからの呼び出しに限定され、操作対象は Window API が受け取る label で指定された同一アプリ内のウィンドウに限られる。dialog と opener は付与しない (このウィンドウはファイル選択も外部リンクも開かない)。",
   "windows": ["floating"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging"
+  ]
 }

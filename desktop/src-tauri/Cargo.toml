@@ -53,12 +53,14 @@ url = "2"
 # 子プロセス (llama-server) を Job Object で OS に後始末させるため (Windows のみ)。
 # フローティングウィンドウの選択テキスト取得 (SendInput / GetAsyncKeyState)、
 # カーソル位置とモニタ作業領域 (GetCursorPos / GetMonitorInfoW)、クリップボード
-# (DataExchange / Memory) も Windows API を使う。
+# (DataExchange / Memory)、debug ビルドの合成 Ctrl+C 対策 (SetConsoleCtrlHandler)
+# も Windows API を使う。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_JobObjects",
     "Win32_System_Memory",

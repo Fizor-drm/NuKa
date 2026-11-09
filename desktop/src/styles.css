@@ -1379,6 +1379,7 @@ html:lang(zh-Hans) {
 }
 
 .floating {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
@@ -1396,6 +1397,8 @@ html:lang(zh-Hans) {
   padding: 7px 8px;
   background: var(--canvas);
   border-bottom: 1px solid var(--border);
+  /* ヘッダーはつかんでドラッグできる (ボタンは floating-bar の button 規則で pointer)。 */
+  cursor: move;
   user-select: none;
 }
 
@@ -1470,7 +1473,9 @@ html:lang(zh-Hans) {
   z-index: 60;
   width: 220px;
   max-width: calc(100vw - 20px);
-  max-height: 235px;
+  /* 既定高さを小さくしたので、固定値ではなくウィンドウ (= ビューポート) に
+     合わせる。広いときは従来の 235px を超えない。 */
+  max-height: min(235px, calc(100vh - 64px));
   margin: 0;
   padding: 4px;
   overflow-y: auto;
@@ -1480,6 +1485,8 @@ html:lang(zh-Hans) {
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   outline: none;
+  /* ヘッダーの cursor: move を継承させない (リスト内は通常のカーソル)。 */
+  cursor: default;
 }
 
 .floating-lang-popover[hidden] {
@@ -1576,6 +1583,31 @@ html:lang(zh-Hans) {
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* 右下のリサイズつまみ (startResizeDragging の当たり判定)。 */
+.floating-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  color: var(--muted);
+  opacity: 0.55;
+  background: repeating-linear-gradient(
+    -45deg,
+    currentColor 0 1px,
+    transparent 1px 4px
+  );
+  /* 右下の三角形だけに斜め線を出し、左上はクリックを透過させる。 */
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+  transition: opacity 120ms ease;
+}
+
+.floating-grip:hover {
+  opacity: 0.9;
 }
 
 /* ---------- 設定: フローティングウィンドウ ---------- */

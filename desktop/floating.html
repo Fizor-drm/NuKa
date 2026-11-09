@@ -8,7 +8,7 @@
   </head>
   <body class="floating-body">
     <main class="floating">
-      <header class="floating-bar">
+      <header class="floating-bar" id="floating-bar">
         <span class="floating-mark" aria-hidden="true">訳</span>
         <span class="floating-drag" aria-hidden="true"></span>
         <div class="floating-lang" id="floating-lang">
@@ -86,6 +86,8 @@
         <p class="floating-message" id="floating-message"></p>
         <div class="floating-text" id="floating-text" hidden></div>
       </section>
+      <!-- 右下のリサイズつまみ。見た目だけの装飾で、操作は floating.ts が持つ。 -->
+      <div class="floating-grip" id="floating-grip" aria-hidden="true"></div>
     </main>
     <script type="module" src="/src/floating.ts"></script>
   </body>

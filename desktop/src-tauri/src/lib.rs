@@ -77,7 +77,51 @@ impl AppState {
     }
 }
 
+/// capture の合成 Ctrl+C で debug ビルドが終了しないようにする。
+///
+/// debug ビルドはコンソールサブシステムのため、開発用ターミナルと同じコンソールに
+/// 接続している。capture は選択テキスト取得のために前景アプリへ Ctrl+C を送るが、
+/// 前景がそのターミナルだと CTRL_C_EVENT が NuKa 自身にも届き、プロセスが
+/// 0xC000013A (STATUS_CONTROL_C_EXIT) で終了する (E2E で実測)。
+/// CTRL_C_EVENT / CTRL_BREAK_EVENT だけを「処理済み」にして終了を防ぎ、
+/// それ以外 (ウィンドウを閉じる・ログオフなど) は OS の既定処理に任せる。
+///
+/// リリースビルドは main.rs の `windows_subsystem = "windows"` でコンソールを
+/// 持たないため登録しない (イベント自体が届かない)。debug ではターミナルからの
+/// Ctrl+C でもプロセスが終了しなくなるが、停止はアプリの終了操作 (トレイの
+/// 「終了」) かプロセス kill を使う。
+#[cfg(all(windows, debug_assertions))]
+fn install_console_ctrl_handler() {
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+    };
+
+    // コンソール制御イベントのハンドラ。Ctrl+C / Ctrl+Break だけ握って終了させない。
+    unsafe extern "system" fn ignore_ctrl_c(event: u32) -> windows_sys::core::BOOL {
+        if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+            1
+        } else {
+            0
+        }
+    }
+
+    // SAFETY: プロセス単位のハンドラ登録。ハンドラは 'static な関数で、
+    // 登録は解除せずプロセス終了まで有効なままにする。
+    let added = unsafe { SetConsoleCtrlHandler(Some(ignore_ctrl_c), 1) };
+    if added == 0 {
+        // コンソールを持たない起動 (リダイレクトなど) でもここに来る。動作は継続する。
+        eprintln!(
+            "コンソール制御ハンドラを登録できません (合成 Ctrl+C で終了する可能性があります)"
+        );
+    }
+}
+
+#[cfg(not(all(windows, debug_assertions)))]
+fn install_console_ctrl_handler() {}
+
 pub fn run() {
+    // 合成 Ctrl+C (選択テキストの取得) で debug ビルドが終了するのを防ぐ。
+    install_console_ctrl_handler();
     let application = tauri::Builder::default()
         // 二重起動の防止。2 個目のプロセスはここで終了し、既存のメイン画面を前に出す。
         // ほかの plugin より先に登録し、2 個目が余計な初期化 (ホットキー登録など) を
