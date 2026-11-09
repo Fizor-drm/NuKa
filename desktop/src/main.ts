@@ -264,6 +264,8 @@ const floatingModelLabelEl = byId<HTMLSpanElement>("floating-model-label");
 const floatingModelPopoverEl = byId<HTMLDivElement>("floating-model-popover");
 const floatingModelListEl = byId<HTMLUListElement>("floating-model-list");
 const floatingModelEmptyEl = byId<HTMLParagraphElement>("floating-model-empty");
+const floatingModelNoteEl = byId<HTMLParagraphElement>("floating-model-note");
+const floatingModelSharedNoteEl = byId<HTMLParagraphElement>("floating-model-shared-note");
 
 const backgroundEnabledEl = byId<HTMLInputElement>("background-enabled");
 const backgroundResidentEngineEl = byId<HTMLInputElement>("background-resident-engine");
@@ -309,7 +311,7 @@ const uiLanguageInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="ui-language"]'),
 );
 
-const APP_VERSION = "1.3.3";
+const APP_VERSION = "1.3.4";
 const RELEASES_PAGE_URL = "https://github.com/Fizor-drm/NuKa/releases/latest";
 
 const LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-en";
@@ -1102,6 +1104,13 @@ function renderFloatingModel(): void {
   floatingModelLabelEl.textContent =
     selected?.label ?? (current === "" ? t("settings.floating.modelSame") : modelDisplayName(current));
   floatingModelButtonEl.setAttribute("aria-expanded", String(state.floatingModelOpen));
+  // 専用モデルにアクティブと同じファイルを選んだときは、2 本目は起動せず
+  // メイン用エンジンを共有する。既定の注記 (専用モデルで常時起動) と食い違う
+  // ため、共有時の説明へ差し替える。
+  const sameAsActive =
+    state.floatingModel !== null && state.setup?.active_model === state.floatingModel;
+  floatingModelNoteEl.hidden = sameAsActive;
+  floatingModelSharedNoteEl.hidden = !sameAsActive;
 
   floatingModelListEl.replaceChildren();
   options.forEach((option, index) => {
@@ -1364,12 +1373,22 @@ function renderBackgroundSettings(): void {
   backgroundResidentEngineEl.disabled = !state.backgroundEnabled;
   // 常時起動は「フローティング用モデル」を選んで初めて働く (二重ロード防止)。
   const residentReady = state.floatingModel !== null;
+  // 専用モデルがアクティブと同じファイルなら、2 本目は起こさずメイン用 1 本を
+  // 維持する。注記もその実挙動に合わせる。
+  const sameAsActiveModel =
+    state.floatingModel !== null && state.setup?.active_model === state.floatingModel;
   backgroundResidentNoteEl.textContent = t(
     residentReady
-      ? "settings.background.residentEngineNote"
+      ? sameAsActiveModel
+        ? "settings.background.residentEngineNoteShared"
+        : "settings.background.residentEngineNote"
       : "settings.background.residentEngineNeedsModel",
   );
-  backgroundResidentNoteEl.dataset["state"] = residentReady ? "ready" : "needs-model";
+  backgroundResidentNoteEl.dataset["state"] = residentReady
+    ? sameAsActiveModel
+      ? "shared"
+      : "ready"
+    : "needs-model";
   backgroundDisabledNoteEl.hidden = state.backgroundEnabled;
   backgroundErrorEl.hidden = state.backgroundError === null;
   backgroundErrorEl.textContent = state.backgroundError ?? "";
