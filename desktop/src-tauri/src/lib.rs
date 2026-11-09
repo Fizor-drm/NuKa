@@ -140,9 +140,9 @@ pub fn run() {
             });
 
             // フローティング用は「専用モデルを選んで常時起動が有効」なときだけ
-            // 先に起こす。未指定のまま起こすとアクティブモデルの二重ロードに
-            // なるため (CR4-1)、従来どおりオンデマンドに任せる。
-            if initial.floating_engine_resident()
+            // 先に起こす。専用モデル未指定や、解決モデルがメイン用と同一のときは
+            // 二重ロードを避けてメイン用エンジンへ相乗りする (CR4-1 / High)。
+            if engine::should_run_floating_engine(&initial, &engine::exe_directory())
                 && engine::can_resolve(EngineRole::Floating, &initial, app.handle())
             {
                 let settings = initial.clone();
@@ -258,16 +258,19 @@ pub fn quit(app_handle: &tauri::AppHandle) {
     });
 }
 
-/// 指定した役割のエンジンが止まっていれば起こす。準備完了は待たずに戻る。
+/// 要求された役割のエンジンが止まっていれば起こす。準備完了は待たずに戻る。
 ///
 /// バックグラウンド化で止めたエンジンを、メインの再表示やホットキー発火で
-/// 読み込み直すための入口。進み具合は `engine:status` で全ウィンドウへ流れる。
-pub(crate) fn ensure_engine_started(app_handle: &tauri::AppHandle, role: EngineRole) {
+/// 読み込み直すための入口。実際に起こすのは `engine::serving_role` が決めた
+/// エンジン (解決モデルが同一ならメイン用を共有する)。進み具合は
+/// `engine:status` で全ウィンドウへ流れる。
+pub(crate) fn ensure_engine_started(app_handle: &tauri::AppHandle, requested: EngineRole) {
     let Some(state) = app_handle.try_state::<AppState>() else {
         return;
     };
-    let engine = state.engine_for(role).clone();
     let settings = state.settings.get();
+    let role = engine::serving_role(requested, &settings, &engine::exe_directory());
+    let engine = state.engine_for(role).clone();
     tauri::async_runtime::spawn(async move {
         engine.ensure_started(&settings).await;
     });

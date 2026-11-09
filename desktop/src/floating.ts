@@ -24,6 +24,7 @@ import {
   onTranslationProgress,
   onTranslationSuperseded,
   type EnginePhase,
+  type EngineRole,
   type FloatingCapturePayload,
 } from "./ipc";
 import { LANGUAGES, languageByCode } from "./languages";
@@ -116,6 +117,14 @@ const supersededJobs = new Set<number>();
 
 /** エンジンの状態。バックグラウンドから復帰した直後は starting から始まる。 */
 let enginePhase: EnginePhase = "starting";
+
+/**
+ * この画面の翻訳を処理するエンジンの役割。
+ *
+ * 解決モデルがメイン用と同一ならメイン用を共有するため、capture の
+ * `engine_role` で受け取る。イベントはこの役割の status だけを反映する。
+ */
+let servingRole: EngineRole = "floating";
 
 function setEnginePhase(phase: EnginePhase): void {
   if (enginePhase === phase) {
@@ -337,9 +346,9 @@ async function refreshAppearance(): Promise<void> {
     // 設定が読めなくても翻訳は続ける。
   }
   // エンジンはバックグラウンドで止められていることがある。状態を取り直す。
-  // メイン画面用とは別インスタンスなので、フローティング用の role を指定する。
+  // 共有モデルのときはメイン用エンジンが処理するので、その役割で問い合わせる。
   try {
-    const status = await ipc.getEngineStatus("floating");
+    const status = await ipc.getEngineStatus(servingRole);
     setEnginePhase(status.state);
   } catch {
     // エンジンの状態が読めなくても翻訳は続ける。
@@ -510,6 +519,10 @@ async function handleCapture(payload: FloatingCapturePayload): Promise<void> {
   closeLanguageList(false);
 
   state.initialized = true;
+  // この翻訳を処理するエンジンの役割。共有モデルなら "main" が届く。
+  if (payload.engine_role === "main" || payload.engine_role === "floating") {
+    servingRole = payload.engine_role;
+  }
   state.sourceText =
     payload.text !== null && payload.text.trim() !== "" ? payload.text : null;
   state.translation = "";
@@ -578,10 +591,11 @@ function bindEvents(): void {
   onFloatingCapture((payload) => {
     void handleCapture(payload);
   });
-  // エンジンの起動状況は全ウィンドウに届く。メイン画面用の status は無視し、
-  // フローティング用の status だけを反映する (role 省略時は main 扱い)。
+  // エンジンの起動状況は全ウィンドウに届く。この画面の翻訳を処理する役割
+  // (共有モデルなら "main") の status だけを反映する。role 省略時は main 扱い。
   onEngineStatus((status) => {
-    if (status.role !== "floating") {
+    const role: EngineRole = status.role ?? "main";
+    if (role !== servingRole) {
       return;
     }
     setEnginePhase(status.state);

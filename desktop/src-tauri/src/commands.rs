@@ -261,23 +261,25 @@ pub fn set_settings(
         crate::tray::refresh_labels(&app);
     }
     // 常時起動に関わる設定 (常駐 ON/OFF・トレイ常駐・モデル) が変わったら、
-    // 単一 predicate `floating_engine_resident` の遷移だけをエンジンへ反映する。
+    // 「独立エンジンを維持すべきか」の遷移だけをエンジンへ反映する。
     sync_resident_engine(&app, &state, &before, &saved);
     Ok(saved)
 }
 
-/// 常時起動 predicate の遷移をフローティング用エンジンへ反映する。
+/// フローティング用の独立エンジンを維持すべきかの遷移をエンジンへ反映する。
 ///
 /// - false → true: モデルが解決できる場合だけ起こす (翻訳中は何もしない)
 /// - true → false: フローティングの翻訳中でなければ止める
 ///   (次のホットキーでオンデマンドに起動し直す)
 ///
-/// 「専用モデル未指定なら常駐しない」の判定は `Settings::floating_engine_resident`
-/// の 1 か所だけ。起動・設定変更・メイン非表示・フローティング終了の全経路が
-/// この predicate を使う。
+/// 判定は `engine::should_run_floating_engine` の 1 か所だけ。常時起動の条件に
+/// 加えて「解決モデルがメイン用と異なる」ことも見るため、同一モデルのときは
+/// 2 本目のエンジンを起こさない。起動・設定変更・メイン非表示・フローティング
+/// 終了の全経路がこの判定を使う。
 fn sync_resident_engine(app: &AppHandle, state: &AppState, before: &Settings, after: &Settings) {
-    let was = before.floating_engine_resident();
-    let now = after.floating_engine_resident();
+    let search_root = crate::engine::exe_directory();
+    let was = crate::engine::should_run_floating_engine(before, &search_root);
+    let now = crate::engine::should_run_floating_engine(after, &search_root);
     if was == now {
         return;
     }
@@ -316,8 +318,9 @@ pub fn detect_language(text: String) -> Option<DetectedLanguage> {
 /// 引数は 1 つの `req` オブジェクトなので、フロントは
 /// `invoke("translate", { req: { text, target_lang, ... } })` で呼ぶ。
 ///
-/// どちらのエンジンで訳すかは呼び出し元のウィンドウで決める
-/// (`floating` → フローティング用、それ以外 → メイン用)。
+/// どちらのエンジンで訳すかは呼び出し元のウィンドウのラベルから決め、
+/// `engine::serving_role` が最終的なエンジンを選ぶ。解決モデルがメイン用と
+/// 同一なら、フローティング翻訳もメイン用エンジンで処理する (二重ロード防止)。
 #[tauri::command]
 pub fn translate(
     app: AppHandle,
@@ -326,7 +329,9 @@ pub fn translate(
     req: TranslateRequest,
 ) -> u32 {
     let origin = webview.label().to_string();
-    let role = EngineRole::from_label(&origin);
+    let requested = EngineRole::from_label(&origin);
+    let settings = state.settings.get();
+    let role = crate::engine::serving_role(requested, &settings, &crate::engine::exe_directory());
     let (job_id, cancel, superseded) = state.jobs.begin(&origin);
     if let Some(superseded) = superseded {
         if let Err(error) = app.emit(
@@ -338,7 +343,6 @@ pub fn translate(
     }
     let engine = state.engine_for(role).clone();
     let jobs = state.jobs.clone();
-    let settings = state.settings.get();
     tauri::async_runtime::spawn(async move {
         run_translation(app, engine, jobs, settings, job_id, cancel, req).await;
     });
@@ -423,24 +427,29 @@ pub async fn set_floating_settings(
             LocalizedText::new("settings.floating.saveFailed", fallback).param("detail", error)
         })?;
 
-    // 専用モデルが実際に変わったときだけ、稼働中のエンジンを新しいモデルで
-    // 起こし直す (停止 → 起動)。常駐の開始/停止は predicate の遷移で決まる。
+    // 専用モデルが実際に変わったときだけ、稼働中のフローティング用エンジンを
+    // 新しいモデルで起こし直す (停止 → 起動)。常駐の開始/停止は
+    // `should_run_floating_engine` の遷移で決まる。
     let model_changed =
         model_patch.is_some() && saved.floating_window.model != before.floating_window.model;
     if model_changed {
+        let search_root = crate::engine::exe_directory();
+        let shared = crate::engine::models_shared(&saved, &search_root);
         let engine = state.floating_engine.clone();
         let running = engine.has_process() || engine.is_starting();
         let idle = !state
             .jobs
             .has_running_job_from_origin(floating::FLOATING_LABEL);
         if running && idle {
-            if saved.floating_window.model.is_some() {
+            if saved.floating_window.model.is_some() && !shared {
+                // 別モデルの専用エンジンとして起こし直す。
                 let next = saved.clone();
                 tauri::async_runtime::spawn(async move {
                     engine.start(&next).await;
                 });
             } else {
-                // 専用モデルを外した。古いモデルを掴んだままにしない。
+                // 専用モデルを外した、またはメインと同じモデルになった。
+                // 古いモデルを掴んだままにせず、メイン用と共有する。
                 engine.kill_now();
             }
         }
@@ -604,6 +613,11 @@ pub fn delete_model(
 }
 
 /// 使用するモデルを切り替え、エンジンを起こし直す。
+///
+/// フローティング用は「実際に解決されるモデルパス」とメイン用との共有状態が
+/// 変わったときだけ触る。専用モデルが別ファイルなら、アクティブモデルを変えても
+/// フローティング用の解決パスは変わらないので再起動しない (L-3)。解決パスが
+/// 同一になった (共有になった) ときは独立エンジンを止める。
 #[tauri::command]
 pub async fn set_active_model(
     state: State<'_, AppState>,
@@ -613,25 +627,29 @@ pub async fn set_active_model(
     let settings = crate::installer::set_active_model(&state.settings, &file)?;
     let engine = state.engine.clone();
     engine.start(&settings).await;
-    // フローティング用が実際に使うモデルのパスが変わったときだけ起こし直す
-    // (L-3)。専用モデル指定時はアクティブモデルを変えてもパスは変わらない。
+
     let search_root = crate::engine::exe_directory();
-    let before_path = crate::engine::resolve_model_path_for(
-        &before,
-        &search_root,
-        EngineRole::Floating.model_override(&before),
-    )
-    .ok();
-    let after_path = crate::engine::resolve_model_path_for(
-        &settings,
-        &search_root,
-        EngineRole::Floating.model_override(&settings),
-    )
-    .ok();
-    if before_path != after_path {
-        let floating_engine = state.floating_engine.clone();
-        let running = floating_engine.has_process() || floating_engine.is_starting();
-        if running || settings.floating_engine_resident() {
+    let before_path =
+        crate::engine::resolved_model_path(EngineRole::Floating, &before, &search_root);
+    let after_path =
+        crate::engine::resolved_model_path(EngineRole::Floating, &settings, &search_root);
+    let was_shared = crate::engine::models_shared(&before, &search_root);
+    let now_shared = crate::engine::models_shared(&settings, &search_root);
+
+    let floating_engine = state.floating_engine.clone();
+    let running = floating_engine.has_process() || floating_engine.is_starting();
+    let idle = !state
+        .jobs
+        .has_running_job_from_origin(floating::FLOATING_LABEL);
+    if idle && now_shared {
+        // メインと同じモデルになった。独立エンジンは不要。
+        if running {
+            floating_engine.kill_now();
+        }
+    } else if !now_shared && (before_path != after_path || was_shared) {
+        let should_start =
+            running || crate::engine::should_run_floating_engine(&settings, &search_root);
+        if should_start {
             floating_engine.start(&settings).await;
         }
     }
