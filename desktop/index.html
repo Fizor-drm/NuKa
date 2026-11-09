@@ -790,8 +790,20 @@
                     </div>
                   </div>
                 </div>
-                <p class="settings-muted" data-i18n="settings.floating.modelNote">
+                <p
+                  class="settings-muted"
+                  id="floating-model-note"
+                  data-i18n="settings.floating.modelNote"
+                >
                   常時起動を軽くするには、小型モデル (0.8B など) を選んでください。専用モデルを選ぶと、そのモデルで常時起動します。
+                </p>
+                <p
+                  class="settings-muted"
+                  id="floating-model-shared-note"
+                  data-i18n="settings.floating.modelSharedNote"
+                  hidden
+                >
+                  「アクティブモデルと同じ」ファイルを専用モデルに選んだ場合、フローティング翻訳はメイン用のエンジンで処理します (2 本目は起動しません)。常時起動が ON のときは、そのエンジンを維持します。
                 </p>
                 <p class="settings-note" id="floating-hotkey-usage"></p>
                 <p class="settings-error" id="floating-hotkey-error" role="status" hidden></p>

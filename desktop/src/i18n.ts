@@ -157,6 +157,8 @@ const ja: Dict = {
   "settings.floating.modelEmpty": "インストール済みのモデルがありません。",
   "settings.floating.modelNote":
     "常時起動を軽くするには、小型モデル (0.8B など) を選んでください。専用モデルを選ぶと、そのモデルで常時起動します。",
+  "settings.floating.modelSharedNote":
+    "「アクティブモデルと同じ」ファイルを専用モデルに選んだ場合、フローティング翻訳はメイン用のエンジンで処理します (2 本目は起動しません)。常時起動が ON のときは、そのエンジンを維持します。",
   "settings.floating.adminNote":
     "管理者権限で実行されているアプリの上では、選択テキストを取得できません。",
   "settings.floating.saveFailed": "設定を保存できませんでした: {detail}",
@@ -167,6 +169,8 @@ const ja: Dict = {
     "フローティング用エンジンを常時起動しておく (専用モデル選択時)",
   "settings.background.residentEngineNote":
     "翻訳ウィンドウ用の小型モデルを起動したままにします。オフにすると、使うたびにモデルを読み込み直します。",
+  "settings.background.residentEngineNoteShared":
+    "フローティング用モデルがアクティブモデルと同じファイルのため、2 本目は起動せず、メイン用のエンジン 1 本を維持します。オフにすると、メイン画面を閉じた時点で停止します。",
   "settings.background.residentEngineNeedsModel":
     "常時起動は、フローティング用モデルを選ぶと有効になります。未選択のときは、使うたびにモデルを読み込み直します。",
   "settings.background.quitNote": "アプリの終了は、トレイアイコンのメニュー「終了」から行います。",
@@ -484,6 +488,8 @@ const en: Dict = {
   "settings.floating.modelEmpty": "No models are installed.",
   "settings.floating.modelNote":
     "Choose a small model (for example 0.8B) to keep the always-on engine light. Selecting a dedicated model enables the always-on engine.",
+  "settings.floating.modelSharedNote":
+    "When the dedicated model is the same file as the active model, floating translations share the main engine (no second engine is started). With always-on enabled, that engine stays loaded.",
   "settings.floating.adminNote": "Text cannot be captured from apps running as administrator.",
   "settings.floating.saveFailed": "Could not save settings: {detail}",
 
@@ -493,6 +499,8 @@ const en: Dict = {
     "Keep the floating-window engine running (when a dedicated model is selected)",
   "settings.background.residentEngineNote":
     "Keeps the small model for the translation window loaded. Turn it off to reload the model each time you use it.",
+  "settings.background.residentEngineNoteShared":
+    "The floating model is the same file as the active model, so no second engine is started and the single main engine stays loaded. Turn this off and it stops when the main window is closed.",
   "settings.background.residentEngineNeedsModel":
     "Always-on starts once you pick a model for the floating window. Without one, the model is reloaded each time you use it.",
   "settings.background.quitNote": "To quit NuKa, use “Quit” in the tray icon menu.",
@@ -803,6 +811,8 @@ const zh: Dict = {
   "settings.floating.modelEmpty": "没有已安装的模型。",
   "settings.floating.modelNote":
     "为减轻常驻引擎的负担，请选择小模型（如 0.8B）。选择专用模型后，将使用该模型常驻运行。",
+  "settings.floating.modelSharedNote":
+    "当专用模型与当前模型为同一文件时，浮动翻译会共用主引擎（不会启动第二个引擎）。开启常驻运行时，该引擎会保持运行。",
   "settings.floating.adminNote": "无法从以管理员权限运行的应用中获取所选文本。",
   "settings.floating.saveFailed": "无法保存设置：{detail}",
 
@@ -811,6 +821,8 @@ const zh: Dict = {
   "settings.background.residentEngine": "保持浮动窗口引擎常驻运行（选择专用模型时）",
   "settings.background.residentEngineNote":
     "保持翻译窗口用的小模型处于加载状态。关闭后，每次使用时都会重新加载模型。",
+  "settings.background.residentEngineNoteShared":
+    "浮动模型与当前模型为同一文件，因此不会启动第二个引擎，只保持一个主引擎。关闭后，关闭主窗口时即停止。",
   "settings.background.residentEngineNeedsModel":
     "选择浮动窗口模型后即可常驻运行。未选择时，每次使用都会重新加载模型。",
   "settings.background.quitNote": "退出应用请使用托盘图标菜单中的“退出”。",

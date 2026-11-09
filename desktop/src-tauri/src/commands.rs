@@ -22,18 +22,21 @@
 //! `messageKey` は辞書 (`src/i18n.ts`) の key。付いているときは `message` を
 //! フォールバックとして表示言語に合わせて訳す (`localize`)。
 
+use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::timeout;
 
 use crate::detect::{self, DetectedLanguage};
 use crate::engine::{
-    Engine, EnginePhase, EngineReady, EngineRole, EngineStatus, ENGINE_READY_LIMIT, SERVER_ALIAS,
+    Engine, EnginePhase, EngineReady, EngineRole, EngineStatus, ReservedStart, ENGINE_READY_LIMIT,
+    SERVER_ALIAS,
 };
 use crate::floating;
 use crate::message::LocalizedText;
@@ -208,6 +211,17 @@ impl JobManager {
         })
     }
 
+    /// まだ中止されていない進行中のジョブがあるか。
+    ///
+    /// 中止フラグの立ったジョブは、エンジンを使い終えるのを待たずに解放してよい
+    /// (`has_running_job_from_origin` と同じ扱い)。常駐ポリシーの再同期で
+    /// 「いま翻訳中のエンジンは中断しない」を判定するために使う。
+    pub fn has_active_job(&self) -> bool {
+        self.lock()
+            .as_ref()
+            .is_some_and(|control| !control.cancel.load(Ordering::SeqCst))
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<JobControl>> {
         self.inner
             .current
@@ -230,14 +244,13 @@ pub fn get_engine_status(state: State<'_, AppState>, role: Option<String>) -> En
     state.engine_for(role).status()
 }
 
-/// メイン用エンジンを起動し直す。設定の変更を反映するときにも呼ぶ。
+/// メイン用エンジンを起動し直す。
 ///
-/// フローティング用は `set_floating_settings` がモデル変更時に再起動する。
+/// 明示的な再起動要求なので、予約済みの停止/再起動より優先する。起動完了後は
+/// 常駐ポリシーを再評価する (M1)。フローティング用は常駐ポリシーの再同期が担当する。
 #[tauri::command]
-pub async fn restart_engine(state: State<'_, AppState>) -> Result<(), String> {
-    let settings = state.settings.get();
-    let engine = state.engine.clone();
-    engine.start(&settings).await;
+pub fn restart_engine(app: AppHandle) -> Result<(), String> {
+    start_engine_with_sync(&app, EngineRole::Main, true);
     Ok(())
 }
 
@@ -261,51 +274,594 @@ pub fn set_settings(
         crate::tray::refresh_labels(&app);
     }
     // 常時起動に関わる設定 (常駐 ON/OFF・トレイ常駐・モデル) が変わったら、
-    // 「独立エンジンを維持すべきか」の遷移だけをエンジンへ反映する。
-    sync_resident_engine(&app, &state, &before, &saved);
+    // 常駐ポリシー (保持先・解決モデルパス) の変化をエンジンへ反映する。
+    // 変わっていなければ何もしない (無関係な設定保存でエンジンを触らない)。
+    sync_resident_engine(&app, &before, &saved);
     Ok(saved)
 }
 
-/// フローティング用の独立エンジンを維持すべきかの遷移をエンジンへ反映する。
+/// エンジン同期の予約 (世代)。
 ///
-/// - false → true: モデルが解決できる場合だけ起こす (翻訳中は何もしない)
-/// - true → false: フローティングの翻訳中でなければ止める
-///   (次のホットキーでオンデマンドに起動し直す)
+/// 予約を発行した時点と実行した時点で、設定・ジョブの状態が変わっている可能性が
+/// ある。実行時にこの世代とジョブの有無を再検証し、古い停止/再起動を破棄する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyncTicket(u64);
+
+/// 同期予約の世代管理 (H1)。
 ///
-/// 判定は `engine::should_run_floating_engine` の 1 か所だけ。常時起動の条件に
-/// 加えて「解決モデルがメイン用と異なる」ことも見るため、同一モデルのときは
-/// 2 本目のエンジンを起こさない。起動・設定変更・メイン非表示・フローティング
-/// 終了の全経路がこの判定を使う。
-fn sync_resident_engine(app: &AppHandle, state: &AppState, before: &Settings, after: &Settings) {
+/// - `Self::schedule`: 設定変更・起動完了などで「後で同期する」予約を発行する
+/// - `Self::invalidate`: ジョブ受け付けなど、予約より優先する操作で古い予約を捨てる
+/// - `Self::may_apply`: 実行時に、最新の予約でかつジョブが走っていないかを確認する
+///
+/// 確認と適用は [`EngineControl`] の同じロック保持中に行う。ジョブ受け付けが
+/// 先に起きた場合、その予約は実行時に破棄され、ジョブ完了後の再同期に委ねる。
+#[derive(Default)]
+struct SyncEpoch {
+    epoch: u64,
+}
+
+impl SyncEpoch {
+    /// 新しい同期予約を発行する。古い予約は無効になる。
+    fn schedule(&mut self) -> SyncTicket {
+        self.epoch = self.epoch.wrapping_add(1);
+        SyncTicket(self.epoch)
+    }
+
+    /// 予約より優先する操作 (ジョブ受け付け・明示的な起動要求・hide・終了) で
+    /// 古い予約を捨てる。
+    fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// いまの世代。可視性スナップショットの前後で変わっていないかを見る。
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// この予約がまだ最新か。
+    fn is_current(&self, ticket: SyncTicket) -> bool {
+        self.epoch == ticket.0
+    }
+
+    /// この予約を実行してよいか (最新かつジョブが走っていない)。
+    fn may_apply(&self, ticket: SyncTicket, in_use: bool) -> bool {
+        !in_use && self.is_current(ticket)
+    }
+}
+
+/// ジョブ受け付けとエンジンのライフサイクル操作を直列化する制御ロック。
+///
+/// `translate` の受け付け、設定変更・起動完了後の同期、明示的な起動要求が
+/// この 1 本のロックを共有する。ロック保持中にメインスレッドへ問い合わせる API
+/// (`is_visible` など) を呼ばないこと (デッドロック防止)。表示状態はロックを
+/// 取る前に読む。
+#[derive(Default)]
+pub struct EngineControl {
+    inner: Mutex<EngineControlInner>,
+}
+
+#[derive(Default)]
+pub(crate) struct EngineControlInner {
+    sync: SyncEpoch,
+    /// 終了処理が始まったか。以後の起動予約をすべて拒否する。
+    ///
+    /// `stop_engines` の後に残っている同期 ticket やホットキー由来の起動要求が
+    /// エンジンを復活させないためのガード (監査 Medium 2)。
+    shutting_down: bool,
+    /// ホットキー記録中に一時保存した `floating_window.enabled=false` を、通常の
+    /// OFF と区別するための記録前の値。
+    ///
+    /// 記録中は `enabled=false` が settings.json に書かれるが、ユーザーの意図は
+    /// 「記録の間だけホットキーを外す」であって「常駐をやめる」ではない。記録中に
+    /// 起動完了・ジョブ完了の同期が走っても常駐エンジンを止めないよう、ポリシー
+    /// 評価ではここに覚えた値を使う (M3)。
+    suspended_floating_enabled: Option<bool>,
+}
+
+impl EngineControlInner {
+    /// ポリシー評価に使う実効設定。記録中は記録前の `enabled` に戻す。
+    pub(crate) fn effective_settings(&self, mut settings: Settings) -> Settings {
+        if let Some(enabled) = self.suspended_floating_enabled {
+            settings.floating_window.enabled = enabled;
+        }
+        settings
+    }
+
+    /// 予約済みの同期を無効化する (状態変更・停止・終了の前に呼ぶ)。
+    pub(crate) fn invalidate_sync(&mut self) {
+        self.sync.invalidate();
+    }
+
+    /// いまの同期世代。可視性スナップショットの前後で変わっていないかを見る。
+    ///
+    /// 可視性はメインスレッド往復 API のためロック外で読む必要がある。読む前後で
+    /// 世代を照合し、hide/show などの状態変更が入っていたら古い値を使わない
+    /// (Medium 2)。
+    pub(crate) fn sync_epoch(&self) -> u64 {
+        self.sync.epoch()
+    }
+
+    /// 新しい起動を予約してよいか。
+    pub(crate) fn may_start(&self) -> bool {
+        !self.shutting_down
+    }
+
+    /// 同期 ticket を適用してよいか (最新・ジョブ無し・シャットダウン中でない)。
+    fn may_apply(&self, ticket: SyncTicket, in_use: bool) -> bool {
+        !self.shutting_down && self.sync.may_apply(ticket, in_use)
+    }
+
+    /// 終了処理を開始する。以後の起動予約と同期適用を拒否する。
+    fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+        self.sync.invalidate();
+    }
+}
+
+impl EngineControl {
+    /// 制御ロック。ロック保持中にメインスレッドへ問い合わせる API を呼ばないこと。
+    pub(crate) fn lock(&self) -> MutexGuard<'_, EngineControlInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// ホットキー記録の一時無効化を開始する。記録前の `enabled` を覚える。
+    ///
+    /// すでに記録中なら最初に覚えた値を保つ (二重送信で上書きしない)。
+    pub(crate) fn begin_hotkey_suspend(&self, enabled: bool) {
+        self.lock()
+            .suspended_floating_enabled
+            .get_or_insert(enabled);
+    }
+
+    /// 記録終了後の明示的な `enabled` 変更で一時無効化を解除する。
+    pub(crate) fn end_hotkey_suspend(&self) {
+        self.lock().suspended_floating_enabled = None;
+    }
+
+    /// ポリシー評価に使う実効設定 (記録中は記録前の `enabled`)。
+    pub(crate) fn effective_settings(&self, settings: Settings) -> Settings {
+        self.lock().effective_settings(settings)
+    }
+}
+
+/// AppHandle から実効設定を引く。記録中 (suspend) は記録前の `enabled` を使う。
+pub(crate) fn effective_settings(app: &AppHandle, settings: Settings) -> Settings {
+    match app.try_state::<AppState>() {
+        Some(state) => state.engine_control.effective_settings(settings),
+        None => settings,
+    }
+}
+
+/// 可視性やウィンドウ状態が変わったことを制御境界へ知らせ、予約済みの同期を
+/// 無効化する。
+///
+/// 同期 ticket は可視性をロック外で読むため、読んだ後に hide/show が起きても
+/// 古い値で適用しないよう、状態変更側で世代を進める (監査 Medium 2)。
+pub(crate) fn invalidate_engine_sync(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.engine_control.lock().invalidate_sync();
+    }
+}
+
+/// 終了処理を開始し、以後の起動予約を拒否する。
+pub(crate) fn begin_shutdown(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.engine_control.lock().begin_shutdown();
+    }
+}
+
+/// エンジン 1 本に対して取るべき同期動作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineSyncAction {
+    /// 何もしない (稼働中はそのまま、停止中も起こさない)。
+    Keep,
+    /// 止める (起動処理中ならその起動も取り消す)。
+    Stop,
+    /// 止まっていれば起こす (起動中はそのまま待つ)。
+    Start,
+    /// 今の設定のモデルで起こし直す。
+    Restart,
+}
+
+/// 1 本のエンジンの同期動作を決める。
+///
+/// - `warm`: 常駐の保持先か、画面が見えていて温めておく対象 (停止中なら起こす)
+/// - `keep_alive`: 今まさに使われている (止めない。自動起動はしない)
+/// - `in_use`: 翻訳ジョブが動いている (中断しない)
+/// - `model_matches`: 稼働中の子が今の設定と同じモデルを読んでいる
+/// - `resolvable`: 今の設定でモデルとランタイムを解決できる
+///
+/// 起動処理中は `warm` / `keep_alive` だけで判断する。古い設定を掴んだ起動は、
+/// 完了後の再評価 (`spawn_reserved_with_sync` の世代ガード) が最新ポリシーで
+/// 始末する。
+fn decide_engine_sync(
+    warm: bool,
+    keep_alive: bool,
+    in_use: bool,
+    starting: bool,
+    running: bool,
+    model_matches: bool,
+    resolvable: bool,
+) -> EngineSyncAction {
+    if in_use {
+        return EngineSyncAction::Keep;
+    }
+    if starting {
+        return if warm || keep_alive {
+            EngineSyncAction::Keep
+        } else {
+            EngineSyncAction::Stop
+        };
+    }
+    if running {
+        if !warm && !keep_alive {
+            return EngineSyncAction::Stop;
+        }
+        return if model_matches {
+            EngineSyncAction::Keep
+        } else {
+            EngineSyncAction::Restart
+        };
+    }
+    if warm && resolvable {
+        EngineSyncAction::Start
+    } else {
+        EngineSyncAction::Keep
+    }
+}
+
+/// 稼働中の子が今の設定と同じモデルを読んでいるか。
+///
+/// 停止中は比べようがないので「一致」とみなす (起動は呼び出し側が決める)。
+fn running_model_matches(engine: &Engine, desired: Option<&Path>) -> bool {
+    match (engine.running_model(), desired) {
+        (Some(running), Some(desired)) => running == desired,
+        _ => true,
+    }
+}
+
+/// ジョブ受け付け時に、そのジョブを訳すエンジンをどうするか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobEngineAction {
+    /// いまのエンジンをそのまま使う (希望モデルと一致、またはモデル未解決)。
+    Use,
+    /// 停止中なので起こす。
+    Start,
+    /// 稼働中/起動中だが希望モデルと違うので、希望モデルで起こし直す。
+    Restart,
+}
+
+/// ジョブ受け付け時のエンジン動作を決める。
+///
+/// 連続ジョブ (J1: モデル A → 設定 B → J2) で J2 が A のまま訳さないよう、
+/// 稼働中・起動中のどちらも「希望モデルと一致するか」を確認する (M2)。
+/// 起動処理中は `reserved_model` で、子の spawn 前でも判定できる。
+/// モデルが解決できないときは現状に任せる (既存のエラー表示経路)。
+fn decide_job_engine(
+    desired: Option<&Path>,
+    starting: bool,
+    reserved_model: Option<&Path>,
+    running: bool,
+    running_model: Option<&Path>,
+) -> JobEngineAction {
+    let Some(desired) = desired else {
+        return JobEngineAction::Use;
+    };
+    if starting {
+        return if reserved_model == Some(desired) {
+            JobEngineAction::Use
+        } else {
+            JobEngineAction::Restart
+        };
+    }
+    if running {
+        return if running_model == Some(desired) {
+            JobEngineAction::Use
+        } else {
+            JobEngineAction::Restart
+        };
+    }
+    JobEngineAction::Start
+}
+
+/// 予約済みの起動を非同期で実行し、完了後に常駐ポリシーを再評価する。
+///
+/// 起動に失敗した (子を掴んでいない) ときは再評価しない。再評価すると、起動失敗
+/// のたびに同じ起動を繰り返してしまう。起動が成功した場合は、待っている間に
+/// 設定が変わっていても最新ポリシーで起こし直す (M1: 起動完了 sync)。
+fn spawn_reserved_with_sync(
+    app: &AppHandle,
+    engine: &Engine,
+    reserved: ReservedStart,
+    settings: Settings,
+) {
+    let app_handle = app.clone();
+    let engine = engine.clone();
+    tauri::async_runtime::spawn(async move {
+        engine.spawn_reserved(reserved, &settings).await;
+        if resync_after_start(engine.has_process()) {
+            sync_engines_now(&app_handle);
+        }
+    });
+}
+
+/// 起動完了後に常駐ポリシーを再評価するか (M1)。
+///
+/// 起動に失敗した (子を掴んでいない) ときに再評価すると、同じ起動を繰り返して
+/// しまうため行わない。成功時だけ、待っている間に変わった設定を反映する。
+fn resync_after_start(has_process: bool) -> bool {
+    has_process
+}
+
+/// 起動を予約して spawn を依頼する。呼び出し側は制御ロックを保持していること。
+///
+/// 予約 (`reserve_start`) は既存の子の停止までを同期に行う。このため、
+/// ジョブ受け付けと「止める/起こし直す」の順序は制御ロックで確定する (H1)。
+/// 終了処理が始まっていたら予約しない (Medium 2)。
+fn reserve_and_spawn(
+    app: &AppHandle,
+    engine: &Engine,
+    settings: &Settings,
+    force: bool,
+    control: &EngineControlInner,
+) {
+    if !control.may_start() {
+        return;
+    }
+    let Some(reserved) = engine.reserve_start(settings, force) else {
+        return;
+    };
+    spawn_reserved_with_sync(app, engine, reserved, settings.clone());
+}
+
+/// ジョブが使うエンジンを、そのジョブの希望モデルに揃える (M2)。
+///
+/// 呼び出し側は制御ロックを保持し、ジョブを begin した後に呼ぶこと
+/// (`jobs.begin` が前のジョブを中止にしてからエンジンを触る)。
+fn prepare_engine_for_job(
+    app: &AppHandle,
+    state: &AppState,
+    role: EngineRole,
+    settings: &Settings,
+    control: &EngineControlInner,
+) {
+    let engine = state.engine_for(role);
     let search_root = crate::engine::exe_directory();
-    let was = crate::engine::should_run_floating_engine(before, &search_root);
-    let now = crate::engine::should_run_floating_engine(after, &search_root);
+    let desired = crate::engine::resolved_model_path(role, settings, &search_root);
+    let action = decide_job_engine(
+        desired.as_deref(),
+        engine.is_starting(),
+        engine.reserved_model().as_deref(),
+        engine.has_process(),
+        engine.running_model().as_deref(),
+    );
+    match action {
+        JobEngineAction::Use => {}
+        JobEngineAction::Start => reserve_and_spawn(app, engine, settings, false, control),
+        JobEngineAction::Restart => reserve_and_spawn(app, engine, settings, true, control),
+    }
+}
+
+/// 同期動作をエンジンへ適用する。呼び出し側は制御ロックを保持していること。
+fn apply_engine_sync(
+    app: &AppHandle,
+    engine: &Engine,
+    action: EngineSyncAction,
+    settings: &Settings,
+    control: &EngineControlInner,
+) {
+    match action {
+        EngineSyncAction::Keep => {}
+        EngineSyncAction::Stop => engine.kill_now(),
+        EngineSyncAction::Start => reserve_and_spawn(app, engine, settings, false, control),
+        EngineSyncAction::Restart => reserve_and_spawn(app, engine, settings, true, control),
+    }
+}
+
+/// 常駐ポリシーと使用状況から、両方のエンジンを今の設定へ同期する。
+///
+/// 呼び出し側は制御ロックを保持し、ジョブが無いことを確認してから呼ぶこと。
+///
+/// - 常駐の保持先 ([`crate::engine::resident_target`]) が止めない対象を決める
+/// - 画面が見えている間はその画面が使うエンジンを止めない
+/// - 稼働中のモデルが設定と違えば、暇なときに起こし直す (Main↔Floating の
+///   保持先移行で旧エンジンを回収するのもこの経路)
+fn apply_reconcile_plan(
+    app: &AppHandle,
+    state: &AppState,
+    settings: &Settings,
+    main_visible: bool,
+    control: &EngineControlInner,
+) {
+    let search_root = crate::engine::exe_directory();
+    let target = crate::engine::resident_target(settings, &search_root);
+    let target_role = target.as_ref().map(|target| target.role);
+    let serving = crate::engine::serving_role(EngineRole::Floating, settings, &search_root);
+    let floating_shown = state.floating.is_shown();
+    // 呼び出し側が制御ロック下でジョブ無しを確認済み。ここからロックを解放するまで
+    // 新しいジョブは受け付けられない。
+    let in_use = state.jobs.has_active_job();
+
+    let main_model = crate::engine::resolved_model_path(EngineRole::Main, settings, &search_root);
+    let floating_model =
+        crate::engine::resolved_model_path(EngineRole::Floating, settings, &search_root);
+
+    // メイン用: 常駐の保持先か、画面が見えている (共有ならフローティング表示中も)
+    // の間は止めない。表示中のメインは止まっていれば起こす (再表示直後と同じ)。
+    let main_action = decide_engine_sync(
+        target_role == Some(EngineRole::Main) || main_visible,
+        main_visible || (floating_shown && serving == EngineRole::Main),
+        in_use,
+        state.engine.is_starting(),
+        state.engine.has_process(),
+        running_model_matches(&state.engine, main_model.as_deref()),
+        crate::engine::can_resolve(EngineRole::Main, settings, app),
+    );
+
+    // フローティング用: 常駐の保持先か、専用エンジンで表示中の間は止めない。
+    let floating_action = decide_engine_sync(
+        target_role == Some(EngineRole::Floating),
+        floating_shown && serving == EngineRole::Floating,
+        in_use,
+        state.floating_engine.is_starting(),
+        state.floating_engine.has_process(),
+        running_model_matches(&state.floating_engine, floating_model.as_deref()),
+        crate::engine::can_resolve(EngineRole::Floating, settings, app),
+    );
+
+    if target.is_some() {
+        debug_log_resident(target.as_ref());
+    }
+    apply_engine_sync(app, &state.engine, main_action, settings, control);
+    apply_engine_sync(
+        app,
+        &state.floating_engine,
+        floating_action,
+        settings,
+        control,
+    );
+}
+
+/// 常駐ポリシーの再同期を予約する。
+///
+/// 実行時に制御ロック下で「予約が最新か」「ジョブが始まっていないか」を再検証して
+/// から適用する。ジョブ受け付けが先に起きた場合、この予約は破棄され、ジョブ完了
+/// 時の再同期に委ねる。古い Restart/Stop が新しいジョブを巻き込まないための
+/// 直列化 (H1)。
+pub(crate) fn sync_engines_now(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let ticket = {
+        let mut control = state.engine_control.lock();
+        // 終了処理が始まっていたら、新しい同期予約は作らない。
+        if !control.may_start() {
+            return;
+        }
+        control.sync.schedule()
+    };
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app_handle.try_state::<AppState>() else {
+            return;
+        };
+        // 可視性はメインスレッドへの問い合わせを含むため、制御ロックの外で読む。
+        // 読む前後で世代を確認し、その間に hide/show などの状態変更が入っていたら
+        // このスナップショットは使わない (古い visible で起動しない: Medium 2)。
+        let snapshot_epoch = {
+            let control = state.engine_control.lock();
+            if !control.sync.is_current(ticket) {
+                return;
+            }
+            control.sync.epoch()
+        };
+        let main_visible = main_window_visible(&app_handle);
+        let control = state.engine_control.lock();
+        if !control.sync.is_current(ticket) || control.sync.epoch() != snapshot_epoch {
+            return;
+        }
+        let in_use = state.jobs.has_active_job();
+        if !control.may_apply(ticket, in_use) {
+            return;
+        }
+        // 記録中 (suspend) の一時的な enabled=false を通常 OFF と混同しない。
+        let settings = control.effective_settings(state.settings.get());
+        apply_reconcile_plan(&app_handle, &state, &settings, main_visible, &control);
+    });
+}
+
+/// メインウィンドウが見えているか。
+///
+/// メインスレッドへの問い合わせを含むため、制御ロックを取る前に呼ぶこと
+/// (ロック保持中に呼ぶと、メインスレッドが同じロックを待ってデッドロックする)。
+fn main_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window(floating::MAIN_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+/// 明示的な起動要求 (再起動・復元・起動時)。
+///
+/// 古い停止/再起動予約より優先し、起動完了後にポリシーを再評価する (M1)。
+pub(crate) fn start_engine_with_sync(app: &AppHandle, role: EngineRole, force: bool) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let mut control = state.engine_control.lock();
+    if !control.may_start() {
+        return;
+    }
+    control.sync.invalidate();
+    let settings = state.settings.get();
+    let engine = state.engine_for(role).clone();
+    reserve_and_spawn(app, &engine, &settings, force, &control);
+}
+
+/// 要求された役割の翻訳に使うエンジンを起こす (トレイの再表示・ホットキー)。
+///
+/// 実際に起こすのは `engine::serving_role` が決めたエンジン (解決モデルが同一なら
+/// メイン用を共有する)。起動完了後にポリシーを再評価する (M1)。
+pub(crate) fn start_engine_requested(app: &AppHandle, requested: EngineRole) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let mut control = state.engine_control.lock();
+    if !control.may_start() {
+        return;
+    }
+    control.sync.invalidate();
+    let settings = state.settings.get();
+    let role = crate::engine::serving_role(requested, &settings, &crate::engine::exe_directory());
+    let engine = state.engine_for(role).clone();
+    reserve_and_spawn(app, &engine, &settings, false, &control);
+}
+
+/// 常駐ポリシーの決定内容をログに残す (不具合調査用)。
+///
+/// リリースビルドでは黙らせる。フローティング側の `debug_log` と同じ条件で、
+/// `NUKA_FLOATING_DEBUG=1` のときだけ出す。
+fn debug_log_resident(target: Option<&crate::engine::ResidentTarget>) {
+    if !(cfg!(debug_assertions) || std::env::var_os("NUKA_FLOATING_DEBUG").is_some()) {
+        return;
+    }
+    // stderr が閉じられていてもパニックしない (書き込み失敗は無視する)。
+    // E2E ではランチャーがパイプを閉じるため、eprintln! の失敗でプロセスが
+    // 落ちる実害があった。
+    let _ = match target {
+        Some(target) => writeln!(
+            std::io::stderr(),
+            "[resident] keep {} ({}, {})",
+            target.role.as_str(),
+            target.reason.as_str(),
+            target.model.display()
+        ),
+        None => writeln!(std::io::stderr(), "[resident] none (on-demand)"),
+    };
+}
+
+/// 常駐ポリシーの遷移をエンジンへ反映する。
+///
+/// 判定は `engine::resident_target` の 1 か所だけで、保持先 (Main / Floating)・
+/// 解決モデルパス・理由のどれかが変わったときだけ同期する。独立エンジンの有無
+/// (bool) だけを見ると、共有モデルでの常駐 ON/OFF を見落とす。
+///
+/// - ON: 保持先のエンジンを起こす (隠れたメイン用も予熱する。起動中は触らない)
+/// - OFF: 使っていなければ止める。使用中 (画面表示・翻訳中) は維持し、次の
+///   [`sync_engines_now`] / メイン非表示で解放する
+/// - Main↔Floating: 新しい保持先を起こし、旧エンジンは暇なら回収する
+fn sync_resident_engine(app: &AppHandle, before: &Settings, after: &Settings) {
+    let search_root = crate::engine::exe_directory();
+    // ホットキー記録中の一時的な enabled=false を通常の OFF と混同しない。
+    let before = effective_settings(app, before.clone());
+    let after = effective_settings(app, after.clone());
+    let was = crate::engine::resident_target(&before, &search_root);
+    let now = crate::engine::resident_target(&after, &search_root);
     if was == now {
         return;
     }
-    let engine = state.floating_engine.clone();
-    if now {
-        // すでに動いている・起動処理中なら何もしない (モデル変更の再起動は
-        // set_floating_settings / set_active_model が担当する)。
-        if engine.has_process() || engine.is_starting() {
-            return;
-        }
-        if !crate::engine::can_resolve(EngineRole::Floating, after, app) {
-            return;
-        }
-        let next = after.clone();
-        tauri::async_runtime::spawn(async move {
-            engine.ensure_started(&next).await;
-        });
-        return;
-    }
-    // 翻訳中に止めると途中で切れる。終わったあとの hide で解放される。
-    if !state
-        .jobs
-        .has_running_job_from_origin(floating::FLOATING_LABEL)
-    {
-        engine.kill_now();
-    }
+    sync_engines_now(app);
 }
 
 #[tauri::command]
@@ -321,6 +877,10 @@ pub fn detect_language(text: String) -> Option<DetectedLanguage> {
 /// どちらのエンジンで訳すかは呼び出し元のウィンドウのラベルから決め、
 /// `engine::serving_role` が最終的なエンジンを選ぶ。解決モデルがメイン用と
 /// 同一なら、フローティング翻訳もメイン用エンジンで処理する (二重ロード防止)。
+///
+/// ジョブの受け付けとエンジンの停止/再起動は制御ロックで直列化する (H1/M2)。
+/// 受け付けたジョブは、その時点の設定で解決したモデルにエンジンを揃えてから
+/// 実行する (連続ジョブで旧モデルのまま訳さない)。
 #[tauri::command]
 pub fn translate(
     app: AppHandle,
@@ -330,9 +890,25 @@ pub fn translate(
 ) -> u32 {
     let origin = webview.label().to_string();
     let requested = EngineRole::from_label(&origin);
-    let settings = state.settings.get();
-    let role = crate::engine::serving_role(requested, &settings, &crate::engine::exe_directory());
-    let (job_id, cancel, superseded) = state.jobs.begin(&origin);
+    // ここからジョブ開始まで、エンジンの停止/再起動の予約は実行できない。
+    let (job_id, cancel, superseded, engine, settings) = {
+        let mut control = state.engine_control.lock();
+        // 予約済みの停止/再起動より、このジョブの受け付けを優先する。
+        control.sync.invalidate();
+        let settings = state.settings.get();
+        let role =
+            crate::engine::serving_role(requested, &settings, &crate::engine::exe_directory());
+        // 前のジョブを先に中止にしてから、エンジンをこのジョブのモデルへ揃える。
+        let (job_id, cancel, superseded) = state.jobs.begin(&origin);
+        prepare_engine_for_job(&app, &state, role, &settings, &control);
+        (
+            job_id,
+            cancel,
+            superseded,
+            state.engine_for(role).clone(),
+            settings,
+        )
+    };
     if let Some(superseded) = superseded {
         if let Err(error) = app.emit(
             "translation:superseded",
@@ -341,10 +917,21 @@ pub fn translate(
             eprintln!("translation:superseded を送れません: {error}");
         }
     }
-    let engine = state.engine_for(role).clone();
     let jobs = state.jobs.clone();
     tauri::async_runtime::spawn(async move {
-        run_translation(app, engine, jobs, settings, job_id, cancel, req).await;
+        run_translation(
+            app,
+            engine,
+            jobs,
+            TranslationJob {
+                settings,
+                origin,
+                job_id,
+                cancel,
+            },
+            req,
+        )
+        .await;
     });
     job_id
 }
@@ -373,6 +960,24 @@ pub struct FloatingSettingsPatch {
     pub suspend: Option<bool>,
 }
 
+/// フローティング設定の差分がエンジンのライフサイクルに影響するか。
+///
+/// ホットキーだけの保存では常駐エンジンを触らない。ホットキー記録中は
+/// `enabled=false` を一時保存しているため、記録後のホットキー保存で reconcile
+/// すると常駐エンジンを止めてしまい、有効へ戻すときに再ロードが入る (M3)。
+fn floating_settings_affect_engine(before: &Settings, after: &Settings) -> bool {
+    before.floating_window.enabled != after.floating_window.enabled
+        || before.floating_window.model != after.floating_window.model
+}
+
+/// この設定保存でエンジンの再同期を行うか。
+///
+/// ホットキー記録中の一時無効化 (suspend) と、エンジンに影響しない差分
+/// (ホットキーのみ) では触らない。
+fn should_sync_floating_engine(suspended: bool, affects_engine: bool) -> bool {
+    !suspended && affects_engine
+}
+
 /// フローティングウィンドウの設定を保存する。
 ///
 /// ホットキーはパース検証してから保存する。登録に失敗したとき (ほかのアプリと
@@ -380,8 +985,9 @@ pub struct FloatingSettingsPatch {
 /// を返す。設定値そのものは保存済みなので、呼び出し側はエラーを表示しつつ
 /// `get_settings` の値 (変更後) を画面へ反映すること。
 ///
-/// 専用モデルが変わったときは、稼働中のフローティング用を新しいモデルで
-/// 起こし直す (常駐の開始/停止は `floating_engine_resident` の遷移で決まる)。
+/// 専用モデル・有効/無効の変更は常駐ポリシー (保持先・解決モデルパス) の変化として
+/// エンジンへ反映する。翻訳中は旧エンジンで完了させ、完了後の再同期で新ポリシーへ
+/// 移行する (起動・停止をここで直接競合させない)。
 /// `suspend: true` はホットキー記録用の一時無効化で、常駐エンジンを触らない。
 #[tauri::command]
 pub async fn set_floating_settings(
@@ -408,56 +1014,50 @@ pub async fn set_floating_settings(
     });
 
     let before = state.settings.get();
-    let saved = state
-        .settings
-        .update(|settings| {
-            if let Some(enabled) = patch.enabled {
-                settings.floating_window.enabled = enabled;
-            }
-            if let Some(hotkey) = &normalized {
-                settings.floating_window.hotkey = hotkey.clone();
-            }
-            if let Some(model) = &model_patch {
-                settings.floating_window.model = model.clone();
-            }
-            Ok(())
-        })
-        .map_err(|error| {
-            let fallback = format!("設定を保存できませんでした: {error}");
-            LocalizedText::new("settings.floating.saveFailed", fallback).param("detail", error)
-        })?;
-
-    // 専用モデルが実際に変わったときだけ、稼働中のフローティング用エンジンを
-    // 新しいモデルで起こし直す (停止 → 起動)。常駐の開始/停止は
-    // `should_run_floating_engine` の遷移で決まる。
-    let model_changed =
-        model_patch.is_some() && saved.floating_window.model != before.floating_window.model;
-    if model_changed {
-        let search_root = crate::engine::exe_directory();
-        let shared = crate::engine::models_shared(&saved, &search_root);
-        let engine = state.floating_engine.clone();
-        let running = engine.has_process() || engine.is_starting();
-        let idle = !state
-            .jobs
-            .has_running_job_from_origin(floating::FLOATING_LABEL);
-        if running && idle {
-            if saved.floating_window.model.is_some() && !shared {
-                // 別モデルの専用エンジンとして起こし直す。
-                let next = saved.clone();
-                tauri::async_runtime::spawn(async move {
-                    engine.start(&next).await;
-                });
-            } else {
-                // 専用モデルを外した、またはメインと同じモデルになった。
-                // 古いモデルを掴んだままにせず、メイン用と共有する。
-                engine.kill_now();
-            }
-        }
+    // 記録開始は保存より先に suspend を立てる。保存と同期の隙間で一時的な
+    // enabled=false を通常の OFF と誤認しないため (M3)。
+    if suspended {
+        state
+            .engine_control
+            .begin_hotkey_suspend(before.floating_window.enabled);
     }
-    // ホットキー記録中の一時無効化 (suspend) では常駐エンジンを触らない。
-    // 本物の有効/無効の切り替えだけ predicate の遷移として反映する (M-2)。
-    if !suspended {
-        sync_resident_engine(&app, &state, &before, &saved);
+    let saved = match state.settings.update(|settings| {
+        if let Some(enabled) = patch.enabled {
+            settings.floating_window.enabled = enabled;
+        }
+        if let Some(hotkey) = &normalized {
+            settings.floating_window.hotkey = hotkey.clone();
+        }
+        if let Some(model) = &model_patch {
+            settings.floating_window.model = model.clone();
+        }
+        Ok(())
+    }) {
+        Ok(saved) => saved,
+        Err(error) => {
+            // 保存できなかったら、先に立てた suspend も戻す。
+            if suspended {
+                state.engine_control.end_hotkey_suspend();
+            }
+            let fallback = format!("設定を保存できませんでした: {error}");
+            return Err(
+                LocalizedText::new("settings.floating.saveFailed", fallback).param("detail", error)
+            );
+        }
+    };
+
+    // ホットキー記録中の一時無効化は「通常の OFF」ではない。記録前の enabled を
+    // 覚えておき、記録中の同期 (起動完了・ジョブ完了) で常駐エンジンを止めない (M3)。
+    if !suspended && patch.enabled.is_some() {
+        // 記録終了後の有効化/明示的な無効化で解除する。
+        state.engine_control.end_hotkey_suspend();
+    }
+
+    // 専用モデル・有効/無効の変更は、常駐ポリシー (保持先・解決モデルパス) を
+    // 変える。ジョブ実行中は旧エンジンで完了させ、完了後の再同期が新ポリシーへ
+    // 移行する。ホットキーだけの保存ではエンジンを触らない (M3)。
+    if should_sync_floating_engine(suspended, floating_settings_affect_engine(&before, &saved)) {
+        sync_engines_now(&app);
     }
 
     // ショートカットの登録はプラグインがメインスレッドの処理完了を待つ。
@@ -523,13 +1123,12 @@ pub async fn install_runtime(
     // 実行中の llama-server.exe は Windows でロックされるため、常駐中の
     // フローティング用も先に止める (installer 側がメイン用を止める)。
     // 起動処理の途中でも止めれば、あとで起こし直す対象として扱う (L-2)。
-    let restore_floating = floating_engine.has_process() || floating_engine.is_starting();
     floating_engine.kill_now();
     let result = crate::installer::install_runtime(&app, &settings, &downloads, &engine).await;
-    if restore_floating {
-        // 新しいランタイムで起こし直す。失敗しても既存の設定で起動を試みる。
-        floating_engine.start(&settings.get()).await;
-    }
+    // install_runtime はエンジンを直接起こさず、常駐/表示ポリシーに従って復元する
+    // (M1: 旧実装は installer が main を直接 start し、フローティングの復元も
+    // ポリシーを見ずに直接 start していた)。失敗時も既存ランタイムで同じ経路。
+    sync_engines_now(&app);
     result.map(|_| ())
 }
 
@@ -562,6 +1161,7 @@ pub fn cancel_download(state: State<'_, AppState>, id: String) {
 /// する (監査 N-1)。
 #[tauri::command(async)]
 pub fn delete_model(
+    app: AppHandle,
     state: State<'_, AppState>,
     file: String,
 ) -> Result<Settings, crate::message::LocalizedText> {
@@ -600,59 +1200,38 @@ pub fn delete_model(
         Ok(settings) => Ok(settings),
         Err(error) => {
             // 削除できなかった (ウイルス対策ソフト等のロック)。止めた分を戻す。
+            // 専用モデルが欠落したまま常駐を再開しないよう、ポリシーの保持先が
+            // フローティング用のときだけ起こす。
             let current = state.settings.get();
-            if killed && current.floating_engine_resident() {
-                let next = current.clone();
-                tauri::async_runtime::spawn(async move {
-                    floating_engine.ensure_started(&next).await;
-                });
+            let current = effective_settings(&app, current);
+            let restore = crate::engine::resident_target(&current, &crate::engine::exe_directory())
+                .is_some_and(|target| target.role == EngineRole::Floating);
+            if killed && restore {
+                // 常駐の復元も、起動完了後の再同期を通る統一経路で行う (M1)。
+                start_engine_with_sync(&app, EngineRole::Floating, false);
             }
             Err(error)
         }
     }
 }
 
-/// 使用するモデルを切り替え、エンジンを起こし直す。
+/// 使用するモデルを切り替え、エンジンを今の設定へ同期する。
 ///
-/// フローティング用は「実際に解決されるモデルパス」とメイン用との共有状態が
-/// 変わったときだけ触る。専用モデルが別ファイルなら、アクティブモデルを変えても
-/// フローティング用の解決パスは変わらないので再起動しない (L-3)。解決パスが
-/// 同一になった (共有になった) ときは独立エンジンを止める。
+/// アクティブモデルはメイン用エンジンのモデルであり、共有している常駐
+/// (フローティング用に同一ファイルを選んだ場合) のモデルでもある。ここでは
+/// エンジンを直接起こし直さず、常駐ポリシーの再同期に任せる。翻訳中は旧モデルの
+/// エンジンで完了させ、完了後の [`sync_engines_now`] が新しいモデルへ移行する
+/// (ジョブを巻き込んで中断しない一貫した方針)。専用モデルが別ファイルなら、
+/// アクティブモデルを変えてもフローティング用の解決パスは変わらないので触らない
+/// (L-3)。
 #[tauri::command]
-pub async fn set_active_model(
+pub fn set_active_model(
+    app: AppHandle,
     state: State<'_, AppState>,
     file: String,
 ) -> Result<Settings, crate::message::LocalizedText> {
-    let before = state.settings.get();
     let settings = crate::installer::set_active_model(&state.settings, &file)?;
-    let engine = state.engine.clone();
-    engine.start(&settings).await;
-
-    let search_root = crate::engine::exe_directory();
-    let before_path =
-        crate::engine::resolved_model_path(EngineRole::Floating, &before, &search_root);
-    let after_path =
-        crate::engine::resolved_model_path(EngineRole::Floating, &settings, &search_root);
-    let was_shared = crate::engine::models_shared(&before, &search_root);
-    let now_shared = crate::engine::models_shared(&settings, &search_root);
-
-    let floating_engine = state.floating_engine.clone();
-    let running = floating_engine.has_process() || floating_engine.is_starting();
-    let idle = !state
-        .jobs
-        .has_running_job_from_origin(floating::FLOATING_LABEL);
-    if idle && now_shared {
-        // メインと同じモデルになった。独立エンジンは不要。
-        if running {
-            floating_engine.kill_now();
-        }
-    } else if !now_shared && (before_path != after_path || was_shared) {
-        let should_start =
-            running || crate::engine::should_run_floating_engine(&settings, &search_root);
-        if should_start {
-            floating_engine.start(&settings).await;
-        }
-    }
+    sync_engines_now(&app);
     Ok(settings)
 }
 
@@ -703,9 +1282,8 @@ pub fn install_update(
 ) -> Result<(), crate::message::LocalizedText> {
     let engine = state.engine.clone();
     let floating_engine = state.floating_engine.clone();
-    let settings = state.settings.clone();
     // 検証・spawn が成功したときだけ updater 側がフローティング用も止める (L-1)。
-    crate::updater::install(&app, &state.updates, &engine, &floating_engine, &settings)
+    crate::updater::install(&app, &state.updates, &engine, &floating_engine)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,24 +1325,38 @@ impl From<String> for JobError {
     }
 }
 
+/// `run_translation` に渡す、受付時に確定したジョブの実行情報。
+struct TranslationJob {
+    settings: Settings,
+    origin: String,
+    job_id: u32,
+    cancel: Arc<AtomicBool>,
+}
+
 async fn run_translation(
     app: AppHandle,
     engine: Engine,
     jobs: JobManager,
-    settings: Settings,
-    job_id: u32,
-    cancel: Arc<AtomicBool>,
+    job: TranslationJob,
     req: TranslateRequest,
 ) {
-    // バックグラウンド化で止めていた / まだ起動中のエンジンをここで待つ。
-    // 待っている間も中止できる (監査 M-2)。
-    let ready = engine
-        .ensure_ready(&settings, ENGINE_READY_LIMIT, &cancel)
-        .await;
+    let TranslationJob {
+        settings,
+        origin,
+        job_id,
+        cancel,
+    } = job;
+    // 受付時に制御ロック下で起動予約まで確定している。ここでは起動せず、待つだけ
+    // (取消済み J1 が制御ロック外で新しい起動を奪うのを防ぐ: Medium 1)。
+    // 停止・異常終了からの復旧だけは、job id・取消・希望モデルを再検証してから
+    // 共通の予約経路で起こす。
+    let ready = wait_for_job_engine(&app, &engine, &settings, &origin, job_id, &cancel).await;
     let outcome = match ready {
         // 待機中に閉じられた。翻訳は始めない (done も error も流さない)。
         EngineReady::Cancelled => {
             jobs.finish(job_id);
+            // 中止も「ジョブ終了」。常駐 OFF / モデル変更の再同期を行う。
+            sync_engines_now(&app);
             return;
         }
         EngineReady::Ready(port) => {
@@ -800,6 +1392,97 @@ async fn run_translation(
             }
         }
     }
+
+    // ジョブ中に常駐 OFF・モデル変更が起きた場合、ここで最新ポリシーへ移行する
+    // (hide 待ちにしない)。成功・失敗・取消のどの終了経路でも同じ。
+    sync_engines_now(&app);
+}
+
+/// 受付済みジョブのエンジン準備。
+///
+/// 受付時に制御ロック下で起動予約まで確定しているので、ここでは**起動しない**
+/// (取消済みジョブが制御ロック外で新世代の起動を奪い、後続ジョブを旧モデルで
+/// 走らせる事故の防止: Medium 1)。停止・異常終了からの復旧だけ、制御ロック下で
+/// job id・取消・ルーティング・起動状態を再検証して共通の予約経路で起こす。
+async fn wait_for_job_engine(
+    app: &AppHandle,
+    engine: &Engine,
+    settings: &Settings,
+    origin: &str,
+    job_id: u32,
+    cancel: &AtomicBool,
+) -> EngineReady {
+    let ready = engine.wait_until_ready(ENGINE_READY_LIMIT, cancel).await;
+    if !matches!(ready, EngineReady::Unavailable) || is_cancelled(cancel) {
+        return ready;
+    }
+    if !retry_job_engine_start(app, engine, settings, origin, job_id, cancel) {
+        return EngineReady::Unavailable;
+    }
+    engine.wait_until_ready(ENGINE_READY_LIMIT, cancel).await
+}
+
+/// 停止・異常終了したエンジンの復旧起動を予約できたら true。
+///
+/// 取消済み・差し替え済み・起動中・シャットダウン中・ルーティング変更では
+/// 起動しない。予約した起動には完了後の再同期が付く (M1)。
+fn retry_job_engine_start(
+    app: &AppHandle,
+    engine: &Engine,
+    settings: &Settings,
+    origin: &str,
+    job_id: u32,
+    cancel: &AtomicBool,
+) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    // 速い経路: まだ読み込み中なら再起動しない (待ち時間を延ばさない)。
+    if engine.is_starting() {
+        return false;
+    }
+    let control = state.engine_control.lock();
+    let latest = state.settings.get();
+    let requested = EngineRole::from_label(origin);
+    let role_now = crate::engine::serving_role(requested, &latest, &crate::engine::exe_directory());
+    let cancelled = is_cancelled(cancel);
+    let current_job = state.jobs.current_job_id() == Some(job_id);
+    let starting = engine.is_starting();
+    let running = engine.has_process();
+    let phase = engine.status().state;
+    if role_now != engine.role()
+        || !may_retry_job_start(
+            current_job,
+            cancelled,
+            starting,
+            running,
+            phase,
+            control.shutting_down,
+        )
+    {
+        return false;
+    }
+    reserve_and_spawn(app, engine, settings, false, &control);
+    // 予約できたか (reserve_start は同期に starting を立てる)。
+    engine.is_starting()
+}
+
+/// 復旧起動を試みてよいか (純粋判定)。
+///
+/// - 取消済み・差し替え済み・起動処理中・シャットダウン中は不可
+/// - 稼働中は、クラッシュ (`error`) の後片付け以外では再起動しない
+fn may_retry_job_start(
+    current_job: bool,
+    cancelled: bool,
+    starting: bool,
+    running: bool,
+    phase: EnginePhase,
+    shutting_down: bool,
+) -> bool {
+    if shutting_down || cancelled || !current_job || starting {
+        return false;
+    }
+    !running || phase == EnginePhase::Error
 }
 
 async fn translate_job(
@@ -1425,6 +2108,372 @@ mod tests {
 
         jobs.finish(id);
         assert_eq!(jobs.current_job_id(), None);
+    }
+
+    #[test]
+    fn active_job_ignores_cancelled_ones() {
+        // 中止フラグの立ったジョブは「エンジンを使い終える」まで待たない。
+        // 常駐 OFF の再同期が、取消済みジョブで止まらないための判定。
+        let jobs = JobManager::new();
+        assert!(!jobs.has_active_job());
+        let (id, cancel, _) = jobs.begin(floating::FLOATING_LABEL);
+        assert!(jobs.has_active_job());
+        jobs.cancel_current_for_origin(floating::FLOATING_LABEL);
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(!jobs.has_active_job());
+        jobs.finish(id);
+        assert!(!jobs.has_active_job());
+    }
+
+    #[test]
+    fn engine_sync_keeps_a_busy_engine_and_releases_it_afterward() {
+        use EngineSyncAction::{Keep, Restart, Start, Stop};
+
+        // (b) 起動中に常駐 OFF / hide: 保持理由が無ければ起動を取り消す。
+        assert_eq!(
+            decide_engine_sync(false, false, false, true, false, true, true),
+            Stop
+        );
+        // メイン表示中や常駐の保持先なら、起動中の子は完了まで待つ。
+        assert_eq!(
+            decide_engine_sync(true, false, false, true, false, true, true),
+            Keep
+        );
+        assert_eq!(
+            decide_engine_sync(false, true, false, true, false, true, true),
+            Keep
+        );
+
+        // 常駐 ON への切替: 停止中なら起こす。モデル未解決なら起こさない。
+        assert_eq!(
+            decide_engine_sync(true, false, false, false, false, true, true),
+            Start
+        );
+        assert_eq!(
+            decide_engine_sync(true, false, false, false, false, true, false),
+            Keep
+        );
+
+        // 稼働中: 保持先ならモデル一致で継続、違えば起こし直す。
+        assert_eq!(
+            decide_engine_sync(true, false, false, false, true, true, true),
+            Keep
+        );
+        assert_eq!(
+            decide_engine_sync(true, false, false, false, true, false, true),
+            Restart
+        );
+        // 保持先でない (常駐 OFF / Main↔Floating 移行の旧エンジン) なら止める。
+        assert_eq!(
+            decide_engine_sync(false, false, false, false, true, true, true),
+            Stop
+        );
+        // 表示中は止めない。
+        assert_eq!(
+            decide_engine_sync(false, true, false, false, true, true, true),
+            Keep
+        );
+
+        // (d) ジョブ中に OFF にされた: 完了までは維持し、完了後に解放する。
+        assert_eq!(
+            decide_engine_sync(false, false, true, false, true, false, true),
+            Keep
+        );
+        assert_eq!(
+            decide_engine_sync(false, false, false, false, true, false, true),
+            Stop
+        );
+        // ジョブ中にモデルが変わっても中断しない (完了後に Restart)。
+        assert_eq!(
+            decide_engine_sync(true, false, true, false, true, false, true),
+            Keep
+        );
+    }
+
+    #[test]
+    fn on_off_toggles_are_stateless_and_idempotent() {
+        use EngineSyncAction::{Keep, Start, Stop};
+
+        // (c) ON/OFF 連打: 途中の遷移を積み上げず、その時点のポリシーだけで
+        // 判断する。稼働中のエンジンは ON で維持、OFF で停止。
+        for _ in 0..3 {
+            assert_eq!(
+                decide_engine_sync(true, false, false, false, true, true, true),
+                Keep
+            );
+            assert_eq!(
+                decide_engine_sync(false, false, false, false, true, true, true),
+                Stop
+            );
+        }
+        // 停止中のエンジンは ON で起こし、OFF では何もしない。
+        for _ in 0..3 {
+            assert_eq!(
+                decide_engine_sync(true, false, false, false, false, true, true),
+                Start
+            );
+            assert_eq!(
+                decide_engine_sync(false, false, false, false, false, true, true),
+                Keep
+            );
+        }
+    }
+
+    #[test]
+    fn a_scheduled_sync_is_released_when_a_job_begins() {
+        // H1: idle を観測して予約した Restart/Stop は、実行前にジョブが始まったら
+        // 破棄する (実行順が逆なら、予約が先に適用されてから受け付ける)。
+        let mut sync = SyncEpoch::default();
+
+        // 予約 → まだジョブが無いので適用できる。
+        let ticket = sync.schedule();
+        assert!(sync.may_apply(ticket, false));
+
+        // ジョブ受け付けは古い予約を無効化する (queue → job begin → restart 解放)。
+        sync.invalidate();
+        assert!(!sync.may_apply(ticket, false));
+
+        // ジョブ完了後の再同期は新しい世代で適用できる。
+        let ticket = sync.schedule();
+        assert!(sync.may_apply(ticket, false));
+
+        // 実行時にジョブが走っていれば適用しない (ジョブを中断しない)。
+        assert!(!sync.may_apply(ticket, true));
+
+        // 新しい予約ができた時点で、古い予約は無効。
+        let newer = sync.schedule();
+        assert!(!sync.may_apply(ticket, false));
+        assert!(sync.may_apply(newer, false));
+    }
+
+    #[test]
+    fn a_completed_start_requests_a_follow_up_sync() {
+        // M1: 起動が成功したときだけ完了後の再同期を予約する。
+        // 失敗時に予約すると、同じ起動を繰り返してしまう。
+        assert!(resync_after_start(true));
+        assert!(!resync_after_start(false));
+
+        // その再同期も、起動完了までにジョブが始まっていれば適用しない。
+        let mut sync = SyncEpoch::default();
+        let ticket = sync.schedule();
+        assert!(!sync.may_apply(ticket, true));
+        assert!(sync.may_apply(ticket, false));
+    }
+
+    #[test]
+    fn job_admission_picks_an_engine_with_the_current_model() {
+        use JobEngineAction::{Restart, Start, Use};
+
+        let model_a = Path::new("A.gguf");
+        let model_b = Path::new("B.gguf");
+
+        // 希望モデルが解決できない: 現状に任せる (既存の起動エラー経路)。
+        assert_eq!(decide_job_engine(None, false, None, false, None), Use);
+
+        // 停止中: 起こす。
+        assert_eq!(
+            decide_job_engine(Some(model_b), false, None, false, None),
+            Start
+        );
+        // 稼働中で希望どおり: そのまま使う。
+        assert_eq!(
+            decide_job_engine(Some(model_b), false, None, true, Some(model_b)),
+            Use
+        );
+        // 稼働中だが旧モデル: 起こし直す (J1=A の途中に B へ変更 → J2 は B)。
+        assert_eq!(
+            decide_job_engine(Some(model_b), false, None, true, Some(model_a)),
+            Restart
+        );
+        // 起動中で予約モデルが希望どおり: 起動完了を待って使う。
+        assert_eq!(
+            decide_job_engine(Some(model_b), true, Some(model_b), false, None),
+            Use
+        );
+        // 起動中で予約モデルが違う: 希望モデルで予約し直す。
+        assert_eq!(
+            decide_job_engine(Some(model_b), true, Some(model_a), false, None),
+            Restart
+        );
+        // 起動中で予約モデルが不明: 安全側で予約し直す。
+        assert_eq!(
+            decide_job_engine(Some(model_b), true, None, false, None),
+            Restart
+        );
+    }
+
+    #[test]
+    fn hotkey_only_save_does_not_touch_the_resident_engine() {
+        // M3: ホットキー記録中は enabled=false を一時保存している。記録後の
+        // ホットキーだけの保存で reconcile すると常駐エンジンを止めてしまい、
+        // 有効へ戻すときに再ロードが入る。
+        let base = Settings::default();
+
+        let mut hotkey_only = base.clone();
+        hotkey_only.floating_window.hotkey = "Ctrl+Alt+X".to_string();
+        assert!(!floating_settings_affect_engine(&base, &hotkey_only));
+        assert!(!should_sync_floating_engine(false, false));
+        // 記録中の一時無効化 (suspend) は、設定が変わって見えても触らない。
+        assert!(!should_sync_floating_engine(true, true));
+
+        let mut disabled = base.clone();
+        disabled.floating_window.enabled = false;
+        assert!(floating_settings_affect_engine(&base, &disabled));
+        assert!(should_sync_floating_engine(false, true));
+
+        let mut model = base.clone();
+        model.floating_window.model = Some("small.gguf".to_string());
+        assert!(floating_settings_affect_engine(&base, &model));
+    }
+
+    #[test]
+    fn hotkey_suspend_is_not_treated_as_a_normal_off() {
+        // M3: 記録中は enabled=false が一時保存されるが、エンジン同期は記録前の
+        // enabled で評価する。記録中に起動完了/ジョブ完了の sync が走っても、
+        // 常駐エンジンを通常の OFF として止めない。
+        let control = EngineControl::default();
+        let mut settings = Settings::default(); // floating enabled = true
+        settings.floating_window.model = Some("small.gguf".to_string());
+        assert!(control
+            .effective_settings(settings.clone())
+            .floating_engine_resident());
+
+        // 記録開始: enabled=false を一時保存し、記録前の値を覚える。
+        let mut suspended = settings.clone();
+        suspended.floating_window.enabled = false;
+        assert!(!suspended.floating_engine_resident());
+        control.begin_hotkey_suspend(settings.floating_window.enabled);
+        // 二重送信されても、最初に覚えた記録前の値を保つ。
+        control.begin_hotkey_suspend(false);
+
+        // 記録中の同期は「通常 OFF」ではなく記録前の enabled で評価する。
+        let effective = control.effective_settings(suspended.clone());
+        assert!(effective.floating_window.enabled);
+        assert!(effective.floating_engine_resident());
+
+        // 記録終了後の明示的な enabled 変更 (有効へ戻す) で suspend を解除する。
+        control.end_hotkey_suspend();
+        let mut restored = suspended.clone();
+        restored.floating_window.enabled = true;
+        assert!(control
+            .effective_settings(restored)
+            .floating_engine_resident());
+        // 解除後は保存値がそのまま使われる。
+        assert!(
+            !control
+                .effective_settings(suspended)
+                .floating_window
+                .enabled
+        );
+    }
+
+    #[test]
+    fn job_start_retry_requires_a_live_current_job() {
+        use EnginePhase::Ready;
+
+        // 復旧起動は「現行ジョブ・未取消・停止済み・非シャットダウン」だけ。
+        assert!(may_retry_job_start(true, false, false, false, Ready, false));
+        assert!(!may_retry_job_start(true, true, false, false, Ready, false));
+        assert!(!may_retry_job_start(
+            false, false, false, false, Ready, false
+        ));
+        assert!(!may_retry_job_start(true, false, true, false, Ready, false));
+        assert!(!may_retry_job_start(true, false, false, false, Ready, true));
+        // 稼働中はクラッシュ (error) の後片付け以外では再起動しない。
+        assert!(!may_retry_job_start(true, false, false, true, Ready, false));
+        assert!(may_retry_job_start(
+            true,
+            false,
+            false,
+            true,
+            EnginePhase::Error,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_job_never_wins_the_start_race_against_the_next_job() {
+        // Medium 1 の監査順序を barrier で固定する:
+        // J2 が starting=false を読む → 取消済み J1 が起動予約 → J2 続行。
+        // J1 は取消済みなので復旧起動してはならず、J2 の Start 予約が勝つ。
+        #[derive(Default)]
+        struct FakeEngine {
+            starting: bool,
+            reserved: Option<&'static str>,
+        }
+
+        let engine = Arc::new(Mutex::new(FakeEngine::default()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let j2_engine = Arc::clone(&engine);
+        let j2_barrier = Arc::clone(&barrier);
+        let j2 = std::thread::spawn(move || {
+            // J2 受付: starting=false を読んで Start を選ぶ。
+            let starting = j2_engine.lock().expect("fake engine").starting;
+            assert_eq!(
+                decide_job_engine(Some(Path::new("B.gguf")), starting, None, false, None),
+                JobEngineAction::Start
+            );
+            // ここで旧 J1 の再試行と競合させる。
+            j2_barrier.wait();
+            // 予約 (reserve_start)。J1 が予約していれば B は入らない。
+            let mut engine = j2_engine.lock().expect("fake engine");
+            if !engine.starting {
+                engine.starting = true;
+                engine.reserved = Some("B.gguf");
+            }
+        });
+
+        let j1_engine = Arc::clone(&engine);
+        let j1_barrier = Arc::clone(&barrier);
+        let j1 = std::thread::spawn(move || {
+            j1_barrier.wait();
+            // 取消済み J1 の復旧起動は不可 (job は J2 に差し替わっている)。
+            let retry = may_retry_job_start(false, true, false, false, EnginePhase::Ready, false);
+            assert!(!retry);
+            if retry {
+                let mut engine = j1_engine.lock().expect("fake engine");
+                engine.starting = true;
+                engine.reserved = Some("A.gguf");
+            }
+        });
+
+        j2.join().expect("J2 thread");
+        j1.join().expect("J1 thread");
+        let engine = engine.lock().expect("fake engine");
+        assert!(engine.starting);
+        assert_eq!(engine.reserved, Some("B.gguf"));
+    }
+
+    #[test]
+    fn a_visibility_snapshot_is_discarded_when_hide_invalidates() {
+        // Medium 2: ticket は可視性をロック外で読む。読んだ後に hide/show が
+        // 世代を進めたら、そのスナップショットは使わない。
+        let mut sync = SyncEpoch::default();
+        let ticket = sync.schedule();
+        let snapshot = sync.epoch();
+        assert!(sync.is_current(ticket));
+
+        sync.invalidate(); // hide / show / 状態変更
+
+        assert!(!sync.is_current(ticket));
+        assert_ne!(sync.epoch(), snapshot);
+        assert!(!sync.may_apply(ticket, false));
+    }
+
+    #[test]
+    fn shutdown_rejects_new_starts_and_pending_sync() {
+        let mut control = EngineControlInner::default();
+        let ticket = control.sync.schedule();
+        assert!(control.may_start());
+        assert!(control.may_apply(ticket, false));
+
+        control.begin_shutdown();
+        assert!(!control.may_start());
+        assert!(!control.may_apply(ticket, false));
+        // 終了後に新しい ticket を作れても適用はしない。
+        let after = control.sync.schedule();
+        assert!(!control.may_apply(after, false));
     }
 
     /// OpenAI 互換の SSE を、指定した断片のまま返す小さなサーバ。
