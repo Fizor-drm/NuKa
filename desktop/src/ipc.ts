@@ -101,6 +101,7 @@ export interface SettingsPatch {
   background?: BackgroundSettingsPatch;
   /** 用語集。省略すると今の値を保ち、空配列は「全部消す」。 */
   glossary?: GlossaryPair[];
+  glossary_base?: GlossaryPair[];
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +269,8 @@ export const ipc = {
   getSettings: (): Promise<Settings> => invoke<Settings>("get_settings"),
   setSettings: (patch: SettingsPatch): Promise<Settings> =>
     invoke<Settings>("set_settings", { patch }),
+  upsertGlossary: (pair: GlossaryPair): Promise<void> =>
+    invoke<void>("upsert_glossary", { pair }),
   detectLanguage: (text: string): Promise<DetectedLanguage | null> =>
     invoke<DetectedLanguage | null>("detect_language", { text }),
   translate: (request: TranslateRequest): Promise<number> =>
@@ -323,6 +326,10 @@ export function onTranslationError(handler: (payload: ErrorPayload) => void): vo
 
 export function onTranslationSuperseded(handler: (payload: SupersededPayload) => void): void {
   subscribe("translation:superseded", handler);
+}
+
+export function onGlossaryChanged(handler: () => void): void {
+  void listen("glossary:changed", handler);
 }
 
 export function onFloatingCapture(handler: (payload: FloatingCapturePayload) => void): void {

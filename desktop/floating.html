@@ -56,6 +56,14 @@
         >
           <span id="floating-copy-label" data-i18n="floating.copy">コピー</span>
         </button>
+        <button type="button" class="floating-close" id="floating-glossary-button"
+                aria-expanded="false" aria-controls="floating-glossary"
+                data-i18n-title="floating.glossaryAdd" data-i18n-aria-label="floating.glossaryAdd" disabled>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 5h6a2 2 0 0 1 2 2v13a2 2 0 0 0-2-2H4zM12 7a2 2 0 0 1 2-2h6v13h-6a2 2 0 0 0-2 2M16 9v5m-2.5-2.5h5" />
+          </svg>
+        </button>
         <button
           type="button"
           class="floating-close"
@@ -82,9 +90,23 @@
           </svg>
         </button>
       </header>
-      <section class="floating-content" id="floating-content" aria-live="polite">
-        <p class="floating-message" id="floating-message"></p>
-        <div class="floating-text" id="floating-text" hidden></div>
+      <section class="floating-content" id="floating-content">
+        <form class="floating-glossary" id="floating-glossary" hidden>
+          <label for="floating-glossary-source" data-i18n="glossary.sourcePlaceholder">原文の用語</label>
+          <input id="floating-glossary-source" class="glossary-input" maxlength="120" required spellcheck="false" autocomplete="off" />
+          <label for="floating-glossary-target" data-i18n="glossary.targetPlaceholder">訳文の用語</label>
+          <input id="floating-glossary-target" class="glossary-input" maxlength="120" required spellcheck="false" autocomplete="off" />
+          <p class="floating-message" data-i18n="floating.glossaryHint"></p>
+          <p class="floating-message" id="floating-glossary-error" data-state="error" role="alert" hidden></p>
+          <div class="floating-glossary-actions">
+            <button class="floating-copy" id="floating-glossary-cancel" type="button" data-i18n="floating.glossaryCancel">キャンセル</button>
+            <button class="floating-copy" id="floating-glossary-save" type="submit" data-i18n="floating.glossarySave">保存して訳し直す</button>
+          </div>
+        </form>
+        <div aria-live="polite">
+          <p class="floating-message" id="floating-message"></p>
+          <div class="floating-text" id="floating-text" hidden></div>
+        </div>
       </section>
       <!-- 右下のリサイズつまみ。見た目だけの装飾で、操作は floating.ts が持つ。 -->
       <div class="floating-grip" id="floating-grip" aria-hidden="true"></div>

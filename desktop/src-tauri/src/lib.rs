@@ -210,6 +210,7 @@ pub fn run() {
             commands::get_engine_status,
             commands::restart_engine,
             commands::get_settings,
+            commands::upsert_glossary,
             commands::set_settings,
             commands::detect_language,
             commands::translate,

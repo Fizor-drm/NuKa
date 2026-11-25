@@ -26,6 +26,7 @@ import {
   onDownloadError,
   onDownloadProgress,
   onEngineStatus,
+  onGlossaryChanged,
   onOpenSettings,
   onTranslationChunk,
   onTranslationDone,
@@ -336,7 +337,7 @@ const uiLanguageInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="ui-language"]'),
 );
 
-const APP_VERSION = "1.3.7";
+const APP_VERSION = "1.4.0";
 const RELEASES_PAGE_URL = "https://github.com/Fizor-drm/NuKa/releases/latest";
 
 const LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-en";
@@ -450,11 +451,20 @@ function glossaryForStorage(pairs: readonly GlossaryPair[]): GlossaryPair[] {
  * 競合 (保存中に編集) の扱いは `GlossarySaver` のコメントを参照。保存済みの
  * 署名は「送った値」ではなく「バックエンドが正規化して返した値」で更新する。
  */
+let glossaryWriteInFlight = false;
 const glossarySaver = new GlossarySaver({
   read: () => glossaryForStorage(state.glossary),
   save: async (pairs) => {
-    const saved = await ipc.setSettings({ glossary: [...pairs] });
-    return saved.glossary ?? [];
+    glossaryWriteInFlight = true;
+    try {
+      await ipc.setSettings({
+        glossary: [...pairs],
+        glossary_base: JSON.parse(state.savedGlossary) as GlossaryPair[],
+      });
+      return pairs;
+    } finally {
+      glossaryWriteInFlight = false;
+    }
   },
   savedSignature: () => state.savedGlossary,
   setSavedSignature: (signature) => {
@@ -462,9 +472,37 @@ const glossarySaver = new GlossarySaver({
   },
   onError: (error) => {
     // 保存できなくても次の編集で再試行する (署名は進めない)。
-    showAppStatus(t("status.settingsSaveFailed", { detail: describeError(error) }));
+    const detail = error === "glossary.limit" ? t(error) : describeError(error);
+    showAppStatus(t("status.settingsSaveFailed", { detail }));
   },
 });
+
+async function refreshStoredGlossary(): Promise<void> {
+  const saved = state.savedGlossary;
+  try {
+    const { glossary } = await ipc.getSettings();
+    const raw = glossaryEditor.getPairs();
+    const current = glossarySignature(glossaryForStorage(raw));
+    if (glossaryWriteInFlight || saved !== state.savedGlossary || current !== saved ||
+        raw.some((pair) => Boolean(pair.source.trim()) !== Boolean(pair.target.trim()))) return;
+
+    const signature = glossarySignature(glossary);
+    if (signature === saved) return;
+    state.glossary = glossary;
+    state.savedGlossary = signature;
+    state.effectiveGlossary = signature;
+    const focusIndex = Array.from(glossaryRowsEl.querySelectorAll("input")).indexOf(
+      document.activeElement as HTMLInputElement,
+    );
+    glossaryEditor.setPairs(glossary);
+    renderGlossaryLimit();
+    if (focusIndex !== -1) {
+      (glossaryRowsEl.querySelectorAll<HTMLInputElement>("input")[focusIndex] ?? glossaryAddEl).focus();
+    }
+  } catch {
+    // Keep the editable list if the settings are temporarily unavailable.
+  }
+}
 
 function buildRequest(text: string): TranslateRequest {
   const request: TranslateRequest = {
@@ -2282,7 +2320,9 @@ function bindUi(): void {
   });
 
   glossaryToggleEl.addEventListener("click", () => {
-    setGlossaryOpen(glossaryPanelEl.dataset["open"] !== "true");
+    const open = glossaryPanelEl.dataset["open"] !== "true";
+    setGlossaryOpen(open);
+    if (open) void refreshStoredGlossary();
   });
 
   // 文脈は次の翻訳から効く。入力のたびに再翻訳すると、まだ書き終えていない
@@ -2608,6 +2648,8 @@ function bindUi(): void {
 
 async function bootstrap(): Promise<void> {
   bindTranslationEvents();
+  onGlossaryChanged(() => void refreshStoredGlossary());
+  window.addEventListener("focus", () => void refreshStoredGlossary());
   bindDownloadEvents();
   bindUpdateEvents();
   bindUi();

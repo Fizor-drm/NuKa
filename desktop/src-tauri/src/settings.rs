@@ -241,6 +241,8 @@ pub struct SettingsPatch {
     /// 保存前に [`normalize_glossary`] で整列するので、UI の空行が
     /// settings.json に残ることはない。
     pub glossary: Option<Vec<GlossaryPair>>,
+    /// The editor's last saved view, for merging changes from the floating window.
+    pub glossary_base: Option<Vec<GlossaryPair>>,
 }
 
 #[derive(Clone)]
@@ -319,7 +321,36 @@ impl SettingsStore {
             }
             if let Some(glossary) = patch.glossary {
                 // UI の空行や前後の空白は保存しない。メモリもファイルと同じ形にする。
-                settings.glossary = normalize_glossary(glossary);
+                let desired = normalize_glossary(glossary);
+                settings.glossary = match patch.glossary_base {
+                    Some(base) => merge_glossary(&base, desired, &settings.glossary)?,
+                    None => desired,
+                };
+            }
+            Ok(())
+        })
+    }
+
+    pub fn upsert_glossary(&self, pair: GlossaryPair) -> Result<Settings, String> {
+        let pair = normalize_glossary(vec![pair])
+            .pop()
+            .ok_or("glossary.emptyPair")?;
+        if pair.source.chars().count() > 120 || pair.target.chars().count() > 120 {
+            return Err("glossary.termTooLong".into());
+        }
+
+        self.update(|settings| {
+            if let Some(index) = settings
+                .glossary
+                .iter()
+                .position(|row| row.source == pair.source)
+            {
+                settings.glossary.retain(|row| row.source != pair.source);
+                settings.glossary.insert(index, pair);
+            } else if settings.glossary.len() == MAX_GLOSSARY_PAIRS {
+                return Err("glossary.limit".into());
+            } else {
+                settings.glossary.push(pair);
             }
             Ok(())
         })
@@ -381,6 +412,46 @@ fn normalize_glossary(pairs: Vec<GlossaryPair>) -> Vec<GlossaryPair> {
         })
         .take(MAX_GLOSSARY_PAIRS)
         .collect()
+}
+
+// Preserve changes made by the other window for terms this editor did not touch.
+fn merge_glossary(
+    base: &[GlossaryPair],
+    desired: Vec<GlossaryPair>,
+    current: &[GlossaryPair],
+) -> Result<Vec<GlossaryPair>, String> {
+    if current == base {
+        return Ok(desired);
+    }
+    let edited = |source: &str| {
+        base.iter()
+            .filter(|pair| pair.source == source)
+            .ne(desired.iter().filter(|pair| pair.source == source))
+    };
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for pair in &desired {
+        if edited(&pair.source) {
+            merged.push(pair.clone());
+        } else if seen.insert(&pair.source) {
+            merged.extend(
+                current
+                    .iter()
+                    .filter(|row| row.source == pair.source)
+                    .cloned(),
+            );
+        }
+    }
+    merged.extend(
+        current
+            .iter()
+            .filter(|row| !seen.contains(&row.source) && !edited(&row.source))
+            .cloned(),
+    );
+    if merged.len() > MAX_GLOSSARY_PAIRS {
+        return Err("glossary.limit".into());
+    }
+    Ok(merged)
 }
 
 fn validate(settings: &Settings) -> Result<(), String> {
@@ -1062,6 +1133,87 @@ mod tests {
         assert!(!settings.background.enabled);
         assert!(settings.background.resident_engine);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    fn term(source: &str, target: &str) -> GlossaryPair {
+        GlossaryPair {
+            source: source.into(),
+            target: target.into(),
+        }
+    }
+
+    #[test]
+    fn floating_glossary_upsert_persists_and_replaces_only_the_matching_term() {
+        let directory = temp_dir("floating-glossary");
+        let path = directory.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        store.upsert_glossary(term("Product", "Original")).unwrap();
+        store.upsert_glossary(term("Other", "Retained")).unwrap();
+        store
+            .upsert_glossary(term(" Product ", " Updated "))
+            .unwrap();
+        assert_eq!(
+            SettingsStore::new(path).get().glossary,
+            vec![term("Product", "Updated"), term("Other", "Retained")]
+        );
+        assert_eq!(
+            store.upsert_glossary(term(" ", "invalid")).unwrap_err(),
+            "glossary.emptyPair"
+        );
+    }
+
+    #[test]
+    fn stale_editor_save_preserves_new_or_updated_floating_terms() {
+        let store = SettingsStore::in_memory();
+        store.upsert_glossary(term("Product", "Original")).unwrap();
+        store.upsert_glossary(term("Old", "To delete")).unwrap();
+        let base = store.get().glossary;
+        store
+            .upsert_glossary(term("Product", "Updated while editing"))
+            .unwrap();
+        store
+            .upsert_glossary(term("Added", "From floating"))
+            .unwrap();
+        let saved = store
+            .apply(SettingsPatch {
+                glossary: Some(vec![
+                    term("Product", "Original"),
+                    term("Local", "From main"),
+                ]),
+                glossary_base: Some(base),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            saved.glossary,
+            vec![
+                term("Product", "Updated while editing"),
+                term("Local", "From main"),
+                term("Added", "From floating"),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_glossary_rejects_new_terms_but_allows_updating_one() {
+        let store = SettingsStore::in_memory();
+        store
+            .apply(SettingsPatch {
+                glossary: Some(
+                    (0..MAX_GLOSSARY_PAIRS)
+                        .map(|i| term(&i.to_string(), "before"))
+                        .collect(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store.upsert_glossary(term("new", "unfit")).unwrap_err(),
+            "glossary.limit"
+        );
+        let updated = store.upsert_glossary(term("0", "after")).unwrap();
+        assert_eq!(updated.glossary.len(), MAX_GLOSSARY_PAIRS);
+        assert_eq!(updated.glossary[0], term("0", "after"));
     }
 
     #[test]
