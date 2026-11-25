@@ -448,8 +448,8 @@ function glossaryForStorage(pairs: readonly GlossaryPair[]): GlossaryPair[] {
  * 用語集は常駐エンジンの判定 (resident_target) に無関係なので、
  * この保存でエンジンが止まったり起動したりすることもない。
  *
- * 競合 (保存中に編集) の扱いは `GlossarySaver` のコメントを参照。保存済みの
- * 署名は「送った値」ではなく「バックエンドが正規化して返した値」で更新する。
+ * 用語集の保存は、最後に保存したローカル編集を基準に差分をマージする。
+ * 他のウィンドウの編集を含む設定全体は、入力が落ち着いてから取り込む。
  */
 let glossaryWriteInFlight = false;
 const glossarySaver = new GlossarySaver({

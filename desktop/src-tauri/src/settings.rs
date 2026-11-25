@@ -340,13 +340,23 @@ impl SettingsStore {
         }
 
         self.update(|settings| {
+            let key = pair.source.to_lowercase();
             if let Some(index) = settings
                 .glossary
                 .iter()
-                .position(|row| row.source == pair.source)
+                .position(|row| row.source.to_lowercase() == key)
             {
-                settings.glossary.retain(|row| row.source != pair.source);
-                settings.glossary.insert(index, pair);
+                let source = settings.glossary[index].source.clone();
+                settings
+                    .glossary
+                    .retain(|row| row.source.to_lowercase() != key);
+                settings.glossary.insert(
+                    index,
+                    GlossaryPair {
+                        source,
+                        target: pair.target,
+                    },
+                );
             } else if settings.glossary.len() == MAX_GLOSSARY_PAIRS {
                 return Err("glossary.limit".into());
             } else {
@@ -1150,7 +1160,7 @@ mod tests {
         store.upsert_glossary(term("Product", "Original")).unwrap();
         store.upsert_glossary(term("Other", "Retained")).unwrap();
         store
-            .upsert_glossary(term(" Product ", " Updated "))
+            .upsert_glossary(term(" product ", " Updated "))
             .unwrap();
         assert_eq!(
             SettingsStore::new(path).get().glossary,
