@@ -1584,6 +1584,36 @@ html:lang(zh-Hans) {
     color 120ms ease;
 }
 
+.floating-close:disabled,
+.floating-glossary button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.floating-glossary:not([hidden]) {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.floating-glossary .glossary-input {
+  width: 100%;
+}
+
+.floating-glossary-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.floating-glossary-actions button[type="submit"] {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
 .floating-close {
   width: 24px;
   padding: 0;

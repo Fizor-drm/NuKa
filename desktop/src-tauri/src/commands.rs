@@ -274,6 +274,17 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
+pub fn upsert_glossary(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pair: GlossaryPair,
+) -> Result<(), String> {
+    state.settings.upsert_glossary(pair)?;
+    let _ = app.emit("glossary:changed", ());
+    Ok(())
+}
+
+#[tauri::command]
 pub fn set_settings(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -961,7 +972,7 @@ pub fn translate(
     app: AppHandle,
     state: State<'_, AppState>,
     webview: tauri::WebviewWindow,
-    req: TranslateRequest,
+    mut req: TranslateRequest,
 ) -> u32 {
     let origin = webview.label().to_string();
     let requested = EngineRole::from_label(&origin);
@@ -992,6 +1003,9 @@ pub fn translate(
             eprintln!("translation:superseded を送れません: {error}");
         }
     }
+    if requested == EngineRole::Floating {
+        req.glossary = matching_glossary(&req.text, &settings.glossary);
+    }
     let jobs = state.jobs.clone();
     tauri::async_runtime::spawn(async move {
         run_translation(
@@ -1009,6 +1023,15 @@ pub fn translate(
         .await;
     });
     job_id
+}
+
+fn matching_glossary(text: &str, glossary: &[GlossaryPair]) -> Vec<GlossaryPair> {
+    let text = text.to_lowercase();
+    glossary
+        .iter()
+        .filter(|pair| text.contains(&pair.source.to_lowercase()))
+        .cloned()
+        .collect()
 }
 
 #[tauri::command]
@@ -2773,6 +2796,22 @@ mod tests {
             "う".repeat(MAX_CONTEXT_CHARS)
         )));
         assert!(!prompt.contains("context<|plamo:msg|> "));
+    }
+
+    #[test]
+    fn floating_translation_only_uses_saved_terms_found_in_the_source() {
+        let matching = GlossaryPair {
+            source: "NuKa".into(),
+            target: "NuKa product".into(),
+        };
+        let unrelated = GlossaryPair {
+            source: "other".into(),
+            target: "ignored".into(),
+        };
+        assert_eq!(
+            matching_glossary("try nuka", &[matching.clone(), unrelated]),
+            vec![matching]
+        );
     }
 
     #[test]

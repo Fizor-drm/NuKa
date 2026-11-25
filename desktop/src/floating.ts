@@ -116,6 +116,14 @@ const gripEl = byId<HTMLDivElement>("floating-grip");
 const messageEl = byId<HTMLParagraphElement>("floating-message");
 const textEl = byId<HTMLDivElement>("floating-text");
 const contentEl = byId<HTMLElement>("floating-content");
+const glossaryButton = byId<HTMLButtonElement>("floating-glossary-button");
+const glossaryForm = byId<HTMLFormElement>("floating-glossary");
+const glossarySource = byId<HTMLInputElement>("floating-glossary-source");
+const glossaryTarget = byId<HTMLInputElement>("floating-glossary-target");
+const glossarySave = byId<HTMLButtonElement>("floating-glossary-save");
+const glossaryCancel = byId<HTMLButtonElement>("floating-glossary-cancel");
+const glossaryError = byId<HTMLParagraphElement>("floating-glossary-error");
+let glossaryFormSeq = 0;
 
 let waiter: InvokeWaiter | null = null;
 let staleJobId: number | null = null;
@@ -291,6 +299,7 @@ function buildLanguageList(): void {
 // ---------------------------------------------------------------------------
 
 function render(): void {
+  glossaryButton.disabled = state.translating || state.translation.trim() === "";
   if (!state.initialized) {
     messageEl.textContent = "";
     messageEl.hidden = true;
@@ -439,6 +448,7 @@ function abortPending(): void {
  * 起動して VRAM を保持してしまう。
  */
 function cancelPendingCapture(): void {
+  closeGlossary(false);
   captureSeq += 1;
   state.translating = false;
   state.progress = null;
@@ -450,6 +460,7 @@ async function translate(): Promise<void> {
   if (text === null || text.trim() === "") {
     return;
   }
+  closeGlossary(false);
   abortPending();
 
   state.translating = true;
@@ -523,6 +534,7 @@ function handleSuperseded(jobId: number): void {
 // ---------------------------------------------------------------------------
 
 async function handleCapture(payload: FloatingCapturePayload): Promise<void> {
+  closeGlossary(false);
   const capture = ++captureSeq;
   window.clearTimeout(autoHideTimer);
   autoHideTimer = undefined;
@@ -571,6 +583,75 @@ async function handleCapture(payload: FloatingCapturePayload): Promise<void> {
 
   // エンジンが止まっていれば、Rust 側 (`ensure_ready`) が起動を待ってから訳す。
   // 待っている間の表示は `engine:status` で「起動しています」に切り替わる。
+  await translate();
+}
+
+function closeGlossary(restoreFocus: boolean): void {
+  glossaryFormSeq += 1;
+  glossaryForm.hidden = true;
+  glossaryForm.reset();
+  glossarySave.disabled = false;
+  glossarySource.readOnly = false;
+  glossaryTarget.readOnly = false;
+  glossaryButton.setAttribute("aria-expanded", "false");
+  glossaryError.hidden = true;
+  if (restoreFocus) glossaryButton.focus();
+}
+
+function openGlossary(): void {
+  if (glossaryButton.disabled) return;
+  const selection = window.getSelection();
+  const selected = selection?.toString().trim() ?? "";
+  const source = state.sourceText?.trim() ?? "";
+  if (source.length <= 40 && !/\s/u.test(source)) glossarySource.value = source;
+  if (textEl.contains(selection?.anchorNode ?? null) &&
+      textEl.contains(selection?.focusNode ?? null) && selected.length <= 120 && !/[\r\n]/u.test(selected)) {
+    glossaryTarget.value = selected;
+  }
+  closeLanguageList(false);
+  glossaryForm.hidden = false;
+  glossaryButton.setAttribute("aria-expanded", "true");
+  (glossarySource.value === "" ? glossarySource : glossaryTarget).focus();
+}
+
+async function saveGlossary(): Promise<void> {
+  if (glossarySave.disabled || glossaryForm.hidden) return;
+  const seq = glossaryFormSeq;
+  const source = glossarySource.value.trim();
+  const target = glossaryTarget.value.trim();
+  glossaryError.hidden = true;
+  if (!source || !target) {
+    glossaryError.textContent = t("glossary.emptyPair");
+    glossaryError.hidden = false;
+    (!source ? glossarySource : glossaryTarget).focus();
+    return;
+  }
+  if (!state.sourceText?.toLowerCase().includes(source.toLowerCase())) {
+    glossaryError.textContent = t("floating.glossaryNotInSource");
+    glossaryError.hidden = false;
+    glossarySource.focus();
+    return;
+  }
+  glossarySave.disabled = true;
+  glossarySource.readOnly = true;
+  glossaryTarget.readOnly = true;
+  try {
+    await ipc.upsertGlossary({ source, target });
+  } catch (error) {
+    if (seq !== glossaryFormSeq) return;
+    glossarySave.disabled = false;
+    glossarySource.readOnly = false;
+    glossaryTarget.readOnly = false;
+    glossaryError.textContent =
+      error === "glossary.limit" || error === "glossary.emptyPair" || error === "glossary.termTooLong"
+        ? t(error)
+        : t("floating.glossaryError");
+    glossaryError.hidden = false;
+    return;
+  }
+  if (seq !== glossaryFormSeq) return;
+  closeGlossary(false);
+  closeEl.focus();
   await translate();
 }
 
@@ -763,6 +844,19 @@ function bindEvents(): void {
     closeLanguageList(false);
   });
 
+  glossaryButton.addEventListener("pointerdown", (event) => {
+    if (event.button === 0) event.preventDefault();
+  });
+  glossaryButton.addEventListener("click", () => {
+    if (glossaryForm.hidden) openGlossary();
+    else closeGlossary(true);
+  });
+  glossaryCancel.addEventListener("click", () => closeGlossary(true));
+  glossaryForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveGlossary();
+  });
+
   copyEl.addEventListener("click", () => {
     void copyTranslation();
   });
@@ -777,7 +871,12 @@ function bindEvents(): void {
 
   // × ボタンと同じ。言語リストが開いていればリストだけ閉じる。
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") {
+    if (event.key !== "Escape" || event.isComposing) {
+      return;
+    }
+    if (!glossaryForm.hidden) {
+      event.preventDefault();
+      closeGlossary(true);
       return;
     }
     if (state.langOpen) {

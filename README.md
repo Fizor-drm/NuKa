@@ -42,7 +42,7 @@
 
 ### インストール
 
-1. [リリース](https://github.com/Fizor-drm/NuKa/releases/latest) から `NuKa_1.3.7_x64-setup.exe` を実行 (未署名のため SmartScreen が出たら「詳細情報」→「実行」)
+1. [リリース](https://github.com/Fizor-drm/NuKa/releases/latest) から `NuKa_1.4.0_x64-setup.exe` を実行 (未署名のため SmartScreen が出たら「詳細情報」→「実行」)
 2. NuKa を起動し、設定 (歯車) から **ランタイム** をインストール — llama.cpp CUDA 12.4・約 650 MB・SHA-256 検証つき
 3. **モデル** を選んでインストール — 推奨は 0.8B Q4_K_M (約 547 MB)
 
@@ -101,7 +101,7 @@ A desktop app that translates text **entirely on your own PC**. The engine is ll
 
 ### Install
 
-1. Run `NuKa_1.3.7_x64-setup.exe` from the [releases page](https://github.com/Fizor-drm/NuKa/releases/latest) (unsigned — if SmartScreen appears, choose "More info" → "Run anyway")
+1. Run `NuKa_1.4.0_x64-setup.exe` from the [releases page](https://github.com/Fizor-drm/NuKa/releases/latest) (unsigned — if SmartScreen appears, choose "More info" → "Run anyway")
 2. Launch NuKa, open Settings (gear) and install the **runtime** — llama.cpp CUDA 12.4, ~650 MB, SHA-256 verified
 3. Pick and install a **model** — recommended: 0.8B Q4_K_M (~547 MB)
 
@@ -158,7 +158,7 @@ Code: [MIT](LICENSE). Model weights: [PLaMo Community License](https://plamo.pre
 
 ### 安装
 
-1. 从[发布页](https://github.com/Fizor-drm/NuKa/releases/latest)下载并运行 `NuKa_1.3.7_x64-setup.exe`(安装包未签名,出现 SmartScreen 提示时请选择「仍要运行」)
+1. 从[发布页](https://github.com/Fizor-drm/NuKa/releases/latest)下载并运行 `NuKa_1.4.0_x64-setup.exe`(安装包未签名,出现 SmartScreen 提示时请选择「仍要运行」)
 2. 启动 NuKa,打开设置(齿轮图标),安装**运行时** —— llama.cpp CUDA 12.4,约 650 MB,带 SHA-256 校验
 3. 选择并安装**模型** —— 推荐 0.8B Q4_K_M(约 547 MB)
 
