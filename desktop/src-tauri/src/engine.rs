@@ -3,7 +3,7 @@
 //! - 起動はシェルを介さず、引数配列で `llama-server.exe` を直接叩く
 //!   (パスに空白があってもクォート崩れが起きない)。
 //! - 127.0.0.1:0 で空きポートを取ってから、そのポートで起動する。
-//! - `/health` が 200 を返すまで 500ms 間隔で最大 300 秒待つ。
+//! - `/health` が 200 を返すまで 100ms 間隔で最大 300 秒待つ。
 //! - 進み具合は `engine:status` イベントで流す (ペイロードに `role` を含める)。
 //! - 異常終了したら error を流し、`restart_engine` で起こし直せる。
 //! - アプリ終了時 (RunEvent) と Drop で必ず kill する。
@@ -37,7 +37,7 @@ pub const MODEL_FILE: &str = "plamo-3-translate-0.8b-Q4_K_M.gguf";
 pub const MODEL_ENV: &str = "PLAMO_MODEL_PATH";
 pub const SERVER_ENV: &str = "PLAMO_LLAMA_SERVER";
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
-pub const HEALTH_INTERVAL: Duration = Duration::from_millis(500);
+pub const HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 /// 翻訳が「準備完了」を待つ上限。
 ///
 /// エンジン自身の起動待ち (`HEALTH_TIMEOUT`) と揃えて 1 か所で持つ。ここを短く
@@ -48,7 +48,7 @@ pub const ENGINE_READY_LIMIT: Duration = HEALTH_TIMEOUT;
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 /// 準備完了を待つあいだ状態を見直す間隔。
-const ENGINE_WAIT_POLL: Duration = Duration::from_millis(200);
+const ENGINE_WAIT_POLL: Duration = Duration::from_millis(50);
 /// 開発時は exe の位置から上位 6 階層までランタイムを探す。
 const DEBUG_SEARCH_DEPTH: usize = 6;
 /// リリースでは exe の隣と 1 つ上だけ。親ディレクトリに置かれた runtime を拾わない。
@@ -184,6 +184,29 @@ struct Inner {
     /// llama-server を道連れにする Job Object (Windows のみ意味を持つ)。
     /// このハンドルを閉じると OS が割り当て済みの子プロセスも終了させる。
     job: Option<JobObject>,
+}
+
+impl Inner {
+    fn detach_child(&mut self) -> (Option<Child>, Option<JobObject>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.active_start = None;
+        self.port = None;
+        self.model = None;
+        self.reserved_model = None;
+        (self.child.take(), self.job.take())
+    }
+
+    fn fail_start(
+        &mut self,
+        generation: u64,
+        status: EngineStatus,
+    ) -> Option<(Option<Child>, Option<JobObject>)> {
+        if self.generation != generation {
+            return None;
+        }
+        self.status = status;
+        Some(self.detach_child())
+    }
 }
 
 impl Drop for Inner {
@@ -457,11 +480,12 @@ impl Engine {
     /// 起動に失敗したことを記録し、「起動処理中」を解除する。
     /// 解除しないと、次に使うときに再起動できなくなる。
     fn fail_start(&self, generation: u64, detail: LocalizedText) {
-        self.set_status(generation, self.status_of(EnginePhase::Error, Some(detail)));
-        let mut inner = self.lock();
-        if inner.active_start == Some(generation) {
-            inner.active_start = None;
-            inner.reserved_model = None;
+        let status = self.status_of(EnginePhase::Error, Some(detail));
+        // エラー公開と後片付けの対象確定を分けると、再試行で起動した新しい子を止めてしまう。
+        let failed = self.lock().fail_start(generation, status.clone());
+        if let Some((child, job)) = failed {
+            stop_child(child, job);
+            self.emit_status(status);
         }
     }
 
@@ -503,13 +527,7 @@ impl Engine {
 
     /// 子プロセスと Job Object を取り出し、「停止済み」の状態に戻す。
     fn take_child(&self) -> (Option<Child>, Option<JobObject>) {
-        let mut inner = self.lock();
-        inner.generation = inner.generation.wrapping_add(1);
-        inner.active_start = None;
-        inner.port = None;
-        inner.model = None;
-        inner.reserved_model = None;
-        (inner.child.take(), inner.job.take())
+        self.lock().detach_child()
     }
 
     async fn supervise(self, generation: u64, port: u16) {
@@ -552,35 +570,19 @@ impl Engine {
         match outcome {
             ReadyOutcome::Ready => self.watchdog(generation).await,
             ReadyOutcome::TimedOut => {
-                // 置き換えられていたら、新しい子プロセスに手を出さない。
-                if !self.is_current(generation) {
-                    return;
-                }
-                self.set_status(
+                self.fail_start(
                     generation,
-                    self.status_of(
-                        EnginePhase::Error,
-                        Some(
-                            text(
-                                "engine.startTimeout",
-                                format!(
-                                    "llama-server が {} 秒以内に準備できませんでした。",
-                                    HEALTH_TIMEOUT.as_secs()
-                                ),
-                            )
-                            .param("seconds", HEALTH_TIMEOUT.as_secs()),
+                    text(
+                        "engine.startTimeout",
+                        format!(
+                            "llama-server が {} 秒以内に準備できませんでした。",
+                            HEALTH_TIMEOUT.as_secs()
                         ),
-                    ),
+                    )
+                    .param("seconds", HEALTH_TIMEOUT.as_secs()),
                 );
-                self.kill_now();
             }
-            ReadyOutcome::Failed(detail) => {
-                if !self.is_current(generation) {
-                    return;
-                }
-                self.set_status(generation, self.status_of(EnginePhase::Error, Some(detail)));
-                self.kill_now();
-            }
+            ReadyOutcome::Failed(detail) => self.fail_start(generation, detail),
         }
     }
 
@@ -637,6 +639,10 @@ impl Engine {
             inner.status = status;
             inner.status.clone()
         };
+        self.emit_status(payload);
+    }
+
+    fn emit_status(&self, payload: EngineStatus) {
         if let Err(error) = self.app.emit("engine:status", payload) {
             eprintln!("engine:status を送れません: {error}");
         }
@@ -1428,6 +1434,31 @@ mod tests {
             port,
             phase,
         }
+    }
+
+    #[test]
+    fn stale_start_failure_leaves_the_new_model_alone() {
+        let mut inner = Inner {
+            generation: 2,
+            active_start: Some(2),
+            status: EngineStatus::new(EngineRole::Main, EnginePhase::Starting, None),
+            port: None,
+            child: None,
+            model: None,
+            reserved_model: Some(PathBuf::from("new.gguf")),
+            job: None,
+        };
+        let error = EngineStatus::new(EngineRole::Main, EnginePhase::Error, None);
+
+        assert!(inner.fail_start(1, error.clone()).is_none());
+        assert_eq!(inner.active_start, Some(2));
+        assert_eq!(inner.reserved_model.as_deref(), Some(Path::new("new.gguf")));
+        assert_eq!(inner.status.state, EnginePhase::Starting);
+        assert!(inner.fail_start(2, error).is_some());
+        assert_eq!(inner.status.state, EnginePhase::Error);
+        assert_eq!(inner.active_start, None);
+        assert_eq!(inner.reserved_model, None);
+        assert!(engine_state(false, inner.port, inner.status.state).needs_start());
     }
 
     #[test]
